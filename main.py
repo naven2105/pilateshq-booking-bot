@@ -1,63 +1,67 @@
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
+from flask import Flask, request, jsonify
+import requests
 import os
 
 app = Flask(__name__)
 
-# Session store (basic, in-memory)
-sessions = {}
+# Environment variables (store these in Render's dashboard)
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp():
-    incoming_msg = request.values.get("Body", "").strip().lower()
-    from_number = request.values.get("From")
+@app.route("/", methods=["GET"])
+def home():
+    return "PilatesHQ WhatsApp Bot is running!", 200
 
-    resp = MessagingResponse()
-    msg = resp.message()
+# Webhook verification for Meta
+@app.route("/webhook", methods=["GET"])
+def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
 
-    session = sessions.get(from_number, {"step": 0})
-
-    if incoming_msg in ["hi", "hello", "book", "hey"]:
-        session = {"step": 1}
-        msg.body("Hi! Welcome to *PilatesHQ* with Nadine. 🧘‍♀️\n\nWhich class would you like to book?\n1. Reformer Single (R300)\n2. Reformer Duo (R250)\n3. Reformer Trio (R200)")
-
-    elif session["step"] == 1:
-        if incoming_msg.startswith("1"):
-            session["class"] = "Reformer Single"
-        elif incoming_msg.startswith("2"):
-            session["class"] = "Reformer Duo"
-        elif incoming_msg.startswith("3"):
-            session["class"] = "Reformer Trio"
+    if mode and token:
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            return challenge, 200
         else:
-            msg.body("Please enter 1, 2, or 3 to choose your class.")
-            return str(resp)
+            return "Forbidden", 403
+    return "Bad Request", 400
 
-        session["step"] = 2
-        msg.body(f"Great! You selected *{session['class']}*.\n\nPlease enter your preferred date and time (e.g. 15 Aug, 10am):")
+# Handle incoming WhatsApp messages
+@app.route("/webhook", methods=["POST"])
+def receive_webhook():
+    data = request.get_json()
 
-    elif session["step"] == 2:
-        session["datetime"] = incoming_msg
-        session["step"] = 3
-        msg.body("Got it. Please enter your *full name*:")
+    if data and data.get("entry"):
+        try:
+            for entry in data["entry"]:
+                for change in entry["changes"]:
+                    if "messages" in change["value"]:
+                        for message in change["value"]["messages"]:
+                            sender = message["from"]
+                            msg_text = message["text"]["body"]
+                            send_whatsapp_message(sender, f"Echo: {msg_text}")
+        except Exception as e:
+            print("Error processing webhook:", e)
 
-    elif session["step"] == 3:
-        session["name"] = incoming_msg
-        session["step"] = 4
-        msg.body("Thanks! Lastly, please provide your *contact number*:")
+    return "EVENT_RECEIVED", 200
 
-    elif session["step"] == 4:
-        session["contact"] = incoming_msg
-        msg.body(f"✅ Booking Confirmed!\n\nClass: {session['class']}\nDate/Time: {session['datetime']}\nName: {session['name']}\nContact: {session['contact']}\n\nSee you soon at *PilatesHQ*! 🙌")
-        # Store booking (in real app, store to DB/Google Sheets)
-        print("New Booking:", session)
-        session = {"step": 0}  # Reset
-
-    else:
-        msg.body("Hi! To start your booking, reply with *Hi* or *Book*.")
-
-    sessions[from_number] = session
-    return str(resp)
+# Send WhatsApp message via Meta Cloud API
+def send_whatsapp_message(to_number, message):
+    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "text",
+        "text": {"body": message}
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    print("Message sent:", response.status_code, response.text)
+    return response
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
