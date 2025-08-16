@@ -1,19 +1,48 @@
-from flask import Flask, request, jsonify
-import requests
+# pilateshq-booking-bot/
+# │
+# ├── main.py          # Flask entry point
+# ├── booking.py       # Handles PilatesHQ booking & schedule logic
+# ├── wellness.py      # Handles ChatGPT wellness/FAQ responses
+# ├── utils.py         # Shared helpers (e.g. send_whatsapp_message)
+# ├── requirements.txt # Dependencies
+# ├── Procfile         # Render process definition
+# └── README.md        # (optional)
+
+# This way, main.py is always clean, and all the conversation logic lives in booking.py. 
+# Render will run it the same way as before — no changes needed to deployment.
+# Extend the modular setup with Booking + Wellness (ChatGPT). 
+# This way, PilatesHQ bot can handle structured bookings and friendly Q&A wellness support
+
+# User sends "1 ..." → handled as Business/Bookings
+# User sends "2 ..." → handled by wellness.py (ChatGPT wellness assistant)
+# Other text → just echoes back
+
+# flask → for the web server
+# requests → for sending messages to Meta Cloud API
+# openai → needed for wellness.py (ChatGPT calls)
+# gunicorn → production server that Render uses to run Flask apps
+
+from flask import Flask, request
 import os
+
+from booking import handle_booking_message
+from wellness import handle_wellness_message
+from utils import send_whatsapp_message
 
 app = Flask(__name__)
 
-# Environment variables (configure in Render dashboard)
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "klresolute_verify_2025")
+# Environment variables
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+
 
 @app.route("/", methods=["GET"])
 def home():
     return "PilatesHQ WhatsApp Bot is running!", 200
 
-# --- Webhook Verification ---
+
+# Webhook verification for Meta
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -27,7 +56,8 @@ def verify_webhook():
             return "Forbidden", 403
     return "Bad Request", 400
 
-# --- Handle Incoming Messages ---
+
+# Handle incoming WhatsApp messages
 @app.route("/webhook", methods=["POST"])
 def receive_webhook():
     data = request.get_json()
@@ -39,58 +69,20 @@ def receive_webhook():
                     if "messages" in change["value"]:
                         for message in change["value"]["messages"]:
                             sender = message["from"]
+                            msg_text = message["text"]["body"].strip().lower()
 
-                            if "text" in message:
-                                msg_text = message["text"]["body"].strip().lower()
-                                handle_message(sender, msg_text)
+                            # Simple routing
+                            if any(word in msg_text for word in ["book", "schedule", "class"]):
+                                reply = handle_booking_message(msg_text)
+                            else:
+                                reply = handle_wellness_message(msg_text)
 
+                            send_whatsapp_message(sender, reply)
         except Exception as e:
             print("Error processing webhook:", e)
 
     return "EVENT_RECEIVED", 200
 
-# --- Handle user message logic ---
-def handle_message(sender, msg_text):
-    if msg_text in ["hi", "hello", "menu"]:
-        send_menu(sender)
-
-    elif msg_text == "1":
-        send_whatsapp_message(sender, "📅 To book a class, please reply with your preferred day & time.")
-    elif msg_text == "2":
-        send_whatsapp_message(sender, "🗓 PilatesHQ Schedule:\nMon-Fri: 7am, 9am, 5pm\nSat: 8am, 10am")
-    elif msg_text == "3":
-        send_whatsapp_message(sender, "🌱 Wellness Tip: Consistency is key! Even 10 minutes of Pilates daily can boost posture & energy.")
-    else:
-        send_whatsapp_message(sender, "🤖 Sorry, I didn’t understand that. Reply 'menu' to see options again.")
-
-# --- Menu Message ---
-def send_menu(to_number):
-    menu_text = (
-        "👋 Welcome to *PilatesHQ*!\n\n"
-        "Please choose an option:\n"
-        "1️⃣ Book a class\n"
-        "2️⃣ View schedule\n"
-        "3️⃣ Wellness tip\n\n"
-        "Reply with the number of your choice."
-    )
-    send_whatsapp_message(to_number, menu_text)
-
-# --- Send WhatsApp Message via Meta Cloud API ---
-def send_whatsapp_message(to_number, message):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "text",
-        "text": {"body": message}
-    }
-    response = requests.post(url, headers=headers, json=payload)
-    print("Message sent:", response.status_code, response.text)
-    return response
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
