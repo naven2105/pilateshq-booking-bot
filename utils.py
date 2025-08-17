@@ -25,10 +25,34 @@ def send_whatsapp_message(to: str, message: str):
     print("Message sent:", response.status_code, response.text)
 
 
-def send_whatsapp_buttons(to: str):
+def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = None):
     """
-    Send the main menu with 3 quick-reply buttons.
+    Send WhatsApp interactive buttons.
+    Can be called with just 'to' parameter for default menu,
+    or with custom message_text and buttons.
     """
+    # Default message and buttons if not provided
+    if message_text is None:
+        message_text = "👋 Welcome to PilatesHQ! Please choose an option:"
+    
+    if buttons is None:
+        buttons = [
+            {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
+            {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
+            {"id": "BOOK", "title": "📅 Book a Class"},
+        ]
+    
+    # Convert buttons to WhatsApp API format
+    whatsapp_buttons = []
+    for button in buttons:
+        whatsapp_buttons.append({
+            "type": "reply", 
+            "reply": {
+                "id": button["id"], 
+                "title": button["title"]
+            }
+        })
+    
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
@@ -39,13 +63,9 @@ def send_whatsapp_buttons(to: str):
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": "👋 Welcome to PilatesHQ! Please choose an option:"},
+            "body": {"text": message_text},
             "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "about", "title": "ℹ️ About PilatesHQ"}},
-                    {"type": "reply", "reply": {"id": "wellness", "title": "💬 Wellness Q&A"}},
-                    {"type": "reply", "reply": {"id": "book", "title": "📅 Book a Class"}},
-                ]
+                "buttons": whatsapp_buttons
             }
         }
     }
