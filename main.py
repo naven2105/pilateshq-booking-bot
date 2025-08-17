@@ -46,35 +46,41 @@ def receive_webhook():
                         for message in change["value"]["messages"]:
                             sender = message["from"]
 
-                            reply = None
-
-                            # Case 1: Button replies
-                            if "interactive" in message:
-                                interactive = message["interactive"]
-                                if interactive["type"] == "button_reply":
-                                    button_id = interactive["button_reply"]["id"]
-
-                                    if button_id == "ABOUT":
-                                        reply = "ℹ️ PilatesHQ is a boutique studio in Lyndhurst. We focus on personalised Reformer Pilates for all clients, including rehabilitation and wellness support."
-                                    elif button_id == "WELLNESS":
-                                        reply = handle_wellness_message("wellness")
-                                    elif button_id == "BOOK":
-                                        reply = handle_booking_message("book")
-
-                            # Case 2: Free text messages
-                            elif "text" in message:
+                            # Handle text messages
+                            if "text" in message:
                                 msg_text = message["text"]["body"].strip().lower()
 
+                                # Show menu if user greets
+                                if msg_text in ["hi", "hello", "start"]:
+                                    send_whatsapp_buttons(sender)
+                                    continue
+
+                                # Route normal text
                                 if any(word in msg_text for word in ["book", "schedule", "class"]):
                                     reply = handle_booking_message(msg_text)
-                                elif any(word in msg_text for word in ["hi", "hello", "menu", "start"]):
-                                    # Show menu again
-                                    send_whatsapp_buttons(sender)
                                 else:
                                     reply = handle_wellness_message(msg_text)
 
-                            # Send reply if we built one
-                            if reply:
+                                send_whatsapp_message(sender, reply)
+
+                            # Handle interactive button clicks
+                            elif "interactive" in message:
+                                button_reply = message["interactive"]["button_reply"]["id"]
+
+                                if button_reply == "ABOUT":
+                                    reply = (
+                                        "ℹ️ *About PilatesHQ*\n\n"
+                                        "PilatesHQ is a boutique studio in Lyndhurst, Johannesburg, "
+                                        "specialising in Reformer Pilates for strength, mobility, and rehabilitation. "
+                                        "We focus on personalised, small-group classes to help you move better and feel stronger."
+                                    )
+                                elif button_reply == "WELLNESS":
+                                    reply = "💬 Great! Ask me anything about wellness, fitness, or Pilates."
+                                elif button_reply == "BOOK":
+                                    reply = handle_booking_message("book")
+                                else:
+                                    reply = "Please choose one of the options from the menu."
+
                                 send_whatsapp_message(sender, reply)
 
         except Exception as e:
