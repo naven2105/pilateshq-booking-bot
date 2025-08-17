@@ -1,38 +1,14 @@
-# pilateshq-booking-bot/
-# │
-# ├── main.py          # Flask entry point
-# ├── booking.py       # Handles PilatesHQ booking & schedule logic
-# ├── wellness.py      # Handles ChatGPT wellness/FAQ responses
-# ├── utils.py         # Shared helpers (e.g. send_whatsapp_message)
-# ├── requirements.txt # Dependencies
-# ├── Procfile         # Render process definition
-# └── README.md        # (optional)
-
-# This way, main.py is always clean, and all the conversation logic lives in booking.py. 
-# Render will run it the same way as before — no changes needed to deployment.
-# Extend the modular setup with Booking + Wellness (ChatGPT). 
-# This way, PilatesHQ bot can handle structured bookings and friendly Q&A wellness support
-
-# User sends "1 ..." → handled as Business/Bookings
-# User sends "2 ..." → handled by wellness.py (ChatGPT wellness assistant)
-# Other text → just echoes back
-
-# flask → for the web server
-# requests → for sending messages to Meta Cloud API
-# openai → needed for wellness.py (ChatGPT calls)
-# gunicorn → production server that Render uses to run Flask apps
-
 from flask import Flask, request
 import os
 
 from booking import handle_booking_message
 from wellness import handle_wellness_message
-from utils import send_whatsapp_message
+from utils import send_whatsapp_message, send_whatsapp_buttons
 
 app = Flask(__name__)
 
 # Environment variables
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "klresolute_verify_2025")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
@@ -69,15 +45,52 @@ def receive_webhook():
                     if "messages" in change["value"]:
                         for message in change["value"]["messages"]:
                             sender = message["from"]
-                            msg_text = message["text"]["body"].strip().lower()
 
-                            # Simple routing
-                            if any(word in msg_text for word in ["book", "schedule", "class"]):
-                                reply = handle_booking_message(msg_text)
-                            else:
-                                reply = handle_wellness_message(msg_text)
+                            # If it's a button click
+                            if message.get("type") == "button":
+                                button_payload = message["button"]["payload"]
 
-                            send_whatsapp_message(sender, reply)
+                                if button_payload == "ABOUT":
+                                    reply = (
+                                        "ℹ️ *About PilatesHQ*\n\n"
+                                        "PilatesHQ is a boutique Pilates studio in Lyndhurst, Gauteng. "
+                                        "We specialise in Reformer Pilates for all levels — from beginners to rehabilitation clients. "
+                                        "Come move, strengthen, and feel amazing!"
+                                    )
+
+                                elif button_payload == "WELLNESS":
+                                    reply = handle_wellness_message("hi")  # starter for ChatGPT
+
+                                elif button_payload == "BOOK":
+                                    reply = handle_booking_message("")  # booking logic from booking.py
+
+                                else:
+                                    reply = "Sorry, I didn’t understand that option."
+
+                                send_whatsapp_message(sender, reply)
+
+                            # If it's a normal text message
+                            elif message.get("type") == "text":
+                                msg_text = message["text"]["body"].strip().lower()
+
+                                # Show welcome buttons on "hi", "hello", "start"
+                                if msg_text in ["hi", "hello", "start"]:
+                                    send_whatsapp_buttons(
+                                        sender,
+                                        "👋 Welcome to PilatesHQ!\nPlease choose an option:",
+                                        [
+                                            {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
+                                            {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
+                                            {"id": "BOOK", "title": "📅 Book a Class"},
+                                        ],
+                                    )
+                                elif any(word in msg_text for word in ["book", "schedule", "class"]):
+                                    reply = handle_booking_message(msg_text)
+                                    send_whatsapp_message(sender, reply)
+                                else:
+                                    reply = handle_wellness_message(msg_text)
+                                    send_whatsapp_message(sender, reply)
+
         except Exception as e:
             print("Error processing webhook:", e)
 
