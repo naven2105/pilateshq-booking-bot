@@ -46,50 +46,36 @@ def receive_webhook():
                         for message in change["value"]["messages"]:
                             sender = message["from"]
 
-                            # If it's a button click
-                            if message.get("type") == "button":
-                                button_payload = message["button"]["payload"]
+                            reply = None
 
-                                if button_payload == "ABOUT":
-                                    reply = (
-                                        "ℹ️ *About PilatesHQ*\n\n"
-                                        "PilatesHQ is a boutique Pilates studio in Lyndhurst, Gauteng. "
-                                        "We specialise in Reformer Pilates for all levels — from beginners to rehabilitation clients. "
-                                        "Come move, strengthen, and feel amazing!"
-                                    )
+                            # Case 1: Button replies
+                            if "interactive" in message:
+                                interactive = message["interactive"]
+                                if interactive["type"] == "button_reply":
+                                    button_id = interactive["button_reply"]["id"]
 
-                                elif button_payload == "WELLNESS":
-                                    reply = handle_wellness_message("hi")  # starter for ChatGPT
+                                    if button_id == "ABOUT":
+                                        reply = "ℹ️ PilatesHQ is a boutique studio in Lyndhurst. We focus on personalised Reformer Pilates for all clients, including rehabilitation and wellness support."
+                                    elif button_id == "WELLNESS":
+                                        reply = handle_wellness_message("wellness")
+                                    elif button_id == "BOOK":
+                                        reply = handle_booking_message("book")
 
-                                elif button_payload == "BOOK":
-                                    reply = handle_booking_message("")  # booking logic from booking.py
-
-                                else:
-                                    reply = "Sorry, I didn’t understand that option."
-
-                                send_whatsapp_message(sender, reply)
-
-                            # If it's a normal text message
-                            elif message.get("type") == "text":
+                            # Case 2: Free text messages
+                            elif "text" in message:
                                 msg_text = message["text"]["body"].strip().lower()
 
-                                # Show welcome buttons on "hi", "hello", "start"
-                                if msg_text in ["hi", "hello", "start"]:
-                                    send_whatsapp_buttons(
-                                        sender,
-                                        "👋 Welcome to PilatesHQ!\nPlease choose an option:",
-                                        [
-                                            {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
-                                            {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
-                                            {"id": "BOOK", "title": "📅 Book a Class"},
-                                        ],
-                                    )
-                                elif any(word in msg_text for word in ["book", "schedule", "class"]):
+                                if any(word in msg_text for word in ["book", "schedule", "class"]):
                                     reply = handle_booking_message(msg_text)
-                                    send_whatsapp_message(sender, reply)
+                                elif any(word in msg_text for word in ["hi", "hello", "menu", "start"]):
+                                    # Show menu again
+                                    send_whatsapp_buttons(sender)
                                 else:
                                     reply = handle_wellness_message(msg_text)
-                                    send_whatsapp_message(sender, reply)
+
+                            # Send reply if we built one
+                            if reply:
+                                send_whatsapp_message(sender, reply)
 
         except Exception as e:
             print("Error processing webhook:", e)

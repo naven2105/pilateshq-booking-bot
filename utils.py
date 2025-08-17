@@ -31,28 +31,26 @@ def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = Non
     Can be called with just 'to' parameter for default menu,
     or with custom message_text and buttons.
     """
-    # Default message and buttons if not provided
     if message_text is None:
         message_text = "👋 Welcome to PilatesHQ! Please choose an option:"
-    
+
     if buttons is None:
         buttons = [
             {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
             {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
             {"id": "BOOK", "title": "📅 Book a Class"},
         ]
-    
-    # Convert buttons to WhatsApp API format
+
     whatsapp_buttons = []
     for button in buttons:
         whatsapp_buttons.append({
-            "type": "reply", 
+            "type": "reply",
             "reply": {
-                "id": button["id"], 
+                "id": button["id"],
                 "title": button["title"]
             }
         })
-    
+
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json"
@@ -71,3 +69,11 @@ def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = Non
     }
     response = requests.post(WHATSAPP_API_URL, headers=headers, json=data)
     print("Buttons sent:", response.status_code, response.text)
+
+
+def send_welcome_menu(to: str):
+    """
+    Send the default PilatesHQ welcome menu (buttons).
+    This can be called when a new user messages for the first time.
+    """
+    send_whatsapp_buttons(to)
