@@ -1,10 +1,9 @@
-# main.py
 from flask import Flask, request
 import os
 
 from booking import handle_booking_message
 from wellness import handle_wellness_message
-from utils import send_whatsapp_message, send_whatsapp_buttons
+from utils import send_whatsapp_buttons
 
 app = Flask(__name__)
 
@@ -43,40 +42,46 @@ def receive_webhook():
         try:
             for entry in data["entry"]:
                 for change in entry["changes"]:
-                    if "messages" in change["value"]:
-                        for message in change["value"]["messages"]:
+                    value = change["value"]
+
+                    if "messages" in value:
+                        for message in value["messages"]:
                             sender = message["from"]
 
-                            # Button clicks
-                            if "interactive" in message:
+                            # If message is a button reply
+                            if message.get("type") == "interactive":
                                 button_reply = message["interactive"]["button_reply"]["id"]
 
                                 if button_reply == "ABOUT":
-                                    reply = "PilatesHQ is a boutique Pilates studio offering reformer and wall unit classes. We focus on wellness, strength, and flexibility in small groups."
+                                    reply = (
+                                        "ℹ️ *About PilatesHQ*\n\n"
+                                        "PilatesHQ offers personalised and group Reformer Pilates classes "
+                                        "focused on strength, flexibility, and recovery. "
+                                        "We help you move better, feel stronger, and recover faster."
+                                    )
+                                    send_whatsapp_buttons(sender, reply)
+
                                 elif button_reply == "WELLNESS":
-                                    reply = handle_wellness_message("wellness", sender)
+                                    reply = "💬 Please type your wellness or Pilates-related question."
+                                    send_whatsapp_buttons(sender, reply)
+
                                 elif button_reply == "BOOK":
                                     reply = handle_booking_message("book", sender)
-                                elif button_reply == "MENU":
-                                    print("User returned to MENU")
-                                    send_whatsapp_buttons(sender)  # back to main menu
-                                    reply = None
-                                else:
-                                    reply = "Sorry, I didn’t understand that option."
+                                    send_whatsapp_buttons(sender, reply)
 
-                            # Free text messages
-                            elif "text" in message:
+                                elif button_reply == "MAIN_MENU":
+                                    send_whatsapp_buttons(sender)  # default menu
+
+                            else:
+                                # If it's free text, route it
                                 msg_text = message["text"]["body"].strip().lower()
+
                                 if any(word in msg_text for word in ["book", "schedule", "class"]):
                                     reply = handle_booking_message(msg_text, sender)
+                                    send_whatsapp_buttons(sender, reply)
                                 else:
-                                    reply = handle_wellness_message(msg_text, sender)
-                            else:
-                                reply = "Unsupported message type."
-
-                            # Only send text if reply is not None
-                            if reply:
-                                send_whatsapp_message(sender, reply)
+                                    reply = handle_wellness_message(msg_text)
+                                    send_whatsapp_buttons(sender, reply)
 
         except Exception as e:
             print("Error processing webhook:", e)
