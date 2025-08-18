@@ -1,3 +1,11 @@
+# 🔹 utils.py (WhatsApp API Helper)
+# send_whatsapp_message() → sends plain text replies.
+# send_whatsapp_buttons() → sends interactive button menus.
+# Default welcome menu has 3 options:
+# ℹ️ About PilatesHQ
+# 💬 Wellness Q&A
+# 📅 Book a Class
+
 import requests
 import os
 

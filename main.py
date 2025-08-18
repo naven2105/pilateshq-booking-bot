@@ -1,3 +1,15 @@
+# 🔹 main.py (Router / Orchestrator)
+# Handles webhook verification (GET).
+# Handles incoming WhatsApp messages (POST).
+# Routes messages:
+# Interactive button clicks → triggers:
+# "ABOUT" → About PilatesHQ (static text).
+# "WELLNESS" → Passes text to wellness.py (ChatGPT assistant).
+# "BOOK" → Passes text to booking.py.
+# Text messages:
+# If contains book/schedule/class → goes to Booking.
+# Otherwise → goes to Wellness Q&A.
+
 from flask import Flask, request
 import os
 
@@ -57,7 +69,7 @@ def receive_webhook():
 
                                 # Route normal text
                                 if any(word in msg_text for word in ["book", "schedule", "class"]):
-                                    reply = handle_booking_message(msg_text)
+                                    reply = handle_booking_message(msg_text, sender)
                                 else:
                                     reply = handle_wellness_message(msg_text)
 
