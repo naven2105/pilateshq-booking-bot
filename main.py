@@ -1,15 +1,4 @@
-# 🔹 main.py (Router / Orchestrator)
-# Handles webhook verification (GET).
-# Handles incoming WhatsApp messages (POST).
-# Routes messages:
-# Interactive button clicks → triggers:
-# "ABOUT" → About PilatesHQ (static text).
-# "WELLNESS" → Passes text to wellness.py (ChatGPT assistant).
-# "BOOK" → Passes text to booking.py.
-# Text messages:
-# If contains book/schedule/class → goes to Booking.
-# Otherwise → goes to Wellness Q&A.
-
+# main.py
 from flask import Flask, request
 import os
 
@@ -20,7 +9,7 @@ from utils import send_whatsapp_message, send_whatsapp_buttons
 app = Flask(__name__)
 
 # Environment variables
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "klresolute_verify_2025")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
@@ -58,41 +47,35 @@ def receive_webhook():
                         for message in change["value"]["messages"]:
                             sender = message["from"]
 
-                            # Handle text messages
-                            if "text" in message:
-                                msg_text = message["text"]["body"].strip().lower()
-
-                                # Show menu if user greets
-                                if msg_text in ["hi", "hello", "start"]:
-                                    send_whatsapp_buttons(sender)
-                                    continue
-
-                                # Route normal text
-                                if any(word in msg_text for word in ["book", "schedule", "class"]):
-                                    reply = handle_booking_message(msg_text, sender)
-                                else:
-                                    reply = handle_wellness_message(msg_text)
-
-                                send_whatsapp_message(sender, reply)
-
-                            # Handle interactive button clicks
-                            elif "interactive" in message:
+                            # Button clicks
+                            if "interactive" in message:
                                 button_reply = message["interactive"]["button_reply"]["id"]
 
                                 if button_reply == "ABOUT":
-                                    reply = (
-                                        "ℹ️ *About PilatesHQ*\n\n"
-                                        "PilatesHQ is a boutique studio in Lyndhurst, Johannesburg, "
-                                        "specialising in Reformer Pilates for strength, mobility, and rehabilitation. "
-                                        "We focus on personalised, small-group classes to help you move better and feel stronger."
-                                    )
+                                    reply = "PilatesHQ is a boutique Pilates studio offering reformer and wall unit classes. We focus on wellness, strength, and flexibility in small groups."
                                 elif button_reply == "WELLNESS":
-                                    reply = "💬 Great! Ask me anything about wellness, fitness, or Pilates."
+                                    reply = handle_wellness_message("wellness", sender)
                                 elif button_reply == "BOOK":
                                     reply = handle_booking_message("book", sender)
+                                elif button_reply == "MENU":
+                                    print("User returned to MENU")
+                                    send_whatsapp_buttons(sender)  # back to main menu
+                                    reply = None
                                 else:
-                                    reply = "Please choose one of the options from the menu."
+                                    reply = "Sorry, I didn’t understand that option."
 
+                            # Free text messages
+                            elif "text" in message:
+                                msg_text = message["text"]["body"].strip().lower()
+                                if any(word in msg_text for word in ["book", "schedule", "class"]):
+                                    reply = handle_booking_message(msg_text, sender)
+                                else:
+                                    reply = handle_wellness_message(msg_text, sender)
+                            else:
+                                reply = "Unsupported message type."
+
+                            # Only send text if reply is not None
+                            if reply:
                                 send_whatsapp_message(sender, reply)
 
         except Exception as e:
