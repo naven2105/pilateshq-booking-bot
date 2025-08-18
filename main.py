@@ -89,7 +89,7 @@ def receive_webhook():
                                 elif button_reply == "WELLNESS":
                                     reply = "💬 Great! Ask me anything about wellness, fitness, or Pilates."
                                 elif button_reply == "BOOK":
-                                    reply = handle_booking_message("book")
+                                    reply = handle_booking_message("book", sender)
                                 else:
                                     reply = "Please choose one of the options from the menu."
 
