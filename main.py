@@ -39,7 +39,7 @@ def receive_webhook():
         sender = msg["from"]
 
         if msg.get("type") == "interactive":
-            # Button reply OR List reply
+            # Button or List reply
             if "button_reply" in msg["interactive"]:
                 choice_id = msg["interactive"]["button_reply"]["id"].strip().upper()
             elif "list_reply" in msg["interactive"]:
@@ -70,15 +70,17 @@ def route_message(sender: str, text: str):
     elif text == "WELLNESS":
         logging.info(f"[FLOW] WELLNESS -> {sender}")
         reply = handle_wellness_message("wellness", sender)
-        send_whatsapp_buttons(sender, reply)
+        send_whatsapp_buttons(sender, reply)  # sub-screens will auto-add Menu
     elif text == "BOOK" or text in ("GROUP", "DUO", "SINGLE") or text.startswith(("DAY_", "TIME_")):
         logging.info(f"[FLOW] BOOK -> {sender} | {text}")
-        handle_booking_message(text, sender)  # booking sends its own UI
+        from booking import handle_booking_message  # avoid circular import issues on reload
+        handle_booking_message(text, sender)        # booking sends its own UI
     else:
         reply = handle_wellness_message(text, sender)
         send_whatsapp_buttons(sender, reply)
 
 def send_main_menu(to: str):
+    from utils import send_whatsapp_buttons  # local import to ensure latest
     send_whatsapp_buttons(
         to,
         "👋 Welcome to PilatesHQ! Please choose an option:",
@@ -87,10 +89,10 @@ def send_main_menu(to: str):
             {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
             {"id": "BOOK", "title": "📅 Book a Class"},
         ],
+        ensure_menu=False,  # keep all three visible; no auto Menu here
     )
 
 def send_about(to: str):
-    logging.info(f"[FLOW] ABOUT display -> {to}")
     send_whatsapp_buttons(
         to,
         "PilatesHQ delivers transformative Pilates sessions led by internationally certified instructors, "

@@ -16,8 +16,8 @@ def _post_to_whatsapp(payload: dict, to: str, context: str):
     except Exception as e:
         logging.error(f"[WA ERROR] send to {to} failed: {e}", exc_info=True)
 
-def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = None):
-    """Send up to 3 reply buttons; always ensure a Menu button if space allows."""
+def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = None, ensure_menu: bool = True):
+    """Send up to 3 reply buttons; optionally auto-append a Menu button."""
     if message_text is None:
         message_text = "👋 Welcome to PilatesHQ! Please choose an option:"
     if buttons is None:
@@ -27,16 +27,20 @@ def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = Non
             {"id": "BOOK", "title": "📅 Book a Class"},
         ]
 
-    # Enforce WhatsApp limit (max 3). If space, add MENU; otherwise replace last with MENU.
-    has_menu = any(b.get("id") in ("MENU", "MAIN_MENU") for b in buttons)
-    if len(buttons) >= 3:
-        if not has_menu:
-            buttons = buttons[:2] + [{"id": "MENU", "title": "🔙 Return to Menu"}]
+    # Enforce WhatsApp limit (max 3). If ensure_menu, try to include MENU.
+    if ensure_menu:
+        has_menu = any(b.get("id") in ("MENU", "MAIN_MENU") for b in buttons)
+        if len(buttons) >= 3:
+            if not has_menu:
+                buttons = buttons[:2] + [{"id": "MENU", "title": "🔙 Return to Menu"}]
+            else:
+                buttons = buttons[:3]
         else:
-            buttons = buttons[:3]
+            if not has_menu:
+                buttons.append({"id": "MENU", "title": "🔙 Return to Menu"})
     else:
-        if not has_menu:
-            buttons.append({"id": "MENU", "title": "🔙 Return to Menu"})
+        # Even without ensure_menu we still must respect max 3
+        buttons = buttons[:3]
 
     wa_buttons = [{"type": "reply", "reply": {"id": b["id"], "title": b["title"]}} for b in buttons]
 
@@ -54,7 +58,7 @@ def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = Non
     _post_to_whatsapp(payload, to, context=f"buttons ids={ids}")
 
 def send_whatsapp_list(to: str, body_text: str, button_title: str, rows: list, section_title: str = "Options"):
-    """Send a List message (good for >3 choices). Rows = [{'id','title','description'?}]"""
+    """Send a List message. Rows: [{'id','title', 'description'?}]"""
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -63,7 +67,7 @@ def send_whatsapp_list(to: str, body_text: str, button_title: str, rows: list, s
             "type": "list",
             "body": {"text": body_text},
             "action": {
-                "button": button_title,       # what user taps to open list
+                "button": button_title,
                 "sections": [{"title": section_title, "rows": rows}],
             },
         },
