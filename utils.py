@@ -1,75 +1,53 @@
-import os, logging, requests
+import requests
+import os
+import logging
 
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
-WHATSAPP_API_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-def _post_to_whatsapp(payload: dict, to: str, context: str):
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    try:
-        logging.info(f"[WA SEND] -> {to} | {context}")
-        logging.debug(f"[WA PAYLOAD] {payload}")
-        resp = requests.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=15)
-        logging.info(f"[WA RESP] <- {to} | status={resp.status_code}")
-        logging.debug(f"[WA RESP BODY] {resp.text}")
-        return resp
-    except Exception as e:
-        logging.error(f"[WA ERROR] send to {to} failed: {e}", exc_info=True)
+WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 
-def send_whatsapp_buttons(to: str, message_text: str = None, buttons: list = None, ensure_menu: bool = True):
-    """Send up to 3 reply buttons; optionally auto-append a Menu button."""
-    if message_text is None:
-        message_text = "👋 Welcome to PilatesHQ! Please choose an option:"
-    if buttons is None:
-        buttons = [
-            {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
-            {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
-            {"id": "BOOK", "title": "📅 Book a Class"},
-        ]
 
-    # Enforce WhatsApp limit (max 3). If ensure_menu, try to include MENU.
-    if ensure_menu:
-        has_menu = any(b.get("id") in ("MENU", "MAIN_MENU") for b in buttons)
-        if len(buttons) >= 3:
-            if not has_menu:
-                buttons = buttons[:2] + [{"id": "MENU", "title": "🔙 Return to Menu"}]
-            else:
-                buttons = buttons[:3]
-        else:
-            if not has_menu:
-                buttons.append({"id": "MENU", "title": "🔙 Return to Menu"})
-    else:
-        # Even without ensure_menu we still must respect max 3
-        buttons = buttons[:3]
+def send_whatsapp_list(recipient, header, body, button_id, options):
+    """
+    Send a WhatsApp list template.
+    options must be <= 10 items due to WA API limit.
+    """
+    logging.info(f"[SEND LIST] To: {recipient}, Header: {header}, Body: {body}, Options: {len(options)}")
 
-    wa_buttons = [{"type": "reply", "reply": {"id": b["id"], "title": b["title"]}} for b in buttons]
+    if len(options) > 10:
+        logging.warning("[UI ERROR] Too many options provided. Trimming to 10.")
+        options = options[:10]
+
+    rows = [{"id": opt["id"], "title": opt["title"]} for opt in options]
 
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": message_text},
-            "action": {"buttons": wa_buttons},
-        },
-    }
-    ids = [b["reply"]["id"] for b in wa_buttons]
-    _post_to_whatsapp(payload, to, context=f"buttons ids={ids}")
-
-def send_whatsapp_list(to: str, body_text: str, button_title: str, rows: list, section_title: str = "Options"):
-    """Send a List message. Rows: [{'id','title', 'description'?}]"""
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
+        "to": recipient,
         "type": "interactive",
         "interactive": {
             "type": "list",
-            "body": {"text": body_text},
+            "header": {"type": "text", "text": header},
+            "body": {"text": body},
+            "footer": {"text": "Powered by PilatesHQ"},
             "action": {
-                "button": button_title,
-                "sections": [{"title": section_title, "rows": rows}],
-            },
-        },
+                "button": "Choose",
+                "sections": [
+                    {
+                        "title": "Options",
+                        "rows": rows
+                    }
+                ]
+            }
+        }
     }
-    _post_to_whatsapp(payload, to, context=f"list rows={len(rows)} title={button_title}")
+
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(WHATSAPP_API_URL, headers=headers, json=payload)
+    logging.debug(f"[WA RESP CODE] {response.status_code}")
+    logging.debug(f"[WA RESP BODY] {response.text}")
+    return response.json()

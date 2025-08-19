@@ -1,105 +1,92 @@
 from flask import Flask, request
-import os, logging
+import os
+import logging
+
 from booking import handle_booking_message
 from wellness import handle_wellness_message
-from utils import send_whatsapp_buttons
+from utils import send_whatsapp_list
 
 app = Flask(__name__)
 
+# Environment variables
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+
+# Setup logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
-@app.route("/", methods=["GET"])
-def home():
-    logging.info("Health check")
-    return "PilatesHQ WhatsApp Bot is running!", 200
-
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    logging.info(f"[VERIFY] mode={mode}")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        logging.info("[VERIFY] success")
-        return challenge, 200
-    logging.warning("[VERIFY] failed")
-    return "Forbidden", 403
+    if token == VERIFY_TOKEN:
+        return challenge
+    return "Verification failed"
 
 @app.route("/webhook", methods=["POST"])
-def receive_webhook():
+def webhook():
     data = request.get_json()
-    logging.info(f"[INCOMING] {data}")
+    logging.debug(f"[WEBHOOK DATA] {data}")
+
     try:
-        value = data["entry"][0]["changes"][0]["value"]
-        if "messages" not in value:
-            return "ok", 200
-        msg = value["messages"][0]
-        sender = msg["from"]
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                for message in messages:
+                    sender = message["from"]
+                    msg_text = message.get("text", {}).get("body", "").strip().upper()
 
-        if msg.get("type") == "interactive":
-            # Button or List reply
-            if "button_reply" in msg["interactive"]:
-                choice_id = msg["interactive"]["button_reply"]["id"].strip().upper()
-            elif "list_reply" in msg["interactive"]:
-                choice_id = msg["interactive"]["list_reply"]["id"].strip().upper()
-            else:
-                choice_id = ""
-            logging.info(f"[CLICK] {sender} -> {choice_id}")
-            route_message(sender, choice_id)
-            return "ok", 200
+                    # Handle button or list replies
+                    if "button" in message or "interactive" in message:
+                        reply_id = (
+                            message.get("button", {}).get("payload") or
+                            message.get("interactive", {}).get("button_reply", {}).get("id") or
+                            message.get("interactive", {}).get("list_reply", {}).get("id")
+                        )
+                        if reply_id:
+                            logging.info(f"[USER CHOICE] {reply_id}")
+                            if reply_id.startswith("BOOK"):
+                                handle_booking_message(reply_id, sender)
+                            elif reply_id.startswith("WELLNESS"):
+                                handle_wellness_message(reply_id, sender)
+                            else:
+                                send_main_menu(sender)
+                        continue
 
-        if msg.get("type") == "text":
-            text = msg["text"]["body"].strip().upper()
-            logging.info(f"[TEXT] {sender} -> {text}")
-            route_message(sender, text)
-            return "ok", 200
+                    # First-time message
+                    if msg_text in ["HI", "HELLO", "START"]:
+                        send_about_message(sender)
+                        send_main_menu(sender)
+                        continue
+
+                    # Default
+                    send_main_menu(sender)
 
     except Exception as e:
-        logging.error(f"[ERROR] webhook handling failed: {e}", exc_info=True)
+        logging.exception(f"[ERROR in webhook]: {str(e)}")
+
     return "ok", 200
 
-def route_message(sender: str, text: str):
-    if text in ("MENU", "MAIN_MENU", "HI", "HELLO", "START"):
-        logging.info(f"[FLOW] MAIN_MENU -> {sender}")
-        send_main_menu(sender)
-    elif text == "ABOUT":
-        logging.info(f"[FLOW] ABOUT -> {sender}")
-        send_about(sender)
-    elif text == "WELLNESS":
-        logging.info(f"[FLOW] WELLNESS -> {sender}")
-        reply = handle_wellness_message("wellness", sender)
-        send_whatsapp_buttons(sender, reply)  # sub-screens will auto-add Menu
-    elif text == "BOOK" or text in ("GROUP", "DUO", "SINGLE") or text.startswith(("DAY_", "TIME_")):
-        logging.info(f"[FLOW] BOOK -> {sender} | {text}")
-        from booking import handle_booking_message  # avoid circular import issues on reload
-        handle_booking_message(text, sender)        # booking sends its own UI
-    else:
-        reply = handle_wellness_message(text, sender)
-        send_whatsapp_buttons(sender, reply)
 
-def send_main_menu(to: str):
-    from utils import send_whatsapp_buttons  # local import to ensure latest
-    send_whatsapp_buttons(
-        to,
-        "👋 Welcome to PilatesHQ! Please choose an option:",
-        [
-            {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
-            {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
-            {"id": "BOOK", "title": "📅 Book a Class"},
-        ],
-        ensure_menu=False,  # keep all three visible; no auto Menu here
-    )
-
-def send_about(to: str):
-    send_whatsapp_buttons(
-        to,
+def send_about_message(recipient):
+    about_text = (
+        "✨ Welcome to PilatesHQ ✨\n\n"
         "PilatesHQ delivers transformative Pilates sessions led by internationally certified instructors, "
-        "emphasizing holistic wellness, enhanced strength, and improved mobility.\n"
-        "📍 Norwood, Johannesburg • 🎉 Opening Special: Group Classes @ R180 until January",
-        [{"id": "MENU", "title": "🏠 Return to Menu"}],
+        "emphasizing holistic wellness, enhanced strength, and improved mobility.\n\n"
+        "🌐 Visit us online: https://pilateshq.co.za"
     )
+    send_whatsapp_list(recipient, "About PilatesHQ", about_text, "MAIN_MENU", [
+        {"id": "BOOK", "title": "📅 Book a Class"},
+        {"id": "WELLNESS", "title": "💡 Wellness Tips"},
+    ])
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+
+def send_main_menu(recipient):
+    menu_text = "Please choose from the options below 👇"
+    send_whatsapp_list(recipient, "Main Menu", menu_text, "MAIN_MENU", [
+        {"id": "BOOK", "title": "📅 Book a Class"},
+        {"id": "WELLNESS", "title": "💡 Wellness Tips"},
+    ])
