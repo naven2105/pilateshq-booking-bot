@@ -1,19 +1,12 @@
 from flask import Flask, request
-import os
-import logging
-
+import os, logging
 from booking import handle_booking_message
 from wellness import handle_wellness_message
 from utils import send_whatsapp_buttons
 
 app = Flask(__name__)
 
-# Env
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
-
-# Logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
@@ -22,41 +15,41 @@ def home():
     logging.info("Health check")
     return "PilatesHQ WhatsApp Bot is running!", 200
 
-# Webhook verification (GET)
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    logging.info(f"[VERIFY] mode={mode} token={token}")
+    logging.info(f"[VERIFY] mode={mode}")
     if mode == "subscribe" and token == VERIFY_TOKEN:
         logging.info("[VERIFY] success")
         return challenge, 200
     logging.warning("[VERIFY] failed")
     return "Forbidden", 403
 
-# Webhook receiver (POST)
 @app.route("/webhook", methods=["POST"])
 def receive_webhook():
     data = request.get_json()
     logging.info(f"[INCOMING] {data}")
-
     try:
         value = data["entry"][0]["changes"][0]["value"]
         if "messages" not in value:
             return "ok", 200
-
         msg = value["messages"][0]
         sender = msg["from"]
 
-        # Interactive button reply
         if msg.get("type") == "interactive":
-            button_id = msg["interactive"]["button_reply"]["id"].strip().upper()
-            logging.info(f"[CLICK] {sender} -> {button_id}")
-            route_message(sender, button_id)
+            # Button reply OR List reply
+            if "button_reply" in msg["interactive"]:
+                choice_id = msg["interactive"]["button_reply"]["id"].strip().upper()
+            elif "list_reply" in msg["interactive"]:
+                choice_id = msg["interactive"]["list_reply"]["id"].strip().upper()
+            else:
+                choice_id = ""
+            logging.info(f"[CLICK] {sender} -> {choice_id}")
+            route_message(sender, choice_id)
             return "ok", 200
 
-        # Text message
         if msg.get("type") == "text":
             text = msg["text"]["body"].strip().upper()
             logging.info(f"[TEXT] {sender} -> {text}")
@@ -65,25 +58,23 @@ def receive_webhook():
 
     except Exception as e:
         logging.error(f"[ERROR] webhook handling failed: {e}", exc_info=True)
-
     return "ok", 200
 
 def route_message(sender: str, text: str):
     if text in ("MENU", "MAIN_MENU", "HI", "HELLO", "START"):
-        logging.info(f"[FLOW] MAIN_MENU shown -> {sender}")
+        logging.info(f"[FLOW] MAIN_MENU -> {sender}")
         send_main_menu(sender)
     elif text == "ABOUT":
-        logging.info(f"[FLOW] ABOUT clicked -> {sender}")
+        logging.info(f"[FLOW] ABOUT -> {sender}")
         send_about(sender)
     elif text == "WELLNESS":
-        logging.info(f"[FLOW] WELLNESS clicked -> {sender}")
+        logging.info(f"[FLOW] WELLNESS -> {sender}")
         reply = handle_wellness_message("wellness", sender)
         send_whatsapp_buttons(sender, reply)
-    elif text == "BOOK":
-        logging.info(f"[FLOW] BOOK clicked -> {sender}")
-        handle_booking_message("BOOK", sender)  # booking flow sends its own buttons
+    elif text == "BOOK" or text in ("GROUP", "DUO", "SINGLE") or text.startswith(("DAY_", "TIME_")):
+        logging.info(f"[FLOW] BOOK -> {sender} | {text}")
+        handle_booking_message(text, sender)  # booking sends its own UI
     else:
-        # Default to wellness chat for free text
         reply = handle_wellness_message(text, sender)
         send_whatsapp_buttons(sender, reply)
 
