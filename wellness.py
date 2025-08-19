@@ -1,38 +1,32 @@
-# 🔹 wellness.py (ChatGPT Assistant)
-# Uses OPENAI_API_KEY.
-# Friendly Pilates & wellness tone.
-# Short, supportive tips with emojis 🌸💪🧘✨.
-# Replies feel human and warm, not robotic.
-
-from openai import OpenAI
 import os
+import logging
+from openai import OpenAI
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-def handle_wellness_message(msg_text: str) -> str:
-    """
-    Handle wellness Q&A by calling OpenAI.
-    The assistant speaks like a warm, supportive Pilates coach.
-    """
+def handle_wellness_message(msg_text: str, sender: str | None = None) -> str:
+    """Short, warm Pilates/wellness tips. Logs Q/A for lightweight analytics."""
     try:
-        response = client.chat.completions.create(
+        logging.info(f"[WELLNESS] q -> {sender} | {str(msg_text)[:80]}")
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a friendly Pilates and wellness coach. "
+                        "You are a friendly Pilates & wellness coach. "
                         "Keep answers short, supportive, and practical. "
-                        "Always add 1–2 uplifting emojis (like 🌸💪🧘✨😊) to make it warm and human. "
-                        "Avoid sounding too formal or robotic. "
-                        "If relevant, give 1–2 quick tips instead of long paragraphs."
+                        "Add 1–2 uplifting emojis (🌸💪🧘✨😊). "
+                        "Offer 1–2 quick tips, avoid long paragraphs."
                     )
                 },
                 {"role": "user", "content": msg_text},
             ],
             max_tokens=150,
         )
-        return response.choices[0].message.content.strip()
+        answer = resp.choices[0].message.content.strip()
+        logging.info(f"[WELLNESS] a_sent -> {sender}")
+        return answer
     except Exception as e:
-        print("Error with OpenAI wellness assistant:", e)
-        return "Sorry, I'm having trouble answering that right now. 🌸"
+        logging.error(f"[WELLNESS] OpenAI error: {e}", exc_info=True)
+        return "Sorry, I’m having trouble right now. Please try again in a bit. 🌸"

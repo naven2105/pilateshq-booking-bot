@@ -8,76 +8,105 @@ from utils import send_whatsapp_buttons
 
 app = Flask(__name__)
 
-# Environment variables
+# Env
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
-# Setup logging
+# Logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
 @app.route("/", methods=["GET"])
 def home():
-    logging.info("Health check called.")
+    logging.info("Health check")
     return "PilatesHQ WhatsApp Bot is running!", 200
 
-# Webhook verification
+# Webhook verification (GET)
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    logging.info(f"Webhook verification attempt: mode={mode}, token={token}")
+    logging.info(f"[VERIFY] mode={mode} token={token}")
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        logging.info("[VERIFY] success")
+        return challenge, 200
+    logging.warning("[VERIFY] failed")
+    return "Forbidden", 403
 
-    if mode and token:
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            logging.info("Webhook verified successfully.")
-            return challenge, 200
-        else:
-            logging.warning("Webhook verification failed.")
-            return "Forbidden", 403
-    return "Bad Request", 400
-
-# Handle messages
+# Webhook receiver (POST)
 @app.route("/webhook", methods=["POST"])
 def receive_webhook():
     data = request.get_json()
-    logging.info(f"Incoming webhook payload: {data}")
+    logging.info(f"[INCOMING] {data}")
 
-    if data and data.get("entry"):
-        try:
-            for entry in data["entry"]:
-                for change in entry["changes"]:
-                    if "messages" in change["value"]:
-                        for message in change["value"]["messages"]:
-                            sender = message["from"]
-                            logging.info(f"Message received from {sender}: {message}")
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
+        if "messages" not in value:
+            return "ok", 200
 
-                            if message.get("type") == "interactive":
-                                button_reply = message["interactive"]["button_reply"]["id"]
-                                logging.info(f"Button clicked: {button_reply}")
+        msg = value["messages"][0]
+        sender = msg["from"]
 
-                                if button_reply == "ABOUT":
-                                    reply = "ℹ️ PilatesHQ is a specialised Pilates Studio offering reformer and wall-unit sessions designed to improve strength, flexibility, and posture."
-                                    send_whatsapp_buttons(sender, reply)
-                                elif button_reply == "WELLNESS":
-                                    reply = handle_wellness_message("wellness")
-                                    send_whatsapp_buttons(sender, reply)
-                                elif button_reply == "BOOK":
-                                    reply = handle_booking_message("book", sender)
-                                    send_whatsapp_buttons(sender, reply)
+        # Interactive button reply
+        if msg.get("type") == "interactive":
+            button_id = msg["interactive"]["button_reply"]["id"].strip().upper()
+            logging.info(f"[CLICK] {sender} -> {button_id}")
+            route_message(sender, button_id)
+            return "ok", 200
 
-                            elif message.get("type") == "text":
-                                msg_text = message["text"]["body"].strip().lower()
-                                logging.info(f"Text message received: {msg_text}")
-                                reply = handle_wellness_message(msg_text)
-                                send_whatsapp_buttons(sender, reply)
+        # Text message
+        if msg.get("type") == "text":
+            text = msg["text"]["body"].strip().upper()
+            logging.info(f"[TEXT] {sender} -> {text}")
+            route_message(sender, text)
+            return "ok", 200
 
-        except Exception as e:
-            logging.error(f"Error processing webhook: {e}", exc_info=True)
+    except Exception as e:
+        logging.error(f"[ERROR] webhook handling failed: {e}", exc_info=True)
 
-    return "EVENT_RECEIVED", 200
+    return "ok", 200
+
+def route_message(sender: str, text: str):
+    if text in ("MENU", "MAIN_MENU", "HI", "HELLO", "START"):
+        logging.info(f"[FLOW] MAIN_MENU shown -> {sender}")
+        send_main_menu(sender)
+    elif text == "ABOUT":
+        logging.info(f"[FLOW] ABOUT clicked -> {sender}")
+        send_about(sender)
+    elif text == "WELLNESS":
+        logging.info(f"[FLOW] WELLNESS clicked -> {sender}")
+        reply = handle_wellness_message("wellness", sender)
+        send_whatsapp_buttons(sender, reply)
+    elif text == "BOOK":
+        logging.info(f"[FLOW] BOOK clicked -> {sender}")
+        handle_booking_message("BOOK", sender)  # booking flow sends its own buttons
+    else:
+        # Default to wellness chat for free text
+        reply = handle_wellness_message(text, sender)
+        send_whatsapp_buttons(sender, reply)
+
+def send_main_menu(to: str):
+    send_whatsapp_buttons(
+        to,
+        "👋 Welcome to PilatesHQ! Please choose an option:",
+        [
+            {"id": "ABOUT", "title": "ℹ️ About PilatesHQ"},
+            {"id": "WELLNESS", "title": "💬 Wellness Q&A"},
+            {"id": "BOOK", "title": "📅 Book a Class"},
+        ],
+    )
+
+def send_about(to: str):
+    logging.info(f"[FLOW] ABOUT display -> {to}")
+    send_whatsapp_buttons(
+        to,
+        "PilatesHQ delivers transformative Pilates sessions led by internationally certified instructors, "
+        "emphasizing holistic wellness, enhanced strength, and improved mobility.\n"
+        "📍 Norwood, Johannesburg • 🎉 Opening Special: Group Classes @ R180 until January",
+        [{"id": "MENU", "title": "🏠 Return to Menu"}],
+    )
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
