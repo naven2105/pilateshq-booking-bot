@@ -69,14 +69,14 @@ def _send_answer_with_followups(sender: str, answer: str):
 def _topic_hint(code: str) -> str:
     """Map topic id to a short, helpful user prompt."""
     mapping = {
-        "WELLNESS_CORE":     "Give 2–3 safe core-strength tips for Pilates beginners.",
-        "WELLNESS_BACK":     "Give gentle Pilates-based tips to ease lower-back tightness.",
-        "WELLNESS_POSTURE":  "Share desk-posture tips and 2 micro-mobility moves.",
-        "WELLNESS_STRESS":   "Share breathing + short calming routine for stress relief.",
-        "WELLNESS_FLEX":     "Offer simple flexibility ideas for hamstrings and hips.",
-        "WELLNESS_RECOVERY": "General safety-first advice for returning after minor strains.",
-        "WELLNESS_BEGINNER": "How should a total beginner start Pilates? Keep it friendly.",
-        "WELLNESS_SENIORS":  "Gentle, joint-friendly Pilates suggestions for seniors.",
+        "WELLNESS_CORE":     "Core & Mobility.",
+        "WELLNESS_BACK":     "Ease lower-back tightness.",
+        "WELLNESS_POSTURE":  "Posture Focus.",
+        "WELLNESS_STRESS":   "Stress Relief.",
+        "WELLNESS_FLEX":     "Offer simple flexibility ideas.",
+        "WELLNESS_RECOVERY": "Returning after minor strains.",
+        "WELLNESS_BEGINNER": "Total beginner start Pilates.",
+        "WELLNESS_SENIORS":  "Seniors (Gentle)",
     }
     return mapping.get(code, "Share two short, safe Pilates wellness tips.")
 

@@ -7,9 +7,9 @@ def handle_booking_message(choice, sender):
     if choice == "BOOK":
         body = "Please select your class type 👇"
         options = [
-            {"id": "BOOK_GROUP", "title": "👥 Group Class (R180)"},
-            {"id": "BOOK_SINGLE", "title": "🙋 Single Class (R300)"},
-            {"id": "BOOK_DUO", "title": "👫 Duo Class (R250)"}
+            {"id": "BOOK_GROUP", "title": "👥 Group Class R180"},
+            {"id": "BOOK_SINGLE", "title": "🙋 Single Class R300"},
+            {"id": "BOOK_DUO", "title": "👫 Duo Class R250"}
         ]
         send_whatsapp_list(sender, "Class Types", body, "BOOK_CLASS_TYPE", options)
 
