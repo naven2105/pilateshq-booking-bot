@@ -1,5 +1,5 @@
 import logging
-from utils import send_whatsapp_buttons, send_whatsapp_list
+from utils import send_whatsapp_list, send_whatsapp_list
 
 # Per-user state
 user_state = {}  # {sender: {"step","class_type","day_id","day_title","period","time_id","time_title"}}
@@ -86,14 +86,14 @@ def handle_booking_message(msg_text: str, sender: str):
             send_whatsapp_list(sender, "Pick a Day", "Please choose a day:", "BOOK_DAY", DAY_ROWS); return
         state.update({"step":"awaiting_period","day_id":code,"day_title":DAY_MAP[code]})
         user_state[sender] = state
-        send_whatsapp_buttons(sender, f"{state['day_title']} selected. Pick a time period:", PERIOD_BTNS, ensure_menu=False)
+        send_whatsapp_list(sender, f"{state['day_title']} selected. Pick a time period:", PERIOD_BTNS, ensure_menu=False)
         logging.info(f"[BOOK] day -> {sender} | {state['day_title']}")
         return
 
     # Period chosen (button id: PERIOD_*)
     if state["step"] == "awaiting_period":
         if code not in TIME_ROWS_BY_PERIOD:
-            send_whatsapp_buttons(sender, "Please pick a time period:", PERIOD_BTNS, ensure_menu=False); return
+            send_whatsapp_list(sender, "Please pick a time period:", PERIOD_BTNS, ensure_menu=False); return
         state.update({"step":"awaiting_time","period":code})
         user_state[sender] = state
         send_whatsapp_list(sender, "Time Slots", "Choose a time slot:", "BOOK_TIME", TIME_ROWS_BY_PERIOD[code], "Time Slots")

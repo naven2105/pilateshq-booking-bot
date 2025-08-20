@@ -10,12 +10,14 @@ app = Flask(__name__)
 
 # Environment variables
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
 # Setup logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
+
+@app.route("/", methods=["GET"])
+def home():
+    return "OK", 200
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
