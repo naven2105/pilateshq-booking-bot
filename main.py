@@ -61,7 +61,6 @@ def webhook():
                     # First-time message
                     if msg_text in ["HI", "HELLO", "START"]:
                         send_about_message(sender)
-                        send_main_menu(sender)
                         continue
 
                     # Default
