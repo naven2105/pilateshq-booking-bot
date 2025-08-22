@@ -5,7 +5,7 @@ import logging
 from booking import handle_booking_message
 from wellness import handle_wellness_message
 from utils import send_whatsapp_list
-from db import init_db  # <-- DB schema init
+from db import init_db
 
 app = Flask(__name__)
 
@@ -17,8 +17,8 @@ log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
 
-# --- Service lifecycle: initialise DB once per process ---
-@app.before_serving
+# ---- One-time DB init (Flask 3.x) ----
+@app.before_first_request
 def _startup_db():
     try:
         init_db()
@@ -27,13 +27,13 @@ def _startup_db():
         logging.exception("❌ DB init failed", exc_info=True)
 
 
-# --- Health check (optional) ---
+# ---- Health check ----
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
 
 
-# --- Webhook verification (GET) ---
+# ---- Webhook verification (GET) ----
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     token = request.args.get("hub.verify_token")
@@ -47,7 +47,7 @@ def verify_webhook():
     return "Verification failed", 403
 
 
-# --- Webhook receiver (POST) ---
+# ---- Webhook receiver (POST) ----
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -61,7 +61,7 @@ def webhook():
                 for message in messages:
                     sender = message["from"]
 
-                    # Interactive replies (buttons or lists)
+                    # Interactive replies (buttons/lists)
                     if message.get("type") == "interactive":
                         inter = message.get("interactive", {})
                         reply_id = ""
@@ -69,7 +69,6 @@ def webhook():
                             reply_id = inter["button_reply"]["id"]
                         elif "list_reply" in inter:
                             reply_id = inter["list_reply"]["id"]
-
                         reply_id = (reply_id or "").strip().upper()
                         logging.info(f"[CLICK] {sender} -> {reply_id}")
                         route_message(sender, reply_id)
@@ -88,7 +87,7 @@ def webhook():
     return "ok", 200
 
 
-# --- Router ---
+# ---- Router ----
 def route_message(sender: str, text: str):
     # Greetings / main menu
     if text in ("MENU", "MAIN_MENU", "HI", "HELLO", "START"):
@@ -102,7 +101,7 @@ def route_message(sender: str, text: str):
         handle_wellness_message(text, sender)
         return
 
-    # Booking flow (book + all booking IDs)
+    # Booking flow
     if (
         text == "BOOK"
         or text in ("GROUP", "DUO", "SINGLE")
@@ -112,11 +111,11 @@ def route_message(sender: str, text: str):
         handle_booking_message(text, sender)
         return
 
-    # Default: show intro + menu to guide users
+    # Default
     send_intro_and_menu(sender)
 
 
-# --- UI blocks ---
+# ---- UI block ----
 def send_intro_and_menu(recipient: str):
     intro = (
         "✨ Welcome to PilatesHQ ✨\n\n"
@@ -125,7 +124,6 @@ def send_intro_and_menu(recipient: str):
         "📍 Norwood, Johannesburg • 🎉 Opening Special: Group Classes @ R180 until January\n"
         "🌐 https://pilateshq.co.za"
     )
-    # Single list message with the intro text + 2 choices (no duplicate menu)
     send_whatsapp_list(
         recipient,
         header="PilatesHQ",
