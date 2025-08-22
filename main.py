@@ -16,22 +16,24 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
+# ---- One-time DB init (Flask 3.x safe) ----
+_db_inited = False
 
-# ---- One-time DB init (Flask 3.x) ----
-@app.before_first_request
-def _startup_db():
-    try:
-        init_db()
-        logging.info("✅ DB initialised / verified")
-    except Exception as e:
-        logging.exception("❌ DB init failed", exc_info=True)
-
+@app.before_request
+def startup_db_once():
+    global _db_inited
+    if not _db_inited:
+        try:
+            init_db()
+            logging.info("✅ DB initialised / verified")
+        except Exception as e:
+            logging.exception("❌ DB init failed", exc_info=True)
+        _db_inited = True
 
 # ---- Health check ----
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
-
 
 # ---- Webhook verification (GET) ----
 @app.route("/webhook", methods=["GET"])
@@ -45,7 +47,6 @@ def verify_webhook():
         return challenge, 200
     logging.warning("[VERIFY] failed")
     return "Verification failed", 403
-
 
 # ---- Webhook receiver (POST) ----
 @app.route("/webhook", methods=["POST"])
@@ -86,7 +87,6 @@ def webhook():
 
     return "ok", 200
 
-
 # ---- Router ----
 def route_message(sender: str, text: str):
     # Greetings / main menu
@@ -114,7 +114,6 @@ def route_message(sender: str, text: str):
     # Default
     send_intro_and_menu(sender)
 
-
 # ---- UI block ----
 def send_intro_and_menu(recipient: str):
     intro = (
@@ -134,7 +133,6 @@ def send_intro_and_menu(recipient: str):
             {"id": "WELLNESS", "title": "💡 Wellness Tips"},
         ],
     )
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
