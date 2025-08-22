@@ -62,7 +62,7 @@ def webhook():
                 for message in messages:
                     sender = message["from"]
 
-                    # Interactive replies (buttons/lists)
+                    # Interactive replies (lists)
                     if message.get("type") == "interactive":
                         inter = message.get("interactive", {})
                         reply_id = ""

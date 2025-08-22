@@ -1,5 +1,5 @@
 import logging
-from utils import send_whatsapp_list, send_whatsapp_list
+from utils import send_whatsapp_list
 
 # Per-user state
 user_state = {}  # {sender: {"step","class_type","day_id","day_title","period","time_id","time_title"}}
@@ -23,11 +23,11 @@ DAY_ROWS = [
 ]
 DAY_MAP = {r["id"]: r["title"] for r in DAY_ROWS}
 
-# Period buttons (exactly 3; disable auto-Menu to stay ≤3)
-PERIOD_BTNS = [
-    {"id": "PERIOD_MORN", "title": "🌅 Morning 06–11"},
-    {"id": "PERIOD_AFTER","title": "🌤 Afternoon 12–15"},
-    {"id": "PERIOD_EVE",  "title": "🌙 Evening 16–18"},
+# Periods as LIST (not buttons)
+PERIOD_ROWS = [
+    {"id": "PERIOD_MORN",  "title": "Morning 06–11"},
+    {"id": "PERIOD_AFTER", "title": "Afternoon 12–15"},
+    {"id": "PERIOD_EVE",   "title": "Evening 16–18"},
 ]
 
 # Time rows by period (each ≤10)
@@ -53,7 +53,7 @@ TIME_ROWS_BY_PERIOD = {
 }
 
 def handle_booking_message(msg_text: str, sender: str):
-    """Buttons → Class type, List → Day, Buttons → Period, List → Time, confirm + notify Nadine."""
+    """List → Class type, List → Day, List → Period, List → Time, confirm + notify Nadine."""
     code = (msg_text or "").strip().upper()
     state = user_state.get(sender, {"step": "start"})
     logging.info(f"[BOOK] {sender} step={state['step']} input={code}")
@@ -70,45 +70,52 @@ def handle_booking_message(msg_text: str, sender: str):
         )
         return
 
-    # Class type chosen (list id: GROUP/DUO/SINGLE)
+    # Class type chosen (GROUP/DUO/SINGLE)
     if state["step"] == "awaiting_class_type":
-        if code not in {"GROUP","DUO","SINGLE"}:
+        if code not in {"GROUP", "DUO", "SINGLE"}:
             send_whatsapp_list(sender, "Class Types", "Please pick a class type:", "BOOK_CLASS", CLASS_ROWS); return
-        state.update({"step":"awaiting_day","class_type":code})
+        state.update({"step": "awaiting_day", "class_type": code})
         user_state[sender] = state
         send_whatsapp_list(sender, "Pick a Day", "Choose your preferred day:", "BOOK_DAY", DAY_ROWS)
         logging.info(f"[BOOK] class_type -> {sender} | {code}")
         return
 
-    # Day chosen (list id: DAY_*)
+    # Day chosen (DAY_*)
     if state["step"] == "awaiting_day":
         if code not in DAY_MAP:
             send_whatsapp_list(sender, "Pick a Day", "Please choose a day:", "BOOK_DAY", DAY_ROWS); return
-        state.update({"step":"awaiting_period","day_id":code,"day_title":DAY_MAP[code]})
+        state.update({"step": "awaiting_period", "day_id": code, "day_title": DAY_MAP[code]})
         user_state[sender] = state
-        send_whatsapp_list(sender, f"{state['day_title']} selected. Pick a time period:", PERIOD_BTNS, ensure_menu=False)
+        # PERIOD as LIST (was buttons)
+        send_whatsapp_list(
+            sender,
+            header="Pick a Period",
+            body=f"{state['day_title']} selected. Pick a time period:",
+            button_id="BOOK_PERIOD",
+            options=PERIOD_ROWS
+        )
         logging.info(f"[BOOK] day -> {sender} | {state['day_title']}")
         return
 
-    # Period chosen (button id: PERIOD_*)
+    # Period chosen (PERIOD_*)
     if state["step"] == "awaiting_period":
         if code not in TIME_ROWS_BY_PERIOD:
-            send_whatsapp_list(sender, "Please pick a time period:", PERIOD_BTNS, ensure_menu=False); return
-        state.update({"step":"awaiting_time","period":code})
+            send_whatsapp_list(sender, "Pick a Period", "Please pick a time period:", "BOOK_PERIOD", PERIOD_ROWS); return
+        state.update({"step": "awaiting_time", "period": code})
         user_state[sender] = state
-        send_whatsapp_list(sender, "Time Slots", "Choose a time slot:", "BOOK_TIME", TIME_ROWS_BY_PERIOD[code], "Time Slots")
+        send_whatsapp_list(sender, "Time Slots", "Choose a time slot:", "BOOK_TIME", TIME_ROWS_BY_PERIOD[code])
         logging.info(f"[BOOK] period -> {sender} | {code}")
         return
 
-    # Time chosen (list id: TIME_*)
+    # Time chosen (TIME_*)
     if state["step"] == "awaiting_time":
         valid_map = {r["id"]: r["title"] for r in TIME_ROWS_BY_PERIOD[state["period"]]}
         if code not in valid_map:
             send_whatsapp_list(sender, "Time Slots", "Tap to pick a time:", "BOOK_TIME", TIME_ROWS_BY_PERIOD[state["period"]]); return
-        state.update({"time_id":code,"time_title":valid_map[code]})
+        state.update({"time_id": code, "time_title": valid_map[code]})
         user_state[sender] = state
 
-        class_label = {"GROUP":"Group R180","DUO":"Duo R250","SINGLE":"Single R300"}[state["class_type"]]
+        class_label = {"GROUP": "Group R180", "DUO": "Duo R250", "SINGLE": "Single R300"}[state["class_type"]]
 
         # Confirm to client
         confirm = (
