@@ -5,28 +5,49 @@ import logging
 from booking import handle_booking_message
 from wellness import handle_wellness_message
 from utils import send_whatsapp_list
+from db import init_db  # <-- DB schema init
 
 app = Flask(__name__)
 
-# Environment variables
+# Env
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
 
-# Setup logging
+# Logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
+
+# --- Service lifecycle: initialise DB once per process ---
+@app.before_serving
+def _startup_db():
+    try:
+        init_db()
+        logging.info("✅ DB initialised / verified")
+    except Exception as e:
+        logging.exception("❌ DB init failed", exc_info=True)
+
+
+# --- Health check (optional) ---
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
 
+
+# --- Webhook verification (GET) ---
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
+    mode = request.args.get("hub.mode")
+    logging.info(f"[VERIFY] mode={mode}")
     if token == VERIFY_TOKEN:
-        return challenge
-    return "Verification failed"
+        logging.info("[VERIFY] success")
+        return challenge, 200
+    logging.warning("[VERIFY] failed")
+    return "Verification failed", 403
 
+
+# --- Webhook receiver (POST) ---
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -39,55 +60,83 @@ def webhook():
                 messages = value.get("messages", [])
                 for message in messages:
                     sender = message["from"]
-                    msg_text = message.get("text", {}).get("body", "").strip().upper()
 
-                    # Handle button or list replies
-                    if "button" in message or "interactive" in message:
-                        reply_id = (
-                            message.get("button", {}).get("payload") or
-                            message.get("interactive", {}).get("button_reply", {}).get("id") or
-                            message.get("interactive", {}).get("list_reply", {}).get("id")
-                        )
-                        if reply_id:
-                            logging.info(f"[USER CHOICE] {reply_id}")
-                            if reply_id.startswith("BOOK"):
-                                handle_booking_message(reply_id, sender)
-                            elif reply_id.startswith("WELLNESS"):
-                                handle_wellness_message(reply_id, sender)
-                            else:
-                                send_main_menu(sender)
+                    # Interactive replies (buttons or lists)
+                    if message.get("type") == "interactive":
+                        inter = message.get("interactive", {})
+                        reply_id = ""
+                        if "button_reply" in inter:
+                            reply_id = inter["button_reply"]["id"]
+                        elif "list_reply" in inter:
+                            reply_id = inter["list_reply"]["id"]
+
+                        reply_id = (reply_id or "").strip().upper()
+                        logging.info(f"[CLICK] {sender} -> {reply_id}")
+                        route_message(sender, reply_id)
                         continue
 
-                    # First-time message
-                    if msg_text in ["HI", "HELLO", "START"]:
-                        send_about_message(sender)
+                    # Text messages
+                    if message.get("type") == "text":
+                        text = (message.get("text", {}).get("body") or "").strip().upper()
+                        logging.info(f"[TEXT] {sender} -> {text}")
+                        route_message(sender, text)
                         continue
-
-                    # Default
-                    send_main_menu(sender)
 
     except Exception as e:
-        logging.exception(f"[ERROR in webhook]: {str(e)}")
+        logging.exception(f"[ERROR webhook]: {e}")
 
     return "ok", 200
 
 
-def send_about_message(recipient):
-    about_text = (
+# --- Router ---
+def route_message(sender: str, text: str):
+    # Greetings / main menu
+    if text in ("MENU", "MAIN_MENU", "HI", "HELLO", "START"):
+        logging.info(f"[FLOW] INTRO_MENU -> {sender}")
+        send_intro_and_menu(sender)
+        return
+
+    # Wellness flow
+    if text == "WELLNESS" or text.startswith("WELLNESS_"):
+        logging.info(f"[FLOW] WELLNESS -> {sender} | {text}")
+        handle_wellness_message(text, sender)
+        return
+
+    # Booking flow (book + all booking IDs)
+    if (
+        text == "BOOK"
+        or text in ("GROUP", "DUO", "SINGLE")
+        or text.startswith(("DAY_", "TIME_", "PERIOD_"))
+    ):
+        logging.info(f"[FLOW] BOOK -> {sender} | {text}")
+        handle_booking_message(text, sender)
+        return
+
+    # Default: show intro + menu to guide users
+    send_intro_and_menu(sender)
+
+
+# --- UI blocks ---
+def send_intro_and_menu(recipient: str):
+    intro = (
         "✨ Welcome to PilatesHQ ✨\n\n"
         "PilatesHQ delivers transformative Pilates sessions led by internationally certified instructors, "
-        "emphasizing holistic wellness, enhanced strength, and improved mobility.\n\n"
-        "🌐 Visit us online: https://pilateshq.co.za"
+        "emphasizing holistic wellness, enhanced strength, and improved mobility.\n"
+        "📍 Norwood, Johannesburg • 🎉 Opening Special: Group Classes @ R180 until January\n"
+        "🌐 https://pilateshq.co.za"
     )
-    send_whatsapp_list(recipient, "About PilatesHQ", about_text, "MAIN_MENU", [
-        {"id": "BOOK", "title": "📅 Book a Class"},
-        {"id": "WELLNESS", "title": "💡 Wellness Tips"},
-    ])
+    # Single list message with the intro text + 2 choices (no duplicate menu)
+    send_whatsapp_list(
+        recipient,
+        header="PilatesHQ",
+        body=intro + "\n\nPlease choose an option:",
+        button_id="MAIN_MENU",
+        options=[
+            {"id": "BOOK", "title": "📅 Book a Class"},
+            {"id": "WELLNESS", "title": "💡 Wellness Tips"},
+        ],
+    )
 
 
-def send_main_menu(recipient):
-    menu_text = "Please choose from the options below 👇"
-    send_whatsapp_list(recipient, "Main Menu", menu_text, "MAIN_MENU", [
-        {"id": "BOOK", "title": "📅 Book a Class"},
-        {"id": "WELLNESS", "title": "💡 Wellness Tips"},
-    ])
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
