@@ -1,24 +1,26 @@
 from flask import Flask, request
 import os
 import logging
+from datetime import datetime
 
 from booking import handle_booking_message
 from wellness import handle_wellness_message
 from utils import send_whatsapp_list
 from db import init_db
+from crud import list_available_slots, hold_or_reserve_slot, release_slot  # NEW
 
 app = Flask(__name__)
 
 # Env
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "your_verify_token_here")
+NADINE_WA = os.environ.get("NADINE_WA", "27843131635")  # SA format w/out '+'
 
 # Logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level))
 
-# ---- One-time DB init (Flask 3.x safe) ----
+# ---- One-time DB init ----
 _db_inited = False
-
 @app.before_request
 def startup_db_once():
     global _db_inited
@@ -30,12 +32,12 @@ def startup_db_once():
             logging.exception("❌ DB init failed", exc_info=True)
         _db_inited = True
 
-# ---- Health check ----
+# ---- Health ----
 @app.route("/", methods=["GET"])
 def home():
     return "OK", 200
 
-# ---- Webhook verification (GET) ----
+# ---- Webhook verify ----
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     token = request.args.get("hub.verify_token")
@@ -48,7 +50,7 @@ def verify_webhook():
     logging.warning("[VERIFY] failed")
     return "Verification failed", 403
 
-# ---- Webhook receiver (POST) ----
+# ---- Webhook POST ----
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
@@ -62,7 +64,7 @@ def webhook():
                 for message in messages:
                     sender = message["from"]
 
-                    # Interactive replies (lists)
+                    # Interactive replies (list)
                     if message.get("type") == "interactive":
                         inter = message.get("interactive", {})
                         reply_id = ""
@@ -89,38 +91,61 @@ def webhook():
 
 # ---- Router ----
 def route_message(sender: str, text: str):
-    # Greetings / main menu
+    # Greetings / menu
     if text in ("MENU", "MAIN_MENU", "HI", "HELLO", "START"):
-        logging.info(f"[FLOW] INTRO_MENU -> {sender}")
         send_intro_and_menu(sender)
         return
 
-    # Wellness flow
+    # Wellness
     if text == "WELLNESS" or text.startswith("WELLNESS_"):
-        logging.info(f"[FLOW] WELLNESS -> {sender} | {text}")
         handle_wellness_message(text, sender)
         return
 
-    # Booking flow
+    # Booking (old flow still available)
     if (
         text == "BOOK"
         or text in ("GROUP", "DUO", "SINGLE")
         or text.startswith(("DAY_", "TIME_", "PERIOD_"))
     ):
-        logging.info(f"[FLOW] BOOK -> {sender} | {text}")
         handle_booking_message(text, sender)
+        return
+
+    # New: Availability browse
+    if text in ("AVAIL", "AVAILABILITY", "VIEW_AVAIL"):
+        show_availability(sender)
+        return
+
+    # A slot was tapped: SLOT_<id>
+    if text.startswith("SLOT_"):
+        session_id = safe_int(text.replace("SLOT_", ""))
+        if not session_id:
+            send_intro_and_menu(sender); return
+        handle_slot_selection(sender, session_id)
+        return
+
+    # Nadine admin actions
+    if text.startswith("APPROVE_") and is_nadine(sender):
+        session_id = safe_int(text.replace("APPROVE_", ""))
+        # For now, "approve" keeps the hold; later we can create a Booking row
+        confirm_admin_action(sender, session_id, approved=True)
+        return
+
+    if text.startswith("RELEASE_") and is_nadine(sender):
+        session_id = safe_int(text.replace("RELEASE_", ""))
+        if session_id:
+            release_slot(session_id, seats=1)
+        notify_admin_simple(f"🔓 Released hold | Session {session_id}")
         return
 
     # Default
     send_intro_and_menu(sender)
 
-# ---- UI block ----
+# ---- UI blocks ----
 def send_intro_and_menu(recipient: str):
     intro = (
         "✨ Welcome to PilatesHQ ✨\n\n"
-        "PilatesHQ delivers transformative Pilates sessions led by internationally certified instructors, "
-        "emphasizing holistic wellness, enhanced strength, and improved mobility.\n"
-        "📍 Norwood, Johannesburg • 🎉 Opening Special: Group Classes @ R180 until January\n"
+        "Transformative Pilates in Norwood, Johannesburg.\n"
+        "🎉 Opening Special: Group Classes @ R180 until January\n"
         "🌐 https://pilateshq.co.za"
     )
     send_whatsapp_list(
@@ -129,10 +154,120 @@ def send_intro_and_menu(recipient: str):
         body=intro + "\n\nPlease choose an option:",
         button_id="MAIN_MENU",
         options=[
-            {"id": "BOOK", "title": "📅 Book a Class"},
+            {"id": "AVAIL", "title": "👀 View Availability"},
             {"id": "WELLNESS", "title": "💡 Wellness Tips"},
+            {"id": "BOOK", "title": "🧭 Legacy Booking"},  # optional, can remove later
         ],
     )
+
+def show_availability(recipient: str):
+    """Pull up to 10 open sessions (≥1 seat)."""
+    rows = list_available_slots(days=21, min_seats=1, limit=10)
+    if not rows:
+        send_whatsapp_list(
+            recipient, "Availability", "No open sessions found. Please check again soon.",
+            "MAIN_MENU", [{"id": "MAIN_MENU", "title": "⬅️ Back to Menu"}]
+        )
+        return
+
+    # Build list rows (≤ 10)
+    options = []
+    for r in rows:
+        # Format like: Mon 25 Aug • 07:00 • 3 left
+        dt_label = f"{fmt_date(r['session_date'])} • {fmt_time(r['start_time'])} • {r['seats_left']} left"
+        options.append({"id": f"SLOT_{r['id']}", "title": dt_label[:24], "description": "Tap to request this slot"})
+
+    send_whatsapp_list(
+        recipient,
+        header="Available Slots",
+        body="Select a slot to request it. Nadine will review and confirm.",
+        button_id="AVAIL_LIST",
+        options=options
+    )
+
+def handle_slot_selection(sender: str, session_id: int):
+    """Place a soft hold and notify Nadine with admin choices."""
+    updated = hold_or_reserve_slot(session_id, seats=1)
+    if not updated:
+        # Likely full or race condition
+        send_whatsapp_list(
+            sender, "Unavailable", "Sorry, that slot just filled. Try another.",
+            "AVAIL_RETRY", [{"id": "AVAIL", "title": "👀 View Availability"}]
+        )
+        return
+
+    # Confirm to client
+    body = (
+        "✅ Request received! Nadine will review and confirm your spot.\n\n"
+        f"🗓 {fmt_date(updated['session_date'])} at {fmt_time(updated['start_time'])}\n"
+        f"Seats left: {updated['capacity'] - updated['booked_count']}"
+    )
+    send_whatsapp_list(
+        sender, "Request Submitted", body,
+        "REQ_MENU", [{"id": "MAIN_MENU", "title": "⬅️ Back to Menu"}]
+    )
+
+    # Notify Nadine (admin)
+    admin_text = (
+        "📣 Booking Request\n"
+        f"From: {sender}\n"
+        f"Time: {fmt_date(updated['session_date'])} {fmt_time(updated['start_time'])}\n"
+        f"Status: {updated['status']} • Seats left: {updated['capacity'] - updated['booked_count']}\n\n"
+        "Action:"
+    )
+    send_whatsapp_list(
+        NADINE_WA,
+        header="Admin: Approve?",
+        body=admin_text,
+        button_id="ADMIN_ACTION",
+        options=[
+            {"id": f"APPROVE_{session_id}", "title": "✅ Approve"},
+            {"id": f"RELEASE_{session_id}", "title": "🔓 Release"},
+            {"id": "MAIN_MENU", "title": "⬅️ Menu"},
+        ]
+    )
+
+def confirm_admin_action(sender: str, session_id: int, approved: bool):
+    # Placeholder: later we’ll create a Booking row + DM client confirmation.
+    if approved:
+        notify_admin_simple(f"✅ Approved hold | Session {session_id}")
+    else:
+        notify_admin_simple(f"Declined | Session {session_id}")
+
+def notify_admin_simple(msg: str):
+    send_whatsapp_list(
+        NADINE_WA, "Admin", msg, "ADMIN_MENU",
+        [{"id": "MAIN_MENU", "title": "⬅️ Menu"}]
+    )
+
+# ---- helpers ----
+def is_nadine(wa_from: str) -> bool:
+    # Incoming `From` is like "2784..." (no '+')
+    return wa_from.strip().lstrip("+") == NADINE_WA
+
+def safe_int(s: str):
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+def fmt_date(d) -> str:
+    # d can be date or str
+    if isinstance(d, str):
+        try:
+            d = datetime.fromisoformat(d).date()
+        except Exception:
+            return d
+    return d.strftime("%a %d %b")
+
+def fmt_time(t) -> str:
+    # t can be time or str
+    if isinstance(t, str):
+        try:
+            return datetime.fromisoformat(f"2000-01-01T{t}").strftime("%H:%M")
+        except Exception:
+            return t
+    return t.strftime("%H:%M")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
