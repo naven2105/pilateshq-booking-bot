@@ -1,22 +1,16 @@
-# onboarding.py
+# app/onboarding.py
 import logging
 from typing import Dict
 from sqlalchemy import text
 
-from utils import send_whatsapp_list
-from crud import get_or_create_client
-from db import get_session
-from config import NADINE_WA
+from ..utils import send_whatsapp_list
+from ..crud import get_or_create_client
+from ..db import get_session
+from .config import NADINE_WA
 
-# Simple in-memory state per WhatsApp number (fine for MVP)
 ONB_STATE: Dict[str, Dict] = {}
 
 def handle_onboarding(sender: str, action: str):
-    """
-    Entry for menus and onboarding/update actions.
-    Actions: ROOT_MENU | ONB_START | GET_STARTED | UPDATE_DETAILS |
-             ONB_MEDICAL | ONB_TIMES | ONB_TYPE | ONB_FREQ | ONB_SUBMIT
-    """
     client = get_or_create_client(sender)
     is_existing = bool((client.get("name") or "").strip())
 
@@ -29,14 +23,9 @@ def handle_onboarding(sender: str, action: str):
     if action in ("ONB_MEDICAL", "ONB_TIMES", "ONB_TYPE", "ONB_FREQ", "ONB_SUBMIT"):
         return _onb_action(sender, action)
 
-    # Fallback to menu
     return _show_root_menu(sender, is_existing)
 
 def capture_onboarding_free_text(sender: str, raw_text: str):
-    """
-    Called when user types free text and is mid-onboarding.
-    Saves the last requested field and returns to the stepper.
-    """
     s = ONB_STATE.get(sender) or {}
     field = s.get("awaiting")
     if not field:
@@ -47,9 +36,7 @@ def capture_onboarding_free_text(sender: str, raw_text: str):
     s["awaiting"] = None
 
     return send_whatsapp_list(
-        sender,
-        "Saved",
-        f"✅ Saved your {field}.\n\nYou can submit or fill the next item.",
+        sender, "Saved", f"✅ Saved your {field}.\n\nYou can submit or fill the next item.",
         "ONB_MENU",
         [
             {"id": "ONB_MEDICAL", "title": "🩺 Medical / Injuries"},
@@ -59,8 +46,6 @@ def capture_onboarding_free_text(sender: str, raw_text: str):
             {"id": "ONB_SUBMIT",  "title": "✅ Submit"},
         ]
     )
-
-# ---------- internal helpers ----------
 
 def _show_root_menu(sender: str, is_existing: bool):
     body = (
@@ -101,23 +86,27 @@ def _onb_action(sender: str, action_id: str):
 
     if action_id == "ONB_MEDICAL":
         s["awaiting"] = "medical"
-        prompt = "Please describe any injuries or medical conditions (e.g., lower back pain, recent surgery)."
-        return send_whatsapp_list(sender, "Medical", prompt, "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
+        return send_whatsapp_list(sender, "Medical",
+                                  "Please describe any injuries or medical conditions.",
+                                  "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
 
     if action_id == "ONB_TIMES":
         s["awaiting"] = "times"
-        prompt = "What times suit you best? (e.g., Mon & Wed 7–9am; Sat morning)"
-        return send_whatsapp_list(sender, "Preferred Times", prompt, "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
+        return send_whatsapp_list(sender, "Preferred Times",
+                                  "What times suit you best? (e.g., Mon & Wed 7–9am; Sat morning)",
+                                  "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
 
     if action_id == "ONB_TYPE":
         s["awaiting"] = "type"
-        prompt = "Which sessions are you interested in? (Single / Duo / Group)"
-        return send_whatsapp_list(sender, "Session Type", prompt, "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
+        return send_whatsapp_list(sender, "Session Type",
+                                  "Which sessions are you interested in? (Single / Duo / Group)",
+                                  "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
 
     if action_id == "ONB_FREQ":
         s["awaiting"] = "freq"
-        prompt = "How many sessions per week? (1x, 2x, or 3x)"
-        return send_whatsapp_list(sender, "Sessions / Week", prompt, "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
+        return send_whatsapp_list(sender, "Sessions / Week",
+                                  "How many sessions per week? (1x, 2x, or 3x)",
+                                  "ONB_BACK", [{"id": "ONB_START", "title": "⬅️ Onboarding"}])
 
     if action_id == "ONB_SUBMIT":
         s["awaiting"] = None
@@ -130,35 +119,29 @@ def _confirm_and_save(sender: str):
     sess_t  = (s.get("type") or "").lower()
     freq    = (s.get("freq") or "").lower()
 
-    # Map freq → plan
     plan = "1x"
     if "3" in freq: plan = "3x"
     elif "2" in freq: plan = "2x"
     elif "1" in freq or "4 per month" in freq: plan = "1x"
 
-    # Persist to clients
     try:
         with get_session() as dbs:
-            dbs.execute(
-                text("""
-                    UPDATE clients
-                    SET medical_notes = :medical,
-                        notes = :notes,
-                        plan = :plan
-                    WHERE wa_number = :wa
-                """),
-                {
-                    "medical": medical[:500],
-                    "notes": f"pref_times={times}; type={sess_t}"[:500],
-                    "plan": plan,
-                    "wa": sender,
-                },
-            )
+            dbs.execute(text("""
+                UPDATE clients
+                SET medical_notes = :medical,
+                    notes = :notes,
+                    plan = :plan
+                WHERE wa_number = :wa
+            """), {
+                "medical": medical[:500],
+                "notes": f"pref_times={times}; type={sess_t}"[:500],
+                "plan": plan,
+                "wa": sender,
+            })
             dbs.commit()
     except Exception:
         logging.exception("[ONB] DB update failed")
 
-    # Notify Nadine
     summary = (
         "🆕 Client Details Submitted\n"
         f"From: {sender}\n"
@@ -172,7 +155,6 @@ def _confirm_and_save(sender: str):
         [{"id": "MAIN_MENU", "title": "⬅️ Menu"}]
     )
 
-    # Confirm to client
     client_msg = (
         "✅ Thanks! Your details were sent to Nadine.\n"
         "She’ll follow up to confirm your plan and schedule.\n"

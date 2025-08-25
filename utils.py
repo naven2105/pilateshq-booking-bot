@@ -1,68 +1,56 @@
-import requests
-import os
-import logging
-
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
-
-WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+# app/utils.py
+import logging, requests
+from .app.config import ACCESS_TOKEN, GRAPH_URL
 
 def normalize_wa(raw: str) -> str:
-    """
-    Normalize a WhatsApp number into +27... format for South Africa.
-    Assumes input may be in 062..., 27..., or +27... style.
-    """
-    if not raw:
-        return ""
+    """Normalize SA numbers to +27…; accepts 0…, 27…, +27…"""
+    if not raw: return ""
     n = str(raw).strip().replace(" ", "").replace("-", "")
-    if n.startswith("+27"):
-        return n
-    if n.startswith("27"):
-        return "+" + n
-    if n.startswith("0"):
-        return "+27" + n[1:]
+    if n.startswith("+27"): return n
+    if n.startswith("27"):  return "+" + n
+    if n.startswith("0"):   return "+27" + n[1:]
     return n
 
-def send_whatsapp_list(recipient, header, body, button_id, options):
+def send_whatsapp_text(to: str, body: str):
+    _send_json({
+        "messaging_product": "whatsapp",
+        "to": normalize_wa(to),
+        "type": "text",
+        "text": {"body": body}
+    })
+
+def send_whatsapp_list(to: str, header: str, body: str, button_id: str, options: list):
     """
-    Send a WhatsApp list template.
-    options must be <= 10 items due to WA API limit.
+    options: list of {"id": "...", "title": "...", "description": "...?"}
+    Max 10 rows; title <= 24 chars.
     """
-    logging.info(f"[SEND LIST] To: {recipient}, Header: {header}, Body: {body}, Options: {len(options)}")
-
-    if len(options) > 10:
-        logging.warning("[UI ERROR] Too many options provided. Trimming to 10.")
-        options = options[:10]
-
-    rows = [{"id": opt["id"], "title": opt["title"]} for opt in options]
-
+    rows = []
+    for opt in options[:10]:
+        rows.append({
+            "id": opt["id"],
+            "title": opt["title"][:24],
+            "description": opt.get("description", "")[:72]
+        })
     payload = {
         "messaging_product": "whatsapp",
-        "to": recipient,
+        "to": normalize_wa(to),
         "type": "interactive",
         "interactive": {
             "type": "list",
-            "header": {"type": "text", "text": header},
-            "body": {"text": body},
-            "footer": {"text": "Powered by PilatesHQ"},
+            "header": {"type": "text", "text": header[:60]},
+            "body": {"text": body[:1024]},
             "action": {
                 "button": "Choose",
-                "sections": [
-                    {
-                        "title": "Options",
-                        "rows": rows
-                    }
-                ]
+                "sections": [{"title": "Options", "rows": rows}]
             }
         }
     }
+    _send_json(payload)
 
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    response = requests.post(WHATSAPP_API_URL, headers=headers, json=payload)
-    logging.debug(f"[WA RESP CODE] {response.status_code}")
-    logging.debug(f"[WA RESP BODY] {response.text}")
-    return response.json()
+def _send_json(payload: dict):
+    try:
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+        resp = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=15)
+        logging.debug(f"[WA RESP {resp.status_code}] {resp.text}")
+    except Exception as e:
+        logging.exception(f"[WA SEND ERROR] {e}")
