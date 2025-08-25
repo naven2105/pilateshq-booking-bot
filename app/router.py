@@ -1,19 +1,12 @@
-# app/router.py
+from flask import request
+import logging
+from .config import VERIFY_TOKEN
 from .utils import normalize_wa
 from .onboarding import handle_onboarding, capture_onboarding_free_text
 from .admin import handle_admin_action
 from .wellness import handle_wellness_message
 
-from flask import request
-import logging
-
-from app.config import VERIFY_TOKEN
-from app.onboarding import handle_onboarding
-from app.admin import handle_admin_action
-
 def register_routes(app):
-    """Register all routes with the Flask app."""
-
     @app.route("/webhook", methods=["GET"])
     def verify_webhook():
         token = request.args.get("hub.verify_token")
@@ -26,39 +19,42 @@ def register_routes(app):
 
     @app.route("/webhook", methods=["POST"])
     def webhook():
-        data = request.get_json()
+        data = request.get_json() or {}
         logging.debug(f"[WEBHOOK DATA] {data}")
 
         try:
             for entry in data.get("entry", []):
                 for change in entry.get("changes", []):
-                    value = change.get("value", {})
-                    messages = value.get("messages", [])
-                    for message in messages:
-                        sender = message["from"]
+                    for message in change.get("value", {}).get("messages", []):
+                        sender = normalize_wa(message["from"])
 
-                        # First-time or returning client
-                        if "text" in message:
-                            msg_text = message["text"]["body"].strip().lower()
-                            if msg_text in ["hi", "hello", "start"]:
-                                return handle_onboarding(sender)
-                            else:
-                                return handle_admin_action(sender, msg_text)
-
-                        # Interactive replies (buttons / lists)
+                        # interactive replies first
                         if "interactive" in message:
+                            rep = message["interactive"]
                             reply_id = (
-                                message["interactive"].get("button_reply", {}).get("id")
-                                or message["interactive"].get("list_reply", {}).get("id")
+                                rep.get("button_reply", {}).get("id") or
+                                rep.get("list_reply", {}).get("id")
                             )
                             if reply_id:
                                 logging.info(f"[USER CHOICE] {reply_id}")
                                 if reply_id.startswith("ADMIN"):
                                     return handle_admin_action(sender, reply_id)
-                                else:
-                                    return handle_onboarding(sender, reply_id)
+                                return handle_onboarding(sender, reply_id)
+
+                        # plain text
+                        if "text" in message:
+                            msg_text = (message["text"]["body"] or "").strip()
+                            upper = msg_text.upper()
+                            if upper in ("HI","HELLO","START","MENU","MAIN_MENU"):
+                                return handle_onboarding(sender, "ROOT_MENU")
+
+                            # if onboarding is awaiting a free-text answer
+                            return capture_onboarding_free_text(sender, msg_text)
+
+                        # fallback
+                        return handle_onboarding(sender, "ROOT_MENU")
 
         except Exception as e:
-            logging.exception(f"[ERROR webhook]: {str(e)}")
+            logging.exception(f"[ERROR webhook]: {e}")
 
         return "ok", 200
