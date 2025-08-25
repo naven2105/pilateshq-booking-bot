@@ -9,7 +9,7 @@ import logging
 
 from app.config import VERIFY_TOKEN
 from app.onboarding import handle_onboarding
-from app.admin import handle_admin_message
+from app.admin import handle_admin_action
 
 def register_routes(app):
     """Register all routes with the Flask app."""
@@ -43,7 +43,7 @@ def register_routes(app):
                             if msg_text in ["hi", "hello", "start"]:
                                 return handle_onboarding(sender)
                             else:
-                                return handle_admin_message(sender, msg_text)
+                                return handle_admin_action(sender, msg_text)
 
                         # Interactive replies (buttons / lists)
                         if "interactive" in message:
@@ -54,7 +54,7 @@ def register_routes(app):
                             if reply_id:
                                 logging.info(f"[USER CHOICE] {reply_id}")
                                 if reply_id.startswith("ADMIN"):
-                                    return handle_admin_message(sender, reply_id)
+                                    return handle_admin_action(sender, reply_id)
                                 else:
                                     return handle_onboarding(sender, reply_id)
 
