@@ -7,6 +7,21 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
 
+def normalize_wa(raw: str) -> str:
+    """
+    Normalize a WhatsApp number into +27... format for South Africa.
+    Assumes input may be in 062..., 27..., or +27... style.
+    """
+    if not raw:
+        return ""
+    n = str(raw).strip().replace(" ", "").replace("-", "")
+    if n.startswith("+27"):
+        return n
+    if n.startswith("27"):
+        return "+" + n
+    if n.startswith("0"):
+        return "+27" + n[1:]
+    return n
 
 def send_whatsapp_list(recipient, header, body, button_id, options):
     """
