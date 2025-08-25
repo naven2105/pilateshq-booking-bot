@@ -1,5 +1,5 @@
 import logging
-from utils import send_whatsapp_list
+from app.utils import send_whatsapp_list
 
 # Per-user state
 user_state = {}  # {sender: {"step","class_type","day_id","day_title","period","time_id","time_title"}}

@@ -1,6 +1,6 @@
 # app/utils.py
 import logging, requests
-from .app.config import ACCESS_TOKEN, GRAPH_URL
+from .config import ACCESS_TOKEN, GRAPH_URL
 
 def normalize_wa(raw: str) -> str:
     """Normalize SA numbers to +27…; accepts 0…, 27…, +27…"""

@@ -1,4 +1,9 @@
 # app/router.py
+from .utils import normalize_wa
+from .onboarding import handle_onboarding, capture_onboarding_free_text
+from .admin import handle_admin_action
+from .wellness import handle_wellness_message
+
 from flask import request
 import logging
 

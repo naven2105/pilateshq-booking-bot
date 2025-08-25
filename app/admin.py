@@ -1,7 +1,7 @@
 # app/admin.py
 from .config import NADINE_WA
-from ..utils import send_whatsapp_list, normalize_wa
-from ..crud import release_slot
+from .utils import send_whatsapp_list, normalize_wa
+from .crud import release_slot
 
 def is_nadine(wa_from: str) -> bool:
     return normalize_wa(wa_from).lstrip("+") == ("+" + NADINE_WA).lstrip("+")

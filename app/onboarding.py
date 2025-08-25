@@ -2,6 +2,10 @@
 import logging
 from typing import Dict
 from sqlalchemy import text
+from .utils import send_whatsapp_list, normalize_wa
+from .crud import get_or_create_client
+from .db import get_session
+from .config import NADINE_WA
 
 from .utils import send_whatsapp_list, normalize_wa
 from .crud import get_or_create_client
