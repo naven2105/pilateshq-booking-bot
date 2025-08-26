@@ -4,6 +4,16 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 from .db import get_session
 
+def list_clients(limit: int = 20):
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name, plan
+            FROM clients
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            LIMIT :lim
+        """), {"lim": limit}).mappings().all()
+        return [dict(r) for r in rows]
+
 def get_or_create_client(wa_number: str, name: str = "") -> Dict[str, Any]:
     with get_session() as s:
         row = s.execute(text("""

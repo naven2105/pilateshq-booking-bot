@@ -45,6 +45,9 @@ def register_routes(app):
                         if "text" in message:
                             msg_text = (message["text"]["body"] or "").strip()
                             upper = msg_text.upper()
+                            # Admin commands (text)
+                            if upper.startswith("ADMIN"):
+                                return handle_admin_action(sender, upper)
                             if upper in ("HI","HELLO","START","MENU","MAIN_MENU"):
                                 return handle_onboarding(sender, "ROOT_MENU")
 
