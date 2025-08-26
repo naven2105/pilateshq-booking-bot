@@ -1,45 +1,59 @@
-# app/router.py (inside register_routes)
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json() or {}
-    logging.debug(f"[WEBHOOK DATA keys] {list(data.keys())}")
+# app/router.py
+import logging
+from flask import request
 
-    try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = (change.get("value") or {})
-                # 1) status callbacks
-                if value.get("statuses"):
-                    st = value["statuses"][0]
-                    logging.info(f"[STATUS] id={st.get('id')} status={st.get('status')} to={st.get('recipient_id')}")
-                    continue
-                # 2) messages
-                for message in value.get("messages", []):
-                    sender = message.get("from")
-                    if not sender:
-                        logging.warning("[WARN] message without sender")
-                        continue
+from .config import VERIFY_TOKEN
+from .onboarding import handle_onboarding
+from .admin import handle_admin_action
 
-                    if "interactive" in message:
-                        rep = message["interactive"]
-                        reply_id = (rep.get("button_reply", {}) or {}).get("id") or (rep.get("list_reply", {}) or {}).get("id")
-                        logging.info(f"[USER CHOICE] {reply_id}")
-                        if reply_id and reply_id.upper().startswith("ADMIN"):
-                            handle_admin_action(sender, reply_id)
-                        else:
-                            handle_onboarding(sender, reply_id or "ROOT_MENU")
-                        continue
+def register_routes(app):
+    """Register webhook routes with the given Flask app."""
 
-                    if "text" in message:
-                        msg_text = (message["text"].get("body") or "").strip()
-                        up = msg_text.upper()
-                        if up in ("HI","HELLO","START","MENU","MAIN_MENU"):
-                            handle_onboarding(sender, "ROOT_MENU")
-                        else:
-                            capture_onboarding_free_text(sender, msg_text)
-                        continue
+    @app.route("/webhook", methods=["GET"])
+    def verify_webhook():
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if token == VERIFY_TOKEN:
+            logging.info("✅ Webhook verified")
+            return challenge, 200
+        logging.warning("❌ Webhook verification failed")
+        return "Verification failed", 403
 
-    except Exception as e:
-        logging.exception(f"[ERROR webhook]: {e}")
+    @app.route("/webhook", methods=["POST"])
+    def webhook():
+        data = request.get_json()
+        logging.debug(f"[WEBHOOK DATA] {data}")
 
-    return "ok", 200  # <-- inside the function
+        try:
+            for entry in data.get("entry", []):
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    messages = value.get("messages", [])
+                    for message in messages:
+                        sender = message["from"]
+
+                        # Text messages
+                        if "text" in message:
+                            msg_text = message["text"]["body"].strip().lower()
+                            if msg_text in ["hi", "hello", "start"]:
+                                return handle_onboarding(sender)
+                            else:
+                                return handle_admin_action(sender, msg_text)
+
+                        # Interactive replies (buttons/lists)
+                        if "interactive" in message:
+                            reply_id = (
+                                message["interactive"].get("button_reply", {}).get("id")
+                                or message["interactive"].get("list_reply", {}).get("id")
+                            )
+                            if reply_id:
+                                logging.info(f"[USER CHOICE] {reply_id}")
+                                if reply_id.startswith("ADMIN"):
+                                    return handle_admin_action(sender, reply_id)
+                                else:
+                                    return handle_onboarding(sender, reply_id)
+
+        except Exception as e:
+            logging.exception(f"[ERROR webhook]: {str(e)}")
+
+        return "ok", 200

@@ -1,41 +1,34 @@
 # app/main.py
 import logging
+import os
 from flask import Flask
+
 from .db import init_db
 from .router import register_routes
-from .config import LOG_LEVEL
 
+# Create Flask app
 app = Flask(__name__)
 
-# Logging
-logging.basicConfig(
-    level=getattr(logging, (LOG_LEVEL or "INFO").upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# Logging setup
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, log_level))
+logger = logging.getLogger(__name__)
 
-# One-time DB init per instance
-_inited = False
+# One-time DB init
 @app.before_request
 def _init_once():
-    global _inited
-    if not _inited:
+    if not getattr(app, "_db_init_done", False):
         try:
             init_db()
-            app.logger.info("✅ DB initialised / verified")
-        except Exception:
-            app.logger.exception("❌ DB init failed")
-        _inited = True
+            app._db_init_done = True
+            logger.info("✅ Database initialized")
+        except Exception as e:
+            logger.exception("❌ Database init failed: %s", str(e))
 
-# Health check
-@app.get("/")
-def health():
-    return "OK", 200
-
-# Register webhook routes
+# Register all routes (from router.py)
 register_routes(app)
 
-# Safety net for unhandled errors
-@app.errorhandler(Exception)
-def _unhandled(e):
-    app.logger.exception("[FLASK ERROR] Unhandled")
-    return "server_error", 500
+# Health check endpoint
+@app.route("/", methods=["GET"])
+def health():
+    return "✅ PilatesHQ Bot is running", 200
