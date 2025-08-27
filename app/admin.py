@@ -10,13 +10,15 @@ from .crud import (
 )
 
 # Support multiple admin numbers via ENV (bare 27… format, comma-separated)
-ADMIN_WA_LIST = [
-    n.strip() for n in os.getenv("ADMIN_WA_LIST", "").split(",") if n.strip()
-]
+ADMIN_WA_LIST = [n.strip() for n in os.getenv("ADMIN_WA_LIST","").split(",") if n.strip()]
+NADINE_WA = os.getenv("NADINE_WA","").strip()
 
 def is_admin(sender: str) -> bool:
-    wa = normalize_wa(sender)
-    return wa in ADMIN_WA_LIST
+    wa = normalize_wa(sender)  # returns '27...'
+    env_list = set(ADMIN_WA_LIST)
+    if NADINE_WA:
+        env_list.add(normalize_wa(NADINE_WA))
+    return wa in env_list
 
 
 def handle_admin_action(sender: str, action: str):
