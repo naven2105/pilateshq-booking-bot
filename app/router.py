@@ -3,11 +3,17 @@ import logging
 from flask import request
 
 from .config import VERIFY_TOKEN
+from .utils import normalize_wa
 from .onboarding import handle_onboarding
 from .admin import handle_admin_action
 
+
 def register_routes(app):
-    """Register webhook routes with the given Flask app."""
+    """Register webhook routes with the Flask app."""
+
+    @app.route("/", methods=["GET"])
+    def home():
+        return "PilatesHQ Bot running", 200
 
     @app.route("/webhook", methods=["GET"])
     def verify_webhook():
@@ -29,18 +35,19 @@ def register_routes(app):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
                     messages = value.get("messages", [])
-                    for message in messages:
-                        sender = message["from"]
 
-                        # Text messages
+                    for message in messages:
+                        sender = normalize_wa(message["from"])
+
+                        # Free text (normal message)
                         if "text" in message:
                             msg_text = message["text"]["body"].strip().lower()
                             if msg_text in ["hi", "hello", "start"]:
-                                return handle_onboarding(sender)
+                                handle_onboarding(sender)
                             else:
-                                return handle_admin_action(sender, msg_text)
+                                handle_admin_action(sender, msg_text)
 
-                        # Interactive replies (buttons/lists)
+                        # Interactive replies (button/list)
                         if "interactive" in message:
                             reply_id = (
                                 message["interactive"].get("button_reply", {}).get("id")
@@ -49,9 +56,9 @@ def register_routes(app):
                             if reply_id:
                                 logging.info(f"[USER CHOICE] {reply_id}")
                                 if reply_id.startswith("ADMIN"):
-                                    return handle_admin_action(sender, reply_id)
+                                    handle_admin_action(sender, reply_id)
                                 else:
-                                    return handle_onboarding(sender, reply_id)
+                                    handle_onboarding(sender, reply_id)
 
         except Exception as e:
             logging.exception(f"[ERROR webhook]: {str(e)}")

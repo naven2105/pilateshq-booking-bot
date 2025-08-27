@@ -29,9 +29,10 @@ def get_or_create_client(wa_number: str, name: str = "") -> Dict[str, Any]:
         """), {"wa": wa_number}).mappings().first()
         return dict(row)
 
-def list_available_slots(days: int = 14, min_seats: int = 1, limit: int = 10,
-                         start_from: Optional[date] = None) -> List[Dict[str, Any]]:
-    start_from = start_from or date.today()
+def list_available_slots(days: int = 14, min_seats: int = 1, limit: int = 10, start_from: Optional[date] = None):
+    days = max(1, min(days, 60))
+    limit = max(1, min(limit, 50))
+    start_from = start_from or date.today()  # <-- add this line
     with get_session() as s:
         rows = s.execute(text("""
             SELECT id, session_date, start_time, capacity, booked_count,
@@ -51,16 +52,27 @@ def list_available_slots(days: int = 14, min_seats: int = 1, limit: int = 10,
         }).mappings().all()
         return [dict(r) for r in rows]
 
+
+# Replace hold_or_reserve_slot with a locked version
 def hold_or_reserve_slot(session_id: int, seats: int = 1) -> Optional[Dict[str, Any]]:
     with get_session() as s:
+        slot = s.execute(text("""
+            SELECT id, capacity, booked_count FROM sessions
+            WHERE id = :sid FOR UPDATE
+        """), {"sid": session_id}).mappings().first()
+        if not slot:
+            return None
+        if slot["booked_count"] + seats > slot["capacity"]:
+            return None
         row = s.execute(text("""
             UPDATE sessions
             SET booked_count = booked_count + :seats,
-                status = CASE WHEN (booked_count + :seats) >= capacity THEN 'full' ELSE status END
-            WHERE id = :sid AND (booked_count + :seats) <= capacity
+                status = CASE WHEN booked_count + :seats >= capacity THEN 'full' ELSE 'open' END
+            WHERE id = :sid
             RETURNING id, session_date, start_time, capacity, booked_count, status
         """), {"sid": session_id, "seats": seats}).mappings().first()
         return dict(row) if row else None
+
 
 def release_slot(session_id: int, seats: int = 1) -> Optional[Dict[str, Any]]:
     with get_session() as s:
@@ -71,3 +83,50 @@ def release_slot(session_id: int, seats: int = 1) -> Optional[Dict[str, Any]]:
             RETURNING id, session_date, start_time, capacity, booked_count, status
         """), {"sid": session_id, "seats": seats}).mappings().first()
         return dict(row) if row else None
+
+def get_client_profile(client_id: int) -> Optional[Dict[str, Any]]:
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name,
+                   plan, birthday_day, birthday_month, medical_notes, notes, household_id, created_at
+            FROM clients WHERE id = :cid
+        """), {"cid": client_id}).mappings().first()
+        return dict(row) if row else None
+    
+def get_client_by_wa(wa_number: str) -> Optional[Dict[str, Any]]:
+    """Fetch a client row by WhatsApp number (normalized)."""
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name,
+                   plan, birthday_day, birthday_month, medical_notes, notes,
+                   household_id, created_at
+            FROM clients
+            WHERE wa_number = :wa
+            LIMIT 1
+        """), {"wa": wa_number}).mappings().first()
+        return dict(row) if row else None
+
+def list_sessions_for_day(day: date, limit: int = 50):
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT id, session_date, start_time, capacity, booked_count,
+                   (capacity - booked_count) AS seats_left, status
+            FROM sessions
+            WHERE session_date = :d
+            ORDER BY start_time
+            LIMIT :lim
+        """), {"d": day, "lim": limit}).mappings().all()
+        return [dict(r) for r in rows]
+
+def list_sessions_for_reminders(start_dt, end_dt):
+    # expects datetimes in UTC if your DB is UTC; filter by date/time parts
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT id, session_date, start_time, capacity, booked_count, status
+            FROM sessions
+            WHERE status IN ('open','full')
+              AND (session_date, start_time) BETWEEN (:sd::date, :st::time) AND (:ed::date, :et::time)
+            ORDER BY session_date, start_time
+        """), {"sd": start_dt.date(), "st": start_dt.time(),
+               "ed": end_dt.date(),   "et": end_dt.time()}).mappings().all()
+        return [dict(r) for r in rows]

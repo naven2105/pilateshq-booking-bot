@@ -3,12 +3,13 @@ import logging, requests
 from .config import ACCESS_TOKEN, GRAPH_URL
 
 def normalize_wa(raw: str) -> str:
-    """Normalize SA numbers to +27…; accepts 0…, 27…, +27…"""
-    if not raw: return ""
+    """Normalize SA numbers to 27…; accepts 0…, 27…, +27…"""
+    if not raw: 
+        return ""
     n = str(raw).strip().replace(" ", "").replace("-", "")
-    if n.startswith("+27"): return n
-    if n.startswith("27"):  return "+" + n
-    if n.startswith("0"):   return "+27" + n[1:]
+    if n.startswith("+27"): return n[1:]     # remove +
+    if n.startswith("27"):  return n
+    if n.startswith("0"):   return "27" + n[1:]
     return n
 
 def send_whatsapp_text(to: str, body: str):
