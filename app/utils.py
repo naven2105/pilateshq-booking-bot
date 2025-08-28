@@ -11,6 +11,7 @@ def normalize_wa(raw: str) -> str:
     if n.startswith("0"):   return "+27" + n[1:]
     return n
 
+
 def send_whatsapp_text(to: str, body: str):
     _send_json({
         "messaging_product": "whatsapp",
@@ -18,6 +19,7 @@ def send_whatsapp_text(to: str, body: str):
         "type": "text",
         "text": {"body": body}
     })
+
 
 def send_whatsapp_list(to: str, header: str, body: str, button_id: str, options: list):
     """
@@ -47,11 +49,35 @@ def send_whatsapp_list(to: str, header: str, body: str, button_id: str, options:
     }
     _send_json(payload)
 
+
+def send_whatsapp_buttons(to: str, body: str, buttons: list):
+    """
+    buttons: list of {"id": "...", "title": "..."}
+    Max 3 buttons; title <= 20 chars.
+    """
+    btns = []
+    for b in buttons[:3]:
+        btns.append({
+            "type": "reply",
+            "reply": {"id": b["id"], "title": b["title"][:20]}
+        })
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": normalize_wa(to),
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body[:1024]},
+            "action": {"buttons": btns}
+        }
+    }
+    _send_json(payload)
+
+
 def _send_json(payload: dict):
     try:
         headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
         resp = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=15)
-        # Log at INFO so you see errors in Render without switching to DEBUG
         logging.info(f"[WA RESP {resp.status_code}] {resp.text}")
     except Exception as e:
         logging.exception(f"[WA SEND ERROR] {e}")
