@@ -1,84 +1,126 @@
 # app/router.py
+from __future__ import annotations
+
 import logging
+from datetime import datetime
 from flask import request
 
-from .config import VERIFY_TOKEN
-from .utils import normalize_wa
-from .admin import _is_admin, handle_admin_action
-from .onboarding import handle_onboarding
+from app.config import VERIFY_TOKEN, NADINE_WA, ADMIN_WA_LIST
+from app.utils import normalize_wa, send_whatsapp_text
+from app.onboarding import handle_onboarding, capture_onboarding_free_text
+from app.admin import handle_admin_action
+
+# Build admin set (normalize to +27… form)
+def _admin_set():
+    nums = set()
+    if NADINE_WA:
+        nums.add(normalize_wa(NADINE_WA))
+    if ADMIN_WA_LIST:
+        for n in str(ADMIN_WA_LIST).split(","):
+            if n.strip():
+                nums.add(normalize_wa(n.strip()))
+    return nums
+
+ADMIN_WA_SET = _admin_set()
+
 
 def register_routes(app):
-    """Register webhook routes on the Flask app."""
+    """
+    Registers webhook routes on the provided Flask app.
+    NOTE: This module does not define "/" health routes to avoid endpoint clashes.
+    """
 
-    @app.route("/", methods=["GET"])
-    def health():
-        return "OK", 200
-
-    @app.route("/webhook", methods=["GET"])
+    @app.get("/webhook")
     def verify_webhook():
+        """Meta verification challenge."""
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        if token == VERIFY_TOKEN:
+        if token == VERIFY_TOKEN and challenge:
             logging.info("✅ Webhook verified")
             return challenge, 200
         logging.warning("❌ Webhook verification failed")
         return "Verification failed", 403
 
-    @app.route("/webhook", methods=["POST"])
+    @app.post("/webhook")
     def webhook():
+        """
+        WhatsApp inbound handler.
+        Supports:
+          - text messages (admin NLP & client onboarding)
+          - interactive button/list replies
+          - ignores status notifications
+        Always returns a simple 200 OK to Meta.
+        """
         data = request.get_json(silent=True) or {}
         logging.debug(f"[WEBHOOK DATA] {data}")
 
         try:
+            if data.get("object") != "whatsapp_business_account":
+                return "ignored", 200
+
             for entry in data.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
-                    # Message statuses (sent/delivered/read) — acknowledge quickly
-                    if "statuses" in value:
-                        logging.debug(f"[STATUS] {value.get('statuses')}")
+
+                    # 1) Ignore status callbacks
+                    if value.get("statuses"):
+                        logging.debug("[STATUS EVENT] ignored")
                         continue
 
-                    messages = value.get("messages", [])
-                    for message in messages:
-                        sender = normalize_wa(message.get("from", ""))
-                        # ---------- INTERACTIVE FIRST ----------
-                        if "interactive" in message:
-                            reply_id = (
-                                message["interactive"].get("button_reply", {}).get("id")
-                                or message["interactive"].get("list_reply", {}).get("id")
-                            )
-                            logging.info(f"[ROUTER] interactive from={sender} id={reply_id} admin={_is_admin(sender)}")
-                            if _is_admin(sender):
-                                return _safe_ok(handle_admin_action(sender, reply_id))
-                            # Non-admin interactive goes to onboarding (or your default handler)
-                            return _safe_ok(handle_onboarding(sender, reply_id))
+                    # 2) Process inbound messages
+                    for message in value.get("messages", []):
+                        sender_raw = message.get("from", "")
+                        sender = normalize_wa(sender_raw)
 
-                        # ---------- TEXT ----------
-                        if "text" in message:
-                            msg_text = message["text"].get("body", "").strip()
-                            is_admin = _is_admin(sender)
-                            logging.info(f"[ROUTER] text from={sender} admin={is_admin} msg='{msg_text}'")
+                        # Admin or not?
+                        is_admin = sender in ADMIN_WA_SET
+
+                        # Interactive replies (buttons / lists)
+                        if "interactive" in message:
+                            inter = message["interactive"]
+                            reply_id = (
+                                inter.get("button_reply", {}).get("id")
+                                or inter.get("list_reply", {}).get("id")
+                            )
+                            if not reply_id:
+                                logging.debug("[INTERACTIVE] no reply id found")
+                                continue
+
+                            logging.info(f"[INTERACTIVE] {sender} -> {reply_id}")
 
                             if is_admin:
-                                # Always route admin text to admin handler (NLP-first)
-                                return _safe_ok(handle_admin_action(sender, msg_text))
+                                # Route interactive payload to admin handler
+                                handle_admin_action(sender, reply_id)
+                            else:
+                                # Route interactive payload to onboarding/menu
+                                handle_onboarding(sender, reply_id)
+                            continue  # proceed to next message
 
-                            # Non-admins: greet → onboarding, otherwise your default user flow
-                            low = msg_text.lower()
-                            if low in ("hi", "hello", "start"):
-                                return _safe_ok(handle_onboarding(sender))
-                            # Default for regular users
-                            return _safe_ok(handle_onboarding(sender, msg_text))
+                        # Text messages
+                        msg_text = (message.get("text", {}) or {}).get("body", "").strip()
+                        if not msg_text:
+                            logging.debug("[TEXT] empty body")
+                            continue
+
+                        logging.info(f"[TEXT] {sender} -> {msg_text}")
+
+                        if is_admin:
+                            # Entirely NLP-based for admin
+                            handle_admin_action(sender, msg_text)
+                            continue
+
+                        # Client path: try capture in-progress onboarding first
+                        # If not in an awaiting state, treat "hi/hello/start" as entry to menu
+                        low = msg_text.lower()
+                        if low in ("hi", "hello", "start"):
+                            handle_onboarding(sender, None)
+                        else:
+                            # free text could be onboarding capture (name/medical/etc.)
+                            # If not awaiting, onboarding will show menu
+                            capture_onboarding_free_text(sender, msg_text)
 
         except Exception as e:
             logging.exception(f"[ERROR webhook]: {e}")
 
+        # Always ACK 200 to Meta within 10s
         return "ok", 200
-
-
-def _safe_ok(result):
-    """
-    WhatsApp handlers usually send messages and return None;
-    Flask requires a valid response—normalize to ('ok', 200).
-    """
-    return ("ok", 200)
