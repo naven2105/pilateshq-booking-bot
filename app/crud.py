@@ -1,51 +1,58 @@
 # app/crud.py
-from datetime import date, datetime, timedelta
+from __future__ import annotations
+from datetime import date, datetime, timedelta, time
 from typing import Any, Dict, List, Optional
-from sqlalchemy import text
 
+from sqlalchemy import text
 from .db import get_session
 
-# ---------- Clients ----------
 
+# ---------- Clients ----------
 def list_clients(limit: int = 20) -> List[Dict[str, Any]]:
     with get_session() as s:
         rows = s.execute(text("""
-            SELECT id, wa_number,
-                   COALESCE(NULLIF(name,''),'(no name)') AS name,
-                   plan
+            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name, plan,
+                   birthday_day, birthday_month, medical_notes, created_at
             FROM clients
             ORDER BY created_at DESC NULLS LAST, id DESC
             LIMIT :lim
-        """), {"lim": limit}).mappings().all()
+        """), {"lim": max(1, min(limit, 100))}).mappings().all()
         return [dict(r) for r in rows]
 
-def get_or_create_client(wa_number: str, name: str = "") -> Dict[str, Any]:
+def find_clients_by_name(name: str, limit: int = 5) -> List[Dict[str, Any]]:
+    name = (name or "").strip()
+    if not name:
+        return []
     with get_session() as s:
-        row = s.execute(text("""
-            SELECT id, wa_number, name, plan, household_id,
-                   birthday_day, birthday_month, medical_notes, notes
-            FROM clients WHERE wa_number = :wa
-            LIMIT 1
-        """), {"wa": wa_number}).mappings().first()
-        if row: return dict(row)
-        s.execute(text("INSERT INTO clients (wa_number, name) VALUES (:wa, :nm)"),
-                  {"wa": wa_number, "nm": name or ""})
-        row = s.execute(text("""
-            SELECT id, wa_number, name, plan, household_id,
-                   birthday_day, birthday_month, medical_notes, notes
-            FROM clients WHERE wa_number = :wa
-            LIMIT 1
-        """), {"wa": wa_number}).mappings().first()
-        return dict(row)
+        rows = s.execute(text("""
+            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name, plan
+            FROM clients
+            WHERE name ILIKE :q
+            ORDER BY name ASC
+            LIMIT :lim
+        """), {"q": f"%{name}%", "lim": max(1, min(limit, 10))}).mappings().all()
+        return [dict(r) for r in rows]
 
-def create_client(name: str, wa_number: str, plan: str = "1x") -> Optional[Dict[str, Any]]:
+def get_client_profile(client_id: int) -> Optional[Dict[str, Any]]:
     with get_session() as s:
         row = s.execute(text("""
-            INSERT INTO clients (name, wa_number, plan)
-            VALUES (:nm, :wa, :pl)
+            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name,
+                   plan, birthday_day, birthday_month, medical_notes, notes,
+                   household_id, created_at
+            FROM clients WHERE id = :cid
+        """), {"cid": client_id}).mappings().first()
+        return dict(row) if row else None
+
+def create_client(name: str, wa_number: str) -> Optional[Dict[str, Any]]:
+    with get_session() as s:
+        s.execute(text("""
+            INSERT INTO clients (name, wa_number)
+            VALUES (:nm, :wa)
             ON CONFLICT (wa_number) DO UPDATE SET name = EXCLUDED.name
-            RETURNING id, name, wa_number, plan
-        """), {"nm": name, "wa": wa_number, "pl": plan}).mappings().first()
+        """), {"nm": name.strip(), "wa": wa_number.strip()})
+        row = s.execute(text("""
+            SELECT id, name, wa_number, plan FROM clients WHERE wa_number = :wa
+        """), {"wa": wa_number.strip()}).mappings().first()
         return dict(row) if row else None
 
 def update_client_dob(client_id: int, day: int, month: int) -> bool:
@@ -62,52 +69,21 @@ def update_client_medical(client_id: int, note: str, append: bool = True) -> boo
         if append:
             res = s.execute(text("""
                 UPDATE clients
-                SET medical_notes = CONCAT(COALESCE(NULLIF(medical_notes,''),'') ,
+                SET medical_notes = CONCAT(COALESCE(NULLIF(medical_notes,''),''),
                                            CASE WHEN COALESCE(NULLIF(medical_notes,''),'') = '' THEN '' ELSE E'\n' END,
                                            :n)
                 WHERE id = :cid
-            """), {"n": note, "cid": client_id})
+            """), {"n": note.strip(), "cid": client_id})
         else:
-            res = s.execute(text("UPDATE clients SET medical_notes = :n WHERE id = :cid"),
-                            {"n": note, "cid": client_id})
+            res = s.execute(text("""
+                UPDATE clients SET medical_notes = :n WHERE id = :cid
+            """), {"n": note.strip(), "cid": client_id})
         return res.rowcount > 0
 
-def get_client_profile(client_id: int) -> Optional[Dict[str, Any]]:
-    with get_session() as s:
-        row = s.execute(text("""
-            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name,
-                   plan, birthday_day, birthday_month, medical_notes, notes,
-                   household_id, created_at
-            FROM clients WHERE id = :cid
-        """), {"cid": client_id}).mappings().first()
-        return dict(row) if row else None
 
-def get_client_by_wa(wa_number: str) -> Optional[Dict[str, Any]]:
-    with get_session() as s:
-        row = s.execute(text("""
-            SELECT id, wa_number, COALESCE(NULLIF(name,''),'(no name)') AS name,
-                   plan, birthday_day, birthday_month, medical_notes, notes,
-                   household_id, created_at
-            FROM clients WHERE wa_number = :wa
-            LIMIT 1
-        """), {"wa": wa_number}).mappings().first()
-        return dict(row) if row else None
-
-def find_clients_by_name(q: str, limit: int = 3) -> List[Dict[str, Any]]:
-    with get_session() as s:
-        rows = s.execute(text("""
-            SELECT id, name, wa_number, plan
-            FROM clients
-            WHERE LOWER(name) LIKE LOWER(:q)
-            ORDER BY created_at DESC NULLS LAST, id DESC
-            LIMIT :lim
-        """), {"q": f"%{q}%", "lim": limit}).mappings().all()
-        return [dict(r) for r in rows]
-
-# ---------- Sessions / availability ----------
-
-def list_available_slots(days: int = 14, min_seats: int = 1,
-                         limit: int = 10, start_from: Optional[date] = None) -> List[Dict[str, Any]]:
+# ---------- Sessions / Availability ----------
+def list_available_slots(days: int = 14, min_seats: int = 1, limit: int = 10,
+                         start_from: Optional[date] = None) -> List[Dict[str, Any]]:
     days = max(1, min(days, 60))
     limit = max(1, min(limit, 50))
     start_from = start_from or date.today()
@@ -130,225 +106,133 @@ def list_available_slots(days: int = 14, min_seats: int = 1,
         }).mappings().all()
         return [dict(r) for r in rows]
 
-def list_days_with_open_slots(days: int = 21,
-                              start_from: Optional[date] = None,
-                              limit_days: int = 10) -> List[Dict[str, Any]]:
-    start_from = start_from or date.today()
+def list_days_with_open_slots(days: int = 21, limit_days: int = 10) -> List[Dict[str, Any]]:
+    start_from = date.today()
     with get_session() as s:
         rows = s.execute(text("""
-          SELECT session_date, COUNT(*) AS slots
-          FROM sessions
-          WHERE session_date >= :sd AND session_date < :ed
-            AND status='open' AND (capacity - booked_count) > 0
-          GROUP BY session_date
-          ORDER BY session_date
-          LIMIT :lim
-        """), {"sd": start_from, "ed": start_from + timedelta(days=days), "lim": limit_days}).mappings().all()
-        return [dict(r) for r in rows]
-
-def list_slots_for_day(day: date, limit: int = 10) -> List[Dict[str, Any]]:
-    with get_session() as s:
-        rows = s.execute(text("""
-          SELECT id, start_time, (capacity - booked_count) AS seats_left
-          FROM sessions
-          WHERE session_date = :d AND status IN ('open','full') AND (capacity - booked_count) > 0
-          ORDER BY start_time
-          LIMIT :lim
-        """), {"d": day, "lim": limit}).mappings().all()
-        return [dict(r) for r in rows]
-
-def find_session_by_date_time(d: date, hhmm: str) -> Optional[Dict[str, Any]]:
-    with get_session() as s:
-        row = s.execute(text("""
-            SELECT id, session_date, start_time, capacity, booked_count, status
+            SELECT session_date, COUNT(*) AS slots
             FROM sessions
-            WHERE session_date = :d AND start_time = :t AND status IN ('open','full')
-            LIMIT 1
-        """), {"d": d, "t": hhmm}).mappings().first()
-        return dict(row) if row else None
-
-def find_next_n_weekday_time(weekday: int, hhmm: str,
-                             start_from: date, weeks: int = 4) -> List[Dict[str, Any]]:
-    with get_session() as s:
-        rows = s.execute(text("""
-            SELECT id, session_date, start_time, capacity, booked_count, status
-            FROM sessions
-            WHERE session_date >= :start
-              AND EXTRACT(DOW FROM session_date) = :wd
-              AND start_time = :t
+            WHERE session_date >= :start_date
+              AND session_date <  :end_date
+              AND status = 'open'
+              AND (capacity - booked_count) > 0
+            GROUP BY session_date
             ORDER BY session_date
             LIMIT :lim
-        """), {"start": start_from, "wd": weekday, "t": hhmm, "lim": weeks}).mappings().all()
+        """), {
+            "start_date": start_from,
+            "end_date": start_from + timedelta(days=days),
+            "lim": max(1, min(limit_days, 30))
+        }).mappings().all()
         return [dict(r) for r in rows]
 
-# ---------- Bookings (client ↔ session link) ----------
-
-def create_booking(session_id: int, client_id: int,
-                   seats: int = 1, status: str = "confirmed") -> Optional[Dict[str, Any]]:
-    if not session_id or not client_id or seats <= 0:
-        return None
+def list_slots_for_day(session_date: date, limit: int = 20) -> List[Dict[str, Any]]:
     with get_session() as s:
-        slot = s.execute(text("""
-            SELECT id, capacity, booked_count
-            FROM sessions WHERE id=:sid FOR UPDATE
-        """), {"sid": session_id}).mappings().first()
-        if not slot or (slot["booked_count"] + seats) > slot["capacity"]:
-            return None
+        rows = s.execute(text("""
+            SELECT id, session_date, start_time, capacity, booked_count,
+                   (capacity - booked_count) AS seats_left, status
+            FROM sessions
+            WHERE session_date = :d AND (capacity - booked_count) > 0 AND status = 'open'
+            ORDER BY start_time
+            LIMIT :lim
+        """), {"d": session_date, "lim": max(1, min(limit, 50))}).mappings().all()
+        return [dict(r) for r in rows]
+
+def find_session_by_date_time(session_date: date, hhmm: str) -> Optional[Dict[str, Any]]:
+    with get_session() as s:
         row = s.execute(text("""
-            INSERT INTO bookings (session_id, client_id, seats, status)
-            VALUES (:sid, :cid, :seats, :status)
+            SELECT id, session_date, start_time, capacity, booked_count, status
+            FROM sessions
+            WHERE session_date = :d AND start_time = :t
+            LIMIT 1
+        """), {"d": session_date, "t": hhmm}).mappings().first()
+        return dict(row) if row else None
+
+
+# ---------- Bookings ----------
+def create_booking(session_id: int, client_id: int, seats: int = 1, status: str = "confirmed") -> bool:
+    """
+    Creates (or upserts) a booking and increments the session's booked_count atomically.
+    """
+    with get_session() as s:
+        # check capacity
+        slot = s.execute(text("""
+            SELECT id, capacity, booked_count FROM sessions WHERE id = :sid FOR UPDATE
+        """), {"sid": session_id}).mappings().first()
+        if not slot:
+            return False
+        if slot["booked_count"] + seats > slot["capacity"]:
+            return False
+
+        # upsert booking (unique client_id+session_id)
+        s.execute(text("""
+            INSERT INTO bookings (client_id, session_id, seats, status)
+            VALUES (:cid, :sid, :seats, :status)
             ON CONFLICT (client_id, session_id)
-            DO UPDATE SET seats=EXCLUDED.seats, status=EXCLUDED.status
-            RETURNING id
-        """), {"sid": session_id, "cid": client_id, "seats": seats, "status": status}).mappings().first()
+            DO UPDATE SET status = EXCLUDED.status, seats = EXCLUDED.seats
+        """), {"cid": client_id, "sid": session_id, "seats": seats, "status": status})
+
+        # increment session count & maybe mark full
         s.execute(text("""
             UPDATE sessions
-               SET booked_count = booked_count + :seats,
-                   status = CASE WHEN booked_count + :seats >= capacity THEN 'full' ELSE status END
-             WHERE id = :sid
+            SET booked_count = booked_count + :seats,
+                status = CASE WHEN (booked_count + :seats) >= capacity THEN 'full' ELSE status END
+            WHERE id = :sid
         """), {"sid": session_id, "seats": seats})
-        return dict(row) if row else None
-
-def cancel_booking(session_id: int, client_id: int) -> bool:
-    with get_session() as s:
-        b = s.execute(text("""
-            SELECT id, seats, status
-            FROM bookings WHERE session_id=:sid AND client_id=:cid
-        """), {"sid": session_id, "cid": client_id}).mappings().first()
-        if not b: return False
-        if b["status"] != "cancelled":
-            s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:bid"), {"bid": b["id"]})
-            s.execute(text("""
-                UPDATE sessions
-                   SET booked_count = GREATEST(0, booked_count - :seats),
-                       status='open'
-                 WHERE id=:sid
-            """), {"sid": session_id, "seats": b["seats"]})
         return True
 
-def get_next_booking_for_client(client_id: int, from_date: Optional[date] = None) -> Optional[Dict[str, Any]]:
-    from_date = from_date or date.today()
+def cancel_booking(client_id: int, session_id: int) -> bool:
+    """
+    Cancels a booking and frees the seat (if not already cancelled/noshow).
+    """
     with get_session() as s:
+        # only free if currently held/confirmed
         row = s.execute(text("""
-            SELECT b.id AS booking_id, b.status, b.seats,
-                   s.id AS session_id, s.session_date, s.start_time
-            FROM bookings b
-            JOIN sessions s ON s.id = b.session_id
-            WHERE b.client_id = :cid
-              AND b.status IN ('held','confirmed')
-              AND s.session_date >= :d
-            ORDER BY s.session_date, s.start_time
-            LIMIT 1
-        """), {"cid": client_id, "d": from_date}).mappings().first()
-        return dict(row) if row else None
-
-def mark_booking_status(booking_id: int, new_status: str, decrement_if_cancel: bool = True) -> bool:
-    with get_session() as s:
-        b = s.execute(text("""
-            SELECT b.id, b.seats, b.status, s.id AS session_id
-            FROM bookings b
-            JOIN sessions s ON s.id = b.session_id
-            WHERE b.id = :bid
-        """), {"bid": booking_id}).mappings().first()
-        if not b: return False
-        if new_status == b["status"]: return True
-        s.execute(text("UPDATE bookings SET status=:st WHERE id=:bid"), {"st": new_status, "bid": booking_id})
-        if new_status == "cancelled" and decrement_if_cancel and b["status"] in ("held","confirmed"):
-            s.execute(text("""
-                UPDATE sessions
-                   SET booked_count = GREATEST(0, booked_count - :seats),
-                       status='open'
-                 WHERE id=:sid
-            """), {"sid": b["session_id"], "seats": b["seats"]})
+            UPDATE bookings
+            SET status = 'cancelled'
+            WHERE client_id = :cid AND session_id = :sid
+              AND status IN ('held','confirmed')
+            RETURNING seats
+        """), {"cid": client_id, "sid": session_id}).first()
+        if not row:
+            return False
+        seats = int(row[0] or 1)
+        s.execute(text("""
+            UPDATE sessions
+            SET booked_count = GREATEST(0, booked_count - :seats),
+                status = CASE WHEN booked_count - :seats < capacity THEN 'open' ELSE status END
+            WHERE id = :sid
+        """), {"sid": session_id, "seats": seats})
         return True
 
 def cancel_next_booking_for_client(client_id: int) -> bool:
-    nxt = get_next_booking_for_client(client_id)
-    if not nxt: return False
-    return mark_booking_status(nxt["booking_id"], "cancelled", decrement_if_cancel=True)
+    with get_session() as s:
+        # find next upcoming confirmed/held booking
+        row = s.execute(text("""
+            SELECT b.session_id, b.seats
+            FROM bookings b
+            JOIN sessions s ON s.id = b.session_id
+            WHERE b.client_id = :cid AND b.status IN ('held','confirmed')
+              AND s.session_date >= CURRENT_DATE
+            ORDER BY s.session_date, s.start_time
+            LIMIT 1
+        """), {"cid": client_id}).mappings().first()
+        if not row:
+            return False
+        return cancel_booking(client_id, row["session_id"])
 
 def mark_no_show_today(client_id: int) -> bool:
-    today = date.today()
+    """
+    Marks today’s booking as no-show (does NOT free the seat).
+    """
     with get_session() as s:
-        row = s.execute(text("""
-            SELECT b.id AS booking_id
-            FROM bookings b
-            JOIN sessions s ON s.id = b.session_id
-            WHERE b.client_id=:cid AND s.session_date=:d AND b.status IN ('held','confirmed')
-            ORDER BY s.start_time LIMIT 1
-        """), {"cid": client_id, "d": today}).mappings().first()
-        if not row: return False
-        # no-show does NOT free capacity
-        s.execute(text("UPDATE bookings SET status='noshow' WHERE id=:bid"), {"bid": row["booking_id"]})
-        return True
-
-def mark_off_sick_today(client_id: int) -> int:
-    """Cancel all of today's future bookings for client; returns count cancelled."""
-    today = date.today()
-    count = 0
-    with get_session() as s:
-        rows = s.execute(text("""
-            SELECT b.id AS booking_id, b.seats, s.id AS session_id
-            FROM bookings b
-            JOIN sessions s ON s.id = b.session_id
-            WHERE b.client_id=:cid AND s.session_date=:d AND b.status IN ('held','confirmed')
-        """), {"cid": client_id, "d": today}).mappings().all()
-        for r in rows:
-            s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:bid"), {"bid": r["booking_id"]})
-            s.execute(text("""
-                UPDATE sessions
-                   SET booked_count = GREATEST(0, booked_count - :seats),
-                       status='open'
-                 WHERE id=:sid
-            """), {"sid": r["session_id"], "seats": r["seats"]})
-            count += 1
-    return count
-
-def list_bookings_for_session(session_id: int, limit: int = 50) -> List[Dict[str, Any]]:
-    with get_session() as s:
-        rows = s.execute(text("""
-            SELECT b.id, b.client_id, b.seats, b.status,
-                   c.name, c.wa_number
-            FROM bookings b
-            JOIN clients c ON c.id = b.client_id
-            WHERE b.session_id = :sid
-            ORDER BY b.id DESC
-            LIMIT :lim
-        """), {"sid": session_id, "lim": limit}).mappings().all()
-        return [dict(r) for r in rows]
-
-def create_recurring_from_slot(base_session_id: int, client_id: int,
-                               weeks: int = 4, seats: int = 1) -> Dict[str, int]:
-    if not base_session_id or not client_id or weeks <= 0 or seats <= 0:
-        return {"created": 0, "skipped": 0}
-    created = skipped = 0
-    with get_session() as s:
-        base = s.execute(text("""
-            SELECT id, session_date, start_time FROM sessions WHERE id=:sid
-        """), {"sid": base_session_id}).mappings().first()
-        if not base:
-            return {"created": 0, "skipped": 0}
-        base_date = base["session_date"]; start_time = base["start_time"]
-        for k in range(weeks):
-            target_date = base_date + timedelta(days=7*k)
-            tgt = s.execute(text("""
-                SELECT id, capacity, booked_count
-                FROM sessions
-                WHERE session_date=:d AND start_time=:t FOR UPDATE
-            """), {"d": target_date, "t": start_time}).mappings().first()
-            if not tgt or (tgt["booked_count"] + seats) > tgt["capacity"]:
-                skipped += 1; continue
-            s.execute(text("""
-                INSERT INTO bookings (session_id, client_id, seats, status)
-                VALUES (:sid,:cid,:seats,'confirmed')
-                ON CONFLICT (client_id, session_id)
-                DO UPDATE SET seats=EXCLUDED.seats, status='confirmed'
-            """), {"sid": tgt["id"], "cid": client_id, "seats": seats})
-            s.execute(text("""
-                UPDATE sessions
-                   SET booked_count = booked_count + :seats,
-                       status = CASE WHEN booked_count + :seats >= capacity THEN 'full' ELSE status END
-                 WHERE id = :sid
-            """), {"sid": tgt["id"], "seats": seats})
-            created += 1
-    return {"created": created, "skipped": skipped}
+        res = s.execute(text("""
+            UPDATE bookings b
+            SET status = 'noshow'
+            FROM sessions s
+            WHERE b.session_id = s.id
+              AND b.client_id = :cid
+              AND s.session_date = CURRENT_DATE
+              AND b.status IN ('held','confirmed')
+        """), {"cid": client_id})
+        return res.rowcount > 0

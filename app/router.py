@@ -1,20 +1,18 @@
 # app/router.py
 import logging
-import os
 from flask import request
 
 from .config import VERIFY_TOKEN
 from .utils import normalize_wa
-from .onboarding import handle_onboarding, capture_onboarding_free_text
-from .admin import handle_admin_action
-
+from .admin import _is_admin, handle_admin_action
+from .onboarding import handle_onboarding
 
 def register_routes(app):
-    """Register webhook routes with the Flask app."""
+    """Register webhook routes on the Flask app."""
 
     @app.route("/", methods=["GET"])
-    def home():
-        return "PilatesHQ Bot running", 200
+    def health():
+        return "OK", 200
 
     @app.route("/webhook", methods=["GET"])
     def verify_webhook():
@@ -28,64 +26,59 @@ def register_routes(app):
 
     @app.route("/webhook", methods=["POST"])
     def webhook():
-        data = request.get_json() or {}
-        logging.debug(f"[WEBHOOK DATA keys] {list(data.keys())}")
+        data = request.get_json(silent=True) or {}
+        logging.debug(f"[WEBHOOK DATA] {data}")
 
         try:
             for entry in data.get("entry", []):
                 for change in entry.get("changes", []):
-                    value = (change.get("value") or {})
-
-                    # Log and ignore status callbacks (sent, delivered, read, etc.)
-                    if value.get("statuses"):
-                        st = value["statuses"][0]
-                        logging.info(f"[STATUS] id={st.get('id')} status={st.get('status')} to={st.get('recipient_id')}")
+                    value = change.get("value", {})
+                    # Message statuses (sent/delivered/read) — acknowledge quickly
+                    if "statuses" in value:
+                        logging.debug(f"[STATUS] {value.get('statuses')}")
                         continue
 
-                    for message in value.get("messages", []):
-                        sender_raw = message.get("from", "")
-                        sender = normalize_wa(sender_raw)  # '27...'
-
-                        # ---- Admin check debug (for troubleshooting ENV/normalization) ----
-                        env_admins = [n.strip() for n in os.getenv("ADMIN_WA_LIST", "").split(",") if n.strip()]
-                        env_nadine = os.getenv("NADINE_WA", "").strip()
-                        norm_admins = [normalize_wa(x) for x in env_admins]
-                        norm_nadine = normalize_wa(env_nadine) if env_nadine else ""
-                        is_admin_guess = sender in set(norm_admins + ([norm_nadine] if norm_nadine else []))
-                        logging.debug(
-                            f"[ADMIN CHECK] raw={sender_raw} norm={sender} admins={norm_admins} "
-                            f"nadine={norm_nadine} is_admin={is_admin_guess}"
-                        )
-                        # --------------------------------------------------------------------
-
-                        # Interactive replies (buttons / lists)
+                    messages = value.get("messages", [])
+                    for message in messages:
+                        sender = normalize_wa(message.get("from", ""))
+                        # ---------- INTERACTIVE FIRST ----------
                         if "interactive" in message:
-                            rep = message["interactive"]
                             reply_id = (
-                                (rep.get("button_reply") or {}).get("id")
-                                or (rep.get("list_reply") or {}).get("id")
+                                message["interactive"].get("button_reply", {}).get("id")
+                                or message["interactive"].get("list_reply", {}).get("id")
                             )
-                            logging.info(f"[USER CHOICE] {reply_id}")
-                            if reply_id and reply_id.upper().startswith("ADMIN"):
-                                handle_admin_action(sender, reply_id)
-                            else:
-                                handle_onboarding(sender, reply_id or "ROOT_MENU")
-                            continue
+                            logging.info(f"[ROUTER] interactive from={sender} id={reply_id} admin={_is_admin(sender)}")
+                            if _is_admin(sender):
+                                return _safe_ok(handle_admin_action(sender, reply_id))
+                            # Non-admin interactive goes to onboarding (or your default handler)
+                            return _safe_ok(handle_onboarding(sender, reply_id))
 
-                        # Plain text messages
+                        # ---------- TEXT ----------
                         if "text" in message:
-                            msg_text = (message["text"].get("body") or "").strip()
-                            up = msg_text.upper()
-                            if up in ("HI", "HELLO", "START", "MENU", "MAIN_MENU"):
-                                handle_onboarding(sender, "ROOT_MENU")
-                            elif up.startswith("ADMIN"):
-                                handle_admin_action(sender, up)
-                            else:
-                                # default: use onboarding free-text capture (e.g., name/medical/etc.)
-                                capture_onboarding_free_text(sender, msg_text)
-                            continue
+                            msg_text = message["text"].get("body", "").strip()
+                            is_admin = _is_admin(sender)
+                            logging.info(f"[ROUTER] text from={sender} admin={is_admin} msg='{msg_text}'")
+
+                            if is_admin:
+                                # Always route admin text to admin handler (NLP-first)
+                                return _safe_ok(handle_admin_action(sender, msg_text))
+
+                            # Non-admins: greet → onboarding, otherwise your default user flow
+                            low = msg_text.lower()
+                            if low in ("hi", "hello", "start"):
+                                return _safe_ok(handle_onboarding(sender))
+                            # Default for regular users
+                            return _safe_ok(handle_onboarding(sender, msg_text))
 
         except Exception as e:
             logging.exception(f"[ERROR webhook]: {e}")
 
         return "ok", 200
+
+
+def _safe_ok(result):
+    """
+    WhatsApp handlers usually send messages and return None;
+    Flask requires a valid response—normalize to ('ok', 200).
+    """
+    return ("ok", 200)
