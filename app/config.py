@@ -1,15 +1,17 @@
 # app/config.py
 import os
 
-# Meta / WhatsApp API
+# --- Meta / WhatsApp Cloud API ---
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
-GRAPH_URL = os.environ.get("GRAPH_URL", "https://graph.facebook.com/v20.0/me/messages")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")  # e.g. 802833389569115
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "testtoken")
 
-# Admin numbers
-NADINE_WA = os.environ.get("NADINE_WA", "")  # single primary admin
-ADMIN_WA_LIST = os.environ.get("ADMIN_WA_LIST", "")  # optional comma-separated list
-# Example ENV value: "0627597357,0841234567"
+# Build the correct WA messages endpoint:
+# https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages
+GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-# Database
+# --- Admin (single-admin mode is fine) ---
+NADINE_WA = os.environ.get("NADINE_WA", "")  # can be 062..., +27..., 27..., we'll normalize
+
+# --- Database ---
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
