@@ -1,11 +1,10 @@
-# app/onboarding.py
 import logging
 from typing import Dict
 from sqlalchemy import text
 
 from .utils import send_whatsapp_list, normalize_wa
 from .db import get_session
-from .crud import get_or_create_client  # must return dict with at least wa_number,name (OK if you stub)
+from . import crud  # module import to avoid name-level binding during import time
 # If you don't have get_or_create_client yet, you can inline a simple version here.
 
 # Minimal in-memory state for intake (MVP)
@@ -23,7 +22,7 @@ def handle_onboarding(sender: str, action: str | None = None):
     wa = normalize_wa(sender)  # "27XXXXXXXXX"
     # Ensure client row exists
     try:
-        get_or_create_client(wa)
+        crud.get_or_create_client(wa)
     except Exception:
         logging.exception("[ONB] get_or_create_client failed")
 

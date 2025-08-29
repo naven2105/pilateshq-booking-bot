@@ -1,4 +1,3 @@
-# app/admin.py
 import os
 import re
 import logging
@@ -11,14 +10,7 @@ from .utils import (
     send_whatsapp_buttons,
     normalize_wa,
 )
-from .crud import (
-    list_clients, find_clients_by_name, get_client_profile,
-    list_days_with_open_slots, list_slots_for_day,
-    find_session_by_date_time,
-    create_client, update_client_dob, update_client_medical,
-    create_booking, cancel_next_booking_for_client, mark_no_show_today,
-)
-from .crud import adjust_client_credits  # if needed later
+from . import crud  # module import to avoid name-level binding during import time
 
 # ---------------- Admin auth ----------------
 ADMIN_WA_LIST = [n.strip() for n in os.getenv("ADMIN_WA_LIST", "").split(",") if n.strip()]
@@ -84,7 +76,7 @@ def _menu(recipient: str):
     )
 
 def _resolve_single_client(sender: str, name: str, next_prefix: str | None = None):
-    matches = find_clients_by_name(name, limit=6)
+    matches = crud.find_clients_by_name(name, limit=6)
     if not matches:
         send_whatsapp_text(sender, f"⚠️ No client matching “{name}”.")
         return None
@@ -119,13 +111,12 @@ def handle_admin_action(sender: str, text: str):
     if up in ("HELP", "ADMIN_HELP", "?"):
         return _show_template(sender, None)
     if up in ("SHOW CLIENTS", "LIST CLIENTS", "ADMIN_LIST_CLIENTS"):
-        clients = list_clients(limit=20)
+        clients = crud.list_clients(limit=20)
         rows = [{"id": f"ADMIN_VIEW_{c['id']}", "title": c["name"][:24], "description": f"{c['wa_number']} • {c.get('credits',0)} cr"} for c in clients]
         return send_whatsapp_list(sender, "Clients", "Latest clients:", "ADMIN_MENU",
                                   rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
     if up in ("SHOW SLOTS", "LIST SLOTS", "ADMIN_LIST_SLOTS"):
-        from .crud import list_days_with_open_slots
-        days = list_days_with_open_slots(days=21, limit_days=10)
+        days = crud.list_days_with_open_slots(days=21, limit_days=10)
         rows = [{"id": f"ADMIN_DAY_{d['session_date']}", "title": str(d['session_date']), "description": f"{d['slots']} open"} for d in days]
         return send_whatsapp_list(sender, "Open Slots", "Choose a day:", "ADMIN_MENU",
                                   rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
@@ -223,7 +214,7 @@ def handle_admin_action(sender: str, text: str):
         client = _resolve_single_client(sender, name)
         if not client:
             return
-        prof = get_client_profile(client["id"])
+        prof = crud.get_client_profile(client["id"])
         if not prof:
             return send_whatsapp_text(sender, "Client not found.")
         bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
@@ -239,7 +230,7 @@ def handle_admin_action(sender: str, text: str):
     if raw.startswith("ADMIN_DAY_"):
         d = raw.replace("ADMIN_DAY_", "")
         try:
-            slots = list_slots_for_day(date.fromisoformat(d))
+            slots = crud.list_slots_for_day(date.fromisoformat(d))
             rows = [{"id": f"ADMIN_SLOT_{r['id']}", "title": str(r["start_time"]), "description": f"seats {r['seats_left']}"} for r in slots]
             return send_whatsapp_list(sender, f"Slots {d}", "Pick a slot:", "ADMIN_MENU", rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
         except Exception as e:
@@ -249,7 +240,7 @@ def handle_admin_action(sender: str, text: str):
     if raw.startswith("ADMIN_VIEW_"):
         cid_s = raw.replace("ADMIN_VIEW_", "")
         cid = int(cid_s) if cid_s.isdigit() else None
-        prof = get_client_profile(cid) if cid else None
+        prof = crud.get_client_profile(cid) if cid else None
         if not prof:
             return send_whatsapp_text(sender, "Client not found.")
         bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
@@ -267,10 +258,10 @@ def handle_admin_action(sender: str, text: str):
         logging.info(f"[ADMIN CONFIRM] action={action} args={args}")
         try:
             if action == "ADD_CLIENT":
-                res = create_client(args["name"], args["phone"])
+                res = crud.create_client(args["name"], args["phone"])
                 if not res:
                     return send_whatsapp_text(sender, "⚠️ Could not add client.")
-                prof = get_client_profile(res["id"])
+                prof = crud.get_client_profile(res["id"])
                 bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
                 text = (
                     "✅ *Client added*\n"
@@ -284,26 +275,26 @@ def handle_admin_action(sender: str, text: str):
                 return send_whatsapp_text(sender, text)
 
             if action == "SET_DOB":
-                ok = update_client_dob(int(args["cid"]), int(args["day"]), int(args["mon"]))
+                ok = crud.update_client_dob(int(args["cid"]), int(args["day"]), int(args["mon"]))
                 return send_whatsapp_text(sender, "✅ DOB updated." if ok else "⚠️ Update failed.")
 
             if action == "ADD_NOTE":
-                ok = update_client_medical(int(args["cid"]), args["note"], append=True)
+                ok = crud.update_client_medical(int(args["cid"]), args["note"], append=True)
                 return send_whatsapp_text(sender, "✅ Note added." if ok else "⚠️ Update failed.")
 
             if action == "CANCEL_NEXT":
-                ok = cancel_next_booking_for_client(int(args["cid"]))
+                ok = crud.cancel_next_booking_for_client(int(args["cid"]))
                 return send_whatsapp_text(sender, "✅ Next session cancelled. (Credit +1)") if ok else send_whatsapp_text(sender, "⚠️ No upcoming booking found.")
 
             if action == "NOSHOW_TODAY":
-                ok = mark_no_show_today(int(args["cid"]))
+                ok = crud.mark_no_show_today(int(args["cid"]))
                 return send_whatsapp_text(sender, "✅ No-show recorded.") if ok else send_whatsapp_text(sender, "⚠️ No booking found today.")
 
             if action == "BOOK_DT":
-                sess = find_session_by_date_time(date.fromisoformat(args["d"]), args["t"])
+                sess = crud.find_session_by_date_time(date.fromisoformat(args["d"]), args["t"])
                 if not sess:
                     return send_whatsapp_text(sender, "⚠️ No matching session found.")
-                ok = create_booking(sess["id"], int(args["cid"]), seats=1, status="confirmed")
+                ok = crud.create_booking(sess["id"], int(args["cid"]), seats=1, status="confirmed")
                 return send_whatsapp_text(sender, "✅ Booked.") if ok else send_whatsapp_text(sender, "⚠️ Could not book (full?).")
 
         except Exception as e:
