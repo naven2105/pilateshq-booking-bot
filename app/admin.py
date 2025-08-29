@@ -2,7 +2,7 @@
 import os
 import re
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from urllib.parse import quote, unquote
 
 from sqlalchemy import text
@@ -35,23 +35,19 @@ def _is_admin(sender: str) -> bool:
     return ok
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NEW FLOW: single-word intents + small state machine
-# Intents: new, update, cancel, view, book
+# Intents & in-memory state (no strict templates)
 # ──────────────────────────────────────────────────────────────────────────────
 INTENTS = {"NEW", "UPDATE", "CANCEL", "VIEW", "BOOK"}
 
-# Minimal in-memory per-admin state. Keyed by the admin’s WA number.
-# Example state:
 # ADMIN_STATE["+27..."] = {
 #   "flow": "NEW" | "UPDATE" | "CANCEL" | "VIEW" | "BOOK",
-#   "await": "NAME" | "PHONE" | "DOB" | "PLAN" | "MEDICAL" | None,
-#   "cid": 123,           # selected client id (for update/cancel/view/book)
-#   "buffer": {...},      # transient answers in the wizard
+#   "await": "NAME" | "PHONE" | "DOB" | "MEDICAL" | None,
+#   "cid": 123,
+#   "buffer": {...},
 #   "book": { "type": "single/duo/group", "mode": "one/ongoing", "slot_id": 1 }
 # }
 ADMIN_STATE = {}
 
-# Seats mapping by booking type
 SEATS_BY_TYPE = {"single": 1, "duo": 2, "group": 1}
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -91,8 +87,6 @@ def _show_profile(to: str, cid: int):
     bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
     text = (f"👤 {prof['name']}\n"
             f"📱 {prof['wa_number']}\n"
-            f"📅 Plan: {prof.get('plan','')}\n"
-            f"🎟️ Credits: {prof.get('credits',0)}\n"
             f"🎂 DOB: {bday or '—'}\n"
             f"📝 Notes: {prof.get('medical_notes') or '—'}")
     return send_whatsapp_text(to, text)
@@ -106,9 +100,7 @@ def _update_menu(to: str, cid: int):
         [
             {"id": "ADMIN_EDIT_NAME",    "title": "👤 Name"},
             {"id": "ADMIN_EDIT_DOB",     "title": "🎂 DOB"},
-            {"id": "ADMIN_EDIT_PLAN",    "title": "📅 Plan"},
             {"id": "ADMIN_EDIT_MEDICAL", "title": "🩺 Medical Notes"},
-            {"id": "ADMIN_EDIT_CREDITS", "title": "🎟️ Credits (+/-)"},
             {"id": "ADMIN_DONE",         "title": "✅ Done"},
         ],
     )
@@ -124,6 +116,7 @@ def _cancel_menu(to: str, cid: int):
     )
 
 def _ask_free_text(to: str, header: str, prompt: str, back_id="ADMIN_INTENT_UPDATE"):
+    # If you prefer no “Choose” panel, replace this with send_whatsapp_text(to, f"{header}\n{prompt}")
     return send_whatsapp_list(
         to, header, prompt, "ADMIN_BACK",
         [{"id": back_id, "title": "⬅️ Back"}]
@@ -133,14 +126,6 @@ def _save_name(cid: int, name: str):
     with get_session() as s:
         s.execute(text("UPDATE clients SET name=:nm WHERE id=:cid"),
                   {"nm": name[:120], "cid": cid})
-
-def _save_plan(cid: int, plan: str):
-    with get_session() as s:
-        s.execute(text("UPDATE clients SET plan=:p WHERE id=:cid"),
-                  {"p": plan[:20], "cid": cid})
-
-def _save_credits_delta(cid: int, delta: int):
-    crud.adjust_client_credits(cid, delta)
 
 def _book_type_menu(to: str):
     return send_whatsapp_list(
@@ -184,7 +169,6 @@ def _get_session_row(session_id: int):
         return dict(r) if r else None
 
 def _find_session_by_date_time_safe(d: date, hhmm: str):
-    # Try to use a helper in crud if present; else inline a simple match by date+time.
     fn = getattr(crud, "find_session_by_date_time", None)
     if fn:
         return fn(d, hhmm)
@@ -199,14 +183,13 @@ def _find_session_by_date_time_safe(d: date, hhmm: str):
 
 def _iter_weekly_dates(start: date, weekday: int, count: int):
     """Yield `count` dates starting from the next `weekday` on/after start."""
-    # weekday: Monday=0..Sunday=6
     days_ahead = (weekday - start.weekday()) % 7
-    first = start + timedelta(days=days_ahead or 7)  # always next occurrence (not same day)
+    first = start + timedelta(days=days_ahead or 7)  # always next occurrence
     for i in range(count):
         yield first + timedelta(days=7 * i)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entry
+# Entry (only single-word intents and NLP; no strict templates)
 # ──────────────────────────────────────────────────────────────────────────────
 def handle_admin_action(sender: str, text: str):
     if not _is_admin(sender):
@@ -220,14 +203,14 @@ def handle_admin_action(sender: str, text: str):
     up = raw.upper()
     logging.info(f"[ADMIN CMD] '{raw}' (flow={state['flow']} await={state['await']} cid={state['cid']})")
 
-    # ── Handle intent shortcuts (interactive buttons)
+    # Intent buttons
     if up == "ADMIN_INTENT_NEW":     state.update({"flow": "NEW",    "await": None, "cid": None, "buffer": {}, "book": {}});  return _start_new(wa, state)
     if up == "ADMIN_INTENT_UPDATE":  state.update({"flow": "UPDATE", "await": None}); return _client_picker(wa, "Update: pick client")
     if up == "ADMIN_INTENT_CANCEL":  state.update({"flow": "CANCEL", "await": None}); return _client_picker(wa, "Cancel: pick client")
     if up == "ADMIN_INTENT_VIEW":    state.update({"flow": "VIEW",   "await": None}); return _client_picker(wa, "View: pick client")
     if up == "ADMIN_INTENT_BOOK":    state.update({"flow": "BOOK",   "await": None}); return _client_picker(wa, "Book: pick client")
 
-    # ── Client selection from list
+    # Client selection
     if up.startswith("ADMIN_PICK_CLIENT_"):
         try:
             cid = int(up.replace("ADMIN_PICK_CLIENT_", ""))
@@ -244,7 +227,7 @@ def handle_admin_action(sender: str, text: str):
             return _book_type_menu(wa)
         return _root_menu(wa)
 
-    # ── CANCEL actions
+    # CANCEL actions
     if up in ("ADMIN_CANCEL_NEXT","ADMIN_NO_SHOW"):
         if not state["cid"]:
             return _client_picker(wa, "Cancel: pick client")
@@ -256,8 +239,8 @@ def handle_admin_action(sender: str, text: str):
             ok = getattr(crud, "mark_no_show_today", lambda *_: False)(cid)
             return send_whatsapp_text(wa, "✅ No-show recorded." if ok else "⚠️ No booking found today.")
 
-    # ── UPDATE: edit selections
-    if up in ("ADMIN_EDIT_NAME", "ADMIN_EDIT_DOB", "ADMIN_EDIT_PLAN", "ADMIN_EDIT_MEDICAL", "ADMIN_EDIT_CREDITS"):
+    # UPDATE: edit selections
+    if up in ("ADMIN_EDIT_NAME", "ADMIN_EDIT_DOB", "ADMIN_EDIT_MEDICAL"):
         if not state["cid"]:
             return _client_picker(wa, "Update: pick client")
         if up == "ADMIN_EDIT_NAME":
@@ -266,23 +249,16 @@ def handle_admin_action(sender: str, text: str):
         if up == "ADMIN_EDIT_DOB":
             state["await"] = "DOB"
             return _ask_free_text(wa, "Edit DOB", "Reply as DD MON (e.g., 21 MAY).")
-        if up == "ADMIN_EDIT_PLAN":
-            state["await"] = "PLAN"
-            return _ask_free_text(wa, "Edit Plan", "Reply with: 1x, 2x, or 3x.")
         if up == "ADMIN_EDIT_MEDICAL":
             state["await"] = "MEDICAL"
             return _ask_free_text(wa, "Edit Medical Notes", "Reply with the medical note (replaces existing).")
-        if up == "ADMIN_EDIT_CREDITS":
-            state["await"] = "CREDITS"
-            return _ask_free_text(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
-        # fallthrough returns to update menu
         return _update_menu(wa, state["cid"])
 
     if up == "ADMIN_DONE":
         state.update({"flow": None, "await": None, "cid": None, "buffer": {}, "book": {}})
         return _root_menu(wa)
 
-    # ── BOOK: type/mode/slot selection
+    # BOOK: type/mode/slot
     if up.startswith("ADMIN_BOOK_TYPE_"):
         t = up.replace("ADMIN_BOOK_TYPE_", "").lower()
         state["book"]["type"] = t
@@ -313,17 +289,16 @@ def handle_admin_action(sender: str, text: str):
         prof = crud.get_client_profile(state["cid"])
         seats = SEATS_BY_TYPE.get(state["book"].get("type","single"), 1)
 
-        # Reserve selected slot
         ok1 = booking.admin_reserve(prof["wa_number"], state["book"]["slot_id"], seats=seats)
 
-        # If ongoing, try to pre-book the next 3 weeks (configurable)
+        # Ongoing: attempt next 3 weeks
         if ok1 and state["book"].get("mode") == "ongoing":
             base = _get_session_row(state["book"]["slot_id"])
             if base:
                 base_date = base["session_date"] if isinstance(base["session_date"], date) else date.fromisoformat(str(base["session_date"]))
                 start_time = base["start_time"]
                 booked_more = 0
-                for i in range(1, 4):  # next 3 weeks
+                for i in range(1, 4):
                     d = base_date + timedelta(days=7*i)
                     nxt = _find_session_by_date_time_safe(d, start_time)
                     if not nxt:
@@ -336,30 +311,27 @@ def handle_admin_action(sender: str, text: str):
         else:
             send_whatsapp_text(wa, "✅ Booked." if ok1 else "⚠️ Could not book (full?).")
 
-        # reset booking state but keep client selected for quick follow-ups
         state["book"] = {}
         return _update_menu(wa, state["cid"])
 
-    # ── NEW: wizard (interactive entry point)
+    # NEW: wizard (Name → Phone → DOB → Medical)
     if up == "ADMIN_NEW_NEXT":
-        # step through in fixed order: NAME -> PHONE -> PLAN -> DOB -> MEDICAL -> CONFIRM
         return _new_next(wa, state)
 
-    # ── Text fallback: treat as free text for whichever field we await
+    # Free-text capture
     if state["await"]:
         return _capture_free_text(wa, state, raw)
 
-    # ── If a single-word admin intent is typed, start those flows
+    # Single-word typed intents
     low = raw.lower()
     if low in ("new", "update", "cancel", "view", "book"):
-        # Map to the corresponding interactive IDs to reuse logic
         return handle_admin_action(wa, f"ADMIN_INTENT_{low.upper()}")
 
-    # Optional: inline search when inside a flow without awaiting a field
-    if state["flow"] in {"UPDATE", "CANCEL", "VIEW", "BOOK"} and raw and raw.lower() not in {x.lower() for x in INTENTS}:
+    # Inline search within flows
+    if state["flow"] in {"UPDATE", "CANCEL", "VIEW", "BOOK"} and raw and low not in {x.lower() for x in INTENTS}:
         return _client_picker(wa, f"{state['flow'].title()}: search", raw)
 
-    # Try NLP fallbacks if not in the middle of a wizard and no intent matched
+    # NLP fallbacks (no quotes required)
     if not state.get("await"):
         nlp = parse_admin_client_command(raw) or parse_admin_command(raw)
         if nlp:
@@ -383,7 +355,6 @@ def handle_admin_action(sender: str, text: str):
                 ok = getattr(crud, "cancel_next_booking_for_client", lambda *_: False)(match[0]["id"])
                 return send_whatsapp_text(wa, "✅ Next session cancelled." if ok else "⚠️ No upcoming booking found.")
             if intent == "off_sick_today":
-                # Placeholder: wire a dedicated helper if you track excused absences
                 return send_whatsapp_text(wa, "✅ Noted off sick (stub).")
             if intent == "no_show_today":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
@@ -391,7 +362,6 @@ def handle_admin_action(sender: str, text: str):
                 ok = getattr(crud, "mark_no_show_today", lambda *_: False)(match[0]["id"])
                 return send_whatsapp_text(wa, "✅ No-show recorded." if ok else "⚠️ No booking found today.")
             if intent == "book_single":
-                # find session by date+time and reserve
                 sess = _find_session_by_date_time_safe(date.fromisoformat(nlp["date"]), nlp["time"])
                 if not sess: return send_whatsapp_text(wa, "⚠️ No matching session found.")
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
@@ -401,7 +371,6 @@ def handle_admin_action(sender: str, text: str):
                 ok = booking.admin_reserve(prof["wa_number"], sess["id"], seats=seats)
                 return send_whatsapp_text(wa, "✅ Booked." if ok else "⚠️ Could not book (full?).")
             if intent == "book_recurring":
-                # Recurring booking: next N weeks at weekday+time
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
                 prof = crud.get_client_profile(match[0]["id"])
@@ -418,11 +387,10 @@ def handle_admin_action(sender: str, text: str):
                         booked += 1
                 return send_whatsapp_text(wa, f"✅ Recurring booked {booked}/{weeks} weeks.")
 
-    # Otherwise, show the new root
     return _root_menu(wa)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NEW CLIENT WIZARD
+# NEW CLIENT WIZARD (Name → Phone → DOB → Medical)
 # ──────────────────────────────────────────────────────────────────────────────
 def _start_new(wa: str, state: dict):
     state.update({"await": "NAME", "buffer": {}, "cid": None})
@@ -435,9 +403,6 @@ def _new_next(wa: str, state: dict):
         state["await"] = "PHONE"
         return _ask_free_text(wa, "New Client", "Reply with the client's phone (0XXXXXXXXX, +27…, or 27…).", "ADMIN_INTENT_NEW")
     if step == "PHONE":
-        state["await"] = "PLAN"
-        return _ask_free_text(wa, "New Client", "Reply with plan: 1x, 2x, or 3x.", "ADMIN_INTENT_NEW")
-    if step == "PLAN":
         state["await"] = "DOB"
         return _ask_free_text(wa, "New Client", "Reply DOB as DD MON (e.g., 21 MAY).", "ADMIN_INTENT_NEW")
     if step == "DOB":
@@ -447,22 +412,17 @@ def _new_next(wa: str, state: dict):
         # Persist all fields now
         name = (buf.get("NAME") or "").strip()
         phone = normalize_wa(buf.get("PHONE") or "")
-        plan = (buf.get("PLAN") or "").lower()
         day, mon = buf.get("DOB_DAY"), buf.get("DOB_MON")
         medical = (buf.get("MEDICAL") or "").strip()
 
-        # Create or get client
         row = crud.create_client(name, phone) or crud.get_or_create_client(phone)
         cid = row["id"]
-        if plan in ("1x", "2x", "3x"):
-            _save_plan(cid, plan)
         if day and mon:
             try:
                 crud.update_client_dob(cid, int(day), int(mon))
             except Exception:
                 logging.exception("DOB update failed")
         if medical and medical != "-":
-            # replace existing (append=False for wizard-final overwrite)
             crud.update_client_medical(cid, medical, append=False)
 
         state.update({"flow": None, "await": None, "cid": None, "buffer": {}, "book": {}})
@@ -476,7 +436,7 @@ def _capture_free_text(wa: str, state: dict, raw: str):
     field = state.get("await")
     txt = (raw or "").strip()
 
-    # ── NEW flow capture
+    # NEW flow capture
     if state.get("flow") == "NEW":
         buf = state.setdefault("buffer", {})
         if field == "NAME":
@@ -491,14 +451,6 @@ def _capture_free_text(wa: str, state: dict, raw: str):
             if not norm.startswith("+27"):
                 return _ask_free_text(wa, "New Client", "Please send a valid SA phone (0…, 27…, or +27…).", "ADMIN_INTENT_NEW")
             buf["PHONE"] = norm
-            state["await"] = "PLAN"
-            return _ask_free_text(wa, "New Client", "Reply with plan: 1x, 2x, or 3x.", "ADMIN_INTENT_NEW")
-
-        if field == "PLAN":
-            low = txt.lower()
-            if low not in ("1x", "2x", "3x"):
-                return _ask_free_text(wa, "New Client", "Please reply with 1x, 2x, or 3x.", "ADMIN_INTENT_NEW")
-            buf["PLAN"] = low
             state["await"] = "DOB"
             return _ask_free_text(wa, "New Client", "Reply DOB as DD MON (e.g., 21 MAY).", "ADMIN_INTENT_NEW")
 
@@ -516,11 +468,10 @@ def _capture_free_text(wa: str, state: dict, raw: str):
 
         if field == "MEDICAL":
             buf["MEDICAL"] = txt[:500]
-            # Finalize
-            state["await"] = "MEDICAL"  # keep pointer for _new_next guard
+            state["await"] = "MEDICAL"
             return handle_admin_action(wa, "ADMIN_NEW_NEXT")
 
-    # ── UPDATE flow capture
+    # UPDATE flow capture
     if state.get("flow") == "UPDATE" and state.get("cid"):
         cid = state["cid"]
         if field == "NAME":
@@ -531,29 +482,10 @@ def _capture_free_text(wa: str, state: dict, raw: str):
             send_whatsapp_text(wa, "✅ Name updated.")
             return _update_menu(wa, cid)
 
-        if field == "PLAN":
-            low = txt.lower()
-            if low not in ("1x", "2x", "3x"):
-                return _ask_free_text(wa, "Edit Plan", "Please reply with 1x, 2x, or 3x.")
-            _save_plan(cid, low)
-            state["await"] = None
-            send_whatsapp_text(wa, "✅ Plan updated.")
-            return _update_menu(wa, cid)
-
         if field == "MEDICAL":
             crud.update_client_medical(cid, txt[:500], append=False)
             state["await"] = None
             send_whatsapp_text(wa, "✅ Medical notes updated.")
-            return _update_menu(wa, cid)
-
-        if field == "CREDITS":
-            m = re.fullmatch(r"\s*([+-]?\d+)\s*", txt)
-            if not m:
-                return _ask_free_text(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
-            delta = int(m.group(1))
-            _save_credits_delta(cid, delta)
-            state["await"] = None
-            send_whatsapp_text(wa, f"✅ Credits adjusted by {delta}.")
             return _update_menu(wa, cid)
 
         if field == "DOB":
@@ -569,7 +501,6 @@ def _capture_free_text(wa: str, state: dict, raw: str):
             send_whatsapp_text(wa, "✅ DOB updated.")
             return _update_menu(wa, cid)
 
-    # default: show root
     state["await"] = None
     return _root_menu(wa)
 
