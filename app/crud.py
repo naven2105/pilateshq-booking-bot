@@ -1,3 +1,5 @@
+#app/crud.py
+
 from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -122,4 +124,4 @@ def adjust_client_credits(client_id: int, delta: int) -> None:
             "UPDATE clients SET credits = GREATEST(0, COALESCE(credits,0) + :d) WHERE id = :cid"
         ), {"d": delta, "cid": client_id})
 
-# (rest of the session & booking functions stay the same)
+
