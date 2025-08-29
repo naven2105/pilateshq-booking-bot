@@ -37,7 +37,7 @@ def _is_admin(sender: str) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Intents & in-memory state (no strict templates)
 # ──────────────────────────────────────────────────────────────────────────────
-INTENTS = {"NEW", "UPDATE", "CANCEL", "VIEW", "BOOK"}
+INTENTS = {"NEW", "UPDATE", "CANCEL", "VIEW", "BOOK", "NOTIFY"}
 
 # ADMIN_STATE["+27..."] = {
 #   "flow": "NEW" | "UPDATE" | "CANCEL" | "VIEW" | "BOOK",
@@ -62,6 +62,7 @@ def _root_menu(to: str):
             {"id": "ADMIN_INTENT_CANCEL", "title": "❌ Cancel"},
             {"id": "ADMIN_INTENT_VIEW",   "title": "👁️ View"},
             {"id": "ADMIN_INTENT_BOOK",   "title": "📅 Book"},
+            {"id": "ADMIN_INTENT_NOTIFY", "title": "📢 Notify"},
         ],
     )
 
@@ -209,6 +210,40 @@ def handle_admin_action(sender: str, text: str):
     if up == "ADMIN_INTENT_CANCEL":  state.update({"flow": "CANCEL", "await": None}); return _client_picker(wa, "Cancel: pick client")
     if up == "ADMIN_INTENT_VIEW":    state.update({"flow": "VIEW",   "await": None}); return _client_picker(wa, "View: pick client")
     if up == "ADMIN_INTENT_BOOK":    state.update({"flow": "BOOK",   "await": None}); return _client_picker(wa, "Book: pick client")
+    # Start Notify flow
+    if up == "ADMIN_INTENT_NOTIFY":
+        state.update({"flow": "NOTIFY", "await": None})
+        return _notify_menu(wa)
+
+    # Notify menu actions
+    if up in ("ADMIN_NOTIFY_OFFSICK", "ADMIN_NOTIFY_CUSTOM"):
+        if up == "ADMIN_NOTIFY_OFFSICK":
+            today = date.today().isoformat()
+            body = (
+                f"Hi! Nadine here from PilatesHQ.\n"
+                f"Unfortunately I’m off sick today ({today}) 🤒\n"
+                f"All sessions today are cancelled. I’ll follow up to reschedule.\n"
+                f"Thanks for understanding!"
+            )
+            count = _broadcast_to_all(body)
+            return send_whatsapp_text(wa, f"✅ Sent off-sick notice to {count} clients.")
+        if up == "ADMIN_NOTIFY_CUSTOM":
+            state["await"] = "CUSTOM_BROADCAST"
+            return _ask_free_text(
+                wa,
+                "Custom Broadcast",
+                "Reply with the message to send to *all clients*.\n"
+                "Tip: Keep it short and clear."
+            )
+
+    # Capture custom broadcast message
+    if state.get("flow") == "NOTIFY" and state.get("await") == "CUSTOM_BROADCAST":
+        msg = (raw or "").strip()
+        if len(msg) < 5:
+            return _ask_free_text(wa, "Custom Broadcast", "Message is too short — try again.")
+        count = _broadcast_to_all(msg)
+        state.update({"await": None})
+        return send_whatsapp_text(wa, f"✅ Broadcast sent to {count} clients.")
 
     # Client selection
     if up.startswith("ADMIN_PICK_CLIENT_"):
@@ -516,3 +551,40 @@ def _month_to_int(mon: str) -> int | None:
         "nov": 11, "november": 11, "dec": 12, "december": 12
     }
     return table.get(mon)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Broadcast helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _notify_menu(to: str):
+    return send_whatsapp_list(
+        to, "Notify Clients", "Send a message to all clients:", "ADMIN_NOTIFY",
+        [
+            {"id": "ADMIN_NOTIFY_OFFSICK", "title": "🤒 Off Sick Today"},
+            {"id": "ADMIN_NOTIFY_CUSTOM",  "title": "✍️ Custom Broadcast"},
+            {"id": "ADMIN_DONE",           "title": "✅ Done"},
+        ],
+    )
+
+def _broadcast_to_all(body: str) -> int:
+    """
+    Sends `body` to every client that has a wa_number.
+    Returns how many messages were sent.
+    """
+    sent = 0
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT DISTINCT wa_number
+            FROM clients
+            WHERE wa_number IS NOT NULL AND trim(wa_number) <> ''
+        """)).all()
+    # De-dup & normalize just in case
+    seen = set()
+    for (wa,) in rows:
+        n = normalize_wa(wa)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        send_whatsapp_text(n, body)
+        sent += 1
+    logging.info(f"[BROADCAST] sent={sent}")
+    return sent
