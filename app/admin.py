@@ -12,19 +12,13 @@ from .utils import (
     normalize_wa,
 )
 from .crud import (
-    list_clients,
-    find_clients_by_name,
-    get_client_profile,
-    list_days_with_open_slots,
-    list_slots_for_day,
+    list_clients, find_clients_by_name, get_client_profile,
+    list_days_with_open_slots, list_slots_for_day,
     find_session_by_date_time,
-    create_client,
-    update_client_dob,
-    update_client_medical,
-    create_booking,
-    cancel_next_booking_for_client,
-    mark_no_show_today,
+    create_client, update_client_dob, update_client_medical,
+    create_booking, cancel_next_booking_for_client, mark_no_show_today,
 )
+from .crud import adjust_client_credits  # if needed later
 
 # ---------------- Admin auth ----------------
 ADMIN_WA_LIST = [n.strip() for n in os.getenv("ADMIN_WA_LIST", "").split(",") if n.strip()]
@@ -38,7 +32,6 @@ def _is_admin(sender: str) -> bool:
     ok = wa in allow
     logging.debug(f"[ADMIN AUTH] sender={wa} allow={sorted(list(allow))} ok={ok}")
     return ok
-
 
 # ---------------- Strict template help ----------------
 TEMPLATE_HELP = (
@@ -60,17 +53,14 @@ def _show_template(recipient: str, error_msg: str | None = None):
     else:
         send_whatsapp_text(recipient, TEMPLATE_HELP)
 
-
-# ---------------- Utility: token encode/decode for confirms ----------------
+# ---------------- token for confirms ----------------
 def _build_token(action: str, **kwargs) -> str:
-    # ADMIN_CONFIRM__ACTION|k1=v1|k2=v2…  (values URL-quoted)
     parts = [action.upper()]
     for k, v in kwargs.items():
         parts.append(f"{k}={quote(str(v))}")
     return "ADMIN_CONFIRM__" + "|".join(parts)
 
 def _parse_token(payload: str) -> tuple[str, dict]:
-    # payload like "ADMIN_CONFIRM__ACTION|k=v|k2=v2"
     if payload.startswith("ADMIN_CONFIRM__"):
         payload = payload[len("ADMIN_CONFIRM__"):]
     pieces = payload.split("|")
@@ -81,7 +71,6 @@ def _parse_token(payload: str) -> tuple[str, dict]:
             k, v = p.split("=", 1)
             args[k] = unquote(v)
     return action, args
-
 
 # ---------------- Helpers ----------------
 def _menu(recipient: str):
@@ -95,17 +84,13 @@ def _menu(recipient: str):
     )
 
 def _resolve_single_client(sender: str, name: str, next_prefix: str | None = None):
-    """Find one client by name. If ambiguous, show a picker. Return dict row or None (when picker sent)."""
     matches = find_clients_by_name(name, limit=6)
     if not matches:
         send_whatsapp_text(sender, f"⚠️ No client matching “{name}”.")
         return None
     if len(matches) == 1 or not next_prefix:
         return matches[0]
-    rows = [
-        {"id": f"{next_prefix}{m['id']}", "title": m["name"][:24], "description": m["wa_number"]}
-        for m in matches
-    ]
+    rows = [{"id": f"{next_prefix}{m['id']}", "title": m["name"][:24], "description": m["wa_number"]} for m in matches]
     send_whatsapp_list(sender, "Who do you mean?", "Pick a client:", "ADMIN_MENU", rows)
     return None
 
@@ -119,8 +104,7 @@ def _month_to_int(mon: str) -> int | None:
     }
     return table.get(mon)
 
-
-# ---------------- Entry point ----------------
+# ---------------- Entry ----------------
 def handle_admin_action(sender: str, text: str):
     if not _is_admin(sender):
         return send_whatsapp_text(sender, "⛔ Only Nadine (admin) can perform admin functions.")
@@ -129,24 +113,24 @@ def handle_admin_action(sender: str, text: str):
     up = raw.upper()
     logging.info(f"[ADMIN CMD] '{raw}'")
 
-    # Basic menu/help shortcuts
+    # Menu/help shortcuts
     if up in ("ADMIN", "ADMIN_MENU"):
         return _menu(sender)
     if up in ("HELP", "ADMIN_HELP", "?"):
         return _show_template(sender, None)
     if up in ("SHOW CLIENTS", "LIST CLIENTS", "ADMIN_LIST_CLIENTS"):
         clients = list_clients(limit=20)
-        rows = [{"id": f"ADMIN_VIEW_{c['id']}", "title": c["name"][:24], "description": c["wa_number"]} for c in clients]
+        rows = [{"id": f"ADMIN_VIEW_{c['id']}", "title": c["name"][:24], "description": f"{c['wa_number']} • {c.get('credits',0)} cr"} for c in clients]
         return send_whatsapp_list(sender, "Clients", "Latest clients:", "ADMIN_MENU",
                                   rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
     if up in ("SHOW SLOTS", "LIST SLOTS", "ADMIN_LIST_SLOTS"):
+        from .crud import list_days_with_open_slots
         days = list_days_with_open_slots(days=21, limit_days=10)
-        rows = [{"id": f"ADMIN_DAY_{d['session_date']}", "title": str(d['session_date']), "description": f"{d['slots']} open"}
-                for d in days]
+        rows = [{"id": f"ADMIN_DAY_{d['session_date']}", "title": str(d['session_date']), "description": f"{d['slots']} open"} for d in days]
         return send_whatsapp_list(sender, "Open Slots", "Choose a day:", "ADMIN_MENU",
                                   rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
 
-    # -------- Strict templates (regex) --------
+    # -------- Strict templates --------
     # 1) ADD CLIENT "Full Name" PHONE 0XXXXXXXXX
     m = re.fullmatch(r'\s*ADD\s+CLIENT\s+"(.+?)"\s+PHONE\s+([+\d][\d\s-]+)\s*', raw, flags=re.IGNORECASE)
     if m:
@@ -168,7 +152,7 @@ def handle_admin_action(sender: str, text: str):
             return _show_template(sender, "Invalid month (use JAN, FEB, …).")
         client = _resolve_single_client(sender, name)
         if not client:
-            return  # picker sent
+            return
         summary = f"Set DOB:\n• Client: {client['name']}\n• DOB: {day_s} {mon_s.upper()}"
         token = _build_token("SET_DOB", cid=client["id"], day=day_s, mon=mon_i)
         return send_whatsapp_buttons(sender, summary, [
@@ -246,11 +230,12 @@ def handle_admin_action(sender: str, text: str):
         text = (f"👤 {prof['name']}\n"
                 f"📱 {prof['wa_number']}\n"
                 f"📅 Plan: {prof.get('plan','')}\n"
+                f"🎟️ Credits: {prof.get('credits',0)}\n"
                 f"🎂 DOB: {bday or '—'}\n"
                 f"📝 Notes: {prof.get('medical_notes') or '—'}")
         return send_whatsapp_text(sender, text)
 
-    # -------- Interactive follow-ons (from pickers/buttons) --------
+    # -------- Interactive follow-ons --------
     if raw.startswith("ADMIN_DAY_"):
         d = raw.replace("ADMIN_DAY_", "")
         try:
@@ -262,7 +247,8 @@ def handle_admin_action(sender: str, text: str):
             return _menu(sender)
 
     if raw.startswith("ADMIN_VIEW_"):
-        cid = int(raw.replace("ADMIN_VIEW_", "")) if raw.replace("ADMIN_VIEW_", "").isdigit() else None
+        cid_s = raw.replace("ADMIN_VIEW_", "")
+        cid = int(cid_s) if cid_s.isdigit() else None
         prof = get_client_profile(cid) if cid else None
         if not prof:
             return send_whatsapp_text(sender, "Client not found.")
@@ -270,37 +256,56 @@ def handle_admin_action(sender: str, text: str):
         text = (f"👤 {prof['name']}\n"
                 f"📱 {prof['wa_number']}\n"
                 f"📅 Plan: {prof.get('plan','')}\n"
+                f"🎟️ Credits: {prof.get('credits',0)}\n"
                 f"🎂 DOB: {bday or '—'}\n"
                 f"📝 Notes: {prof.get('medical_notes') or '—'}")
         return send_whatsapp_text(sender, text)
 
-    # Button confirmations
+    # -------- Button confirmations --------
     if raw.startswith("ADMIN_CONFIRM__"):
         action, args = _parse_token(raw)
         logging.info(f"[ADMIN CONFIRM] action={action} args={args}")
         try:
             if action == "ADD_CLIENT":
                 res = create_client(args["name"], args["phone"])
-                return send_whatsapp_text(sender, f"✅ Added {res['name']} ({res['wa_number']}).") if res \
-                    else send_whatsapp_text(sender, "⚠️ Could not add client.")
+                if not res:
+                    return send_whatsapp_text(sender, "⚠️ Could not add client.")
+                prof = get_client_profile(res["id"])
+                bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
+                text = (
+                    "✅ *Client added*\n"
+                    f"👤 {prof['name']}\n"
+                    f"📱 {prof['wa_number']}\n"
+                    f"📅 Plan: {prof.get('plan','')}\n"
+                    f"🎟️ Credits: {prof.get('credits',0)}\n"
+                    f"🎂 DOB: {bday or '—'}\n"
+                    f"📝 Notes: {prof.get('medical_notes') or '—'}"
+                )
+                return send_whatsapp_text(sender, text)
+
             if action == "SET_DOB":
                 ok = update_client_dob(int(args["cid"]), int(args["day"]), int(args["mon"]))
                 return send_whatsapp_text(sender, "✅ DOB updated." if ok else "⚠️ Update failed.")
+
             if action == "ADD_NOTE":
                 ok = update_client_medical(int(args["cid"]), args["note"], append=True)
                 return send_whatsapp_text(sender, "✅ Note added." if ok else "⚠️ Update failed.")
+
             if action == "CANCEL_NEXT":
                 ok = cancel_next_booking_for_client(int(args["cid"]))
-                return send_whatsapp_text(sender, "✅ Next session cancelled." if ok else "⚠️ No upcoming booking found.")
+                return send_whatsapp_text(sender, "✅ Next session cancelled. (Credit +1)") if ok else send_whatsapp_text(sender, "⚠️ No upcoming booking found.")
+
             if action == "NOSHOW_TODAY":
                 ok = mark_no_show_today(int(args["cid"]))
-                return send_whatsapp_text(sender, "✅ No-show recorded." if ok else "⚠️ No booking found today.")
+                return send_whatsapp_text(sender, "✅ No-show recorded.") if ok else send_whatsapp_text(sender, "⚠️ No booking found today.")
+
             if action == "BOOK_DT":
                 sess = find_session_by_date_time(date.fromisoformat(args["d"]), args["t"])
                 if not sess:
                     return send_whatsapp_text(sender, "⚠️ No matching session found.")
                 ok = create_booking(sess["id"], int(args["cid"]), seats=1, status="confirmed")
-                return send_whatsapp_text(sender, "✅ Booked." if ok else "⚠️ Could not book (full?).")
+                return send_whatsapp_text(sender, "✅ Booked.") if ok else send_whatsapp_text(sender, "⚠️ Could not book (full?).")
+
         except Exception as e:
             logging.exception(e)
             return send_whatsapp_text(sender, "⚠️ Error performing action.")
@@ -308,5 +313,5 @@ def handle_admin_action(sender: str, text: str):
     if raw == "ADMIN_ABORT":
         return send_whatsapp_text(sender, "Cancelled.")
 
-    # If we reached here, input is non-conforming: show template
+    # Non-conforming input → show template
     return _show_template(sender, "Command not recognized. Please use the exact templates above.")

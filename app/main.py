@@ -5,40 +5,31 @@ from flask import Flask
 
 from .db import init_db
 from .router import register_routes
+from .tasks import register_tasks
 
-# -----------------------------
-# Create Flask app
-# -----------------------------
 app = Flask(__name__)
 
-# -----------------------------
-# Logging setup
-# -----------------------------
+# Logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
+logging.basicConfig(level=getattr(logging, log_level))
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# One-time DB init (first request)
-# -----------------------------
+# One-time DB init
 @app.before_request
 def _init_once():
     if not getattr(app, "_db_init_done", False):
         try:
             init_db()
             app._db_init_done = True
-            logger.info("✅ Database initialized / verified")
+            logger.info("✅ Database initialized")
         except Exception as e:
             logger.exception("❌ Database init failed: %s", str(e))
 
-# -----------------------------
-# Register all routes
-# -----------------------------
+# Routes
 register_routes(app)
+register_tasks(app)
 
-# -----------------------------
-# Health check (single endpoint)
-# -----------------------------
-@app.get("/")
-def ok():
-    return "OK", 200
+# Health
+@app.route("/", methods=["GET"])
+def health():
+    return "✅ PilatesHQ Bot is running", 200
