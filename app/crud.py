@@ -4,9 +4,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 from sqlalchemy import text
 
-# NOTE: we lazy-import get_session inside functions to avoid circular imports.
+# ───────────────── Clients ─────────────────
 
-# ---------- Clients ----------
 def list_clients(limit: int = 20) -> List[Dict[str, Any]]:
     from .db import get_session
     with get_session() as s:
@@ -122,26 +121,151 @@ def adjust_client_credits(client_id: int, delta: int) -> None:
             "UPDATE clients SET credits = GREATEST(0, COALESCE(credits,0) + :d) WHERE id = :cid"
         ), {"d": delta, "cid": client_id})
 
-# ---------- NEW: utilities for admin broadcast/off-sick ----------
 def list_all_client_numbers() -> List[str]:
-    """
-    Return all normalized WhatsApp numbers from clients table.
-    You can add WHERE clauses to exclude empty/nulls.
-    """
     from .db import get_session
     with get_session() as s:
         rows = s.execute(text("""
             SELECT wa_number
             FROM clients
-            WHERE COALESCE(NULLIF(wa_number, ''), '') <> ''
+            WHERE COALESCE(NULLIF(wa_number,''),'') <> ''
         """)).all()
         return [r[0] for r in rows]
 
+# ───────────────── Sessions / Bookings ─────────────────
+
+def _ts_expr() -> str:
+    # Postgres: combine to a comparable timestamp
+    return "(session_date::timestamp + start_time)"
+
+def sessions_next_hour() -> List[Dict[str, Any]]:
+    """Sessions starting in the next clock hour. Excludes cancelled."""
+    from .db import get_session
+    with get_session() as s:
+        rows = s.execute(text(f"""
+            WITH bounds AS (
+              SELECT date_trunc('hour', now()) + interval '1 hour' AS start_ts,
+                     date_trunc('hour', now()) + interval '2 hour' AS end_ts
+            )
+            SELECT id, session_date, start_time, capacity, booked_count, status, notes
+              FROM sessions, bounds
+             WHERE {_ts_expr()} >= bounds.start_ts
+               AND {_ts_expr()} <  bounds.end_ts
+               AND status <> 'cancelled'
+             ORDER BY session_date, start_time
+        """)).mappings().all()
+        return [dict(r) for r in rows]
+
+def sessions_tomorrow() -> List[Dict[str, Any]]:
+    """All sessions tomorrow, excluding cancelled."""
+    from .db import get_session
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT id, session_date, start_time, capacity, booked_count, status, notes
+              FROM sessions
+             WHERE session_date = CURRENT_DATE + INTERVAL '1 day'
+               AND status <> 'cancelled'
+             ORDER BY start_time
+        """)).mappings().all()
+        return [dict(r) for r in rows]
+
+def sessions_for_day(d: date, include_cancelled: bool = False) -> List[Dict[str, Any]]:
+    """All sessions for a date; optionally include cancelled."""
+    from .db import get_session
+    with get_session() as s:
+        if include_cancelled:
+            q = """
+                SELECT id, session_date, start_time, capacity, booked_count, status, notes
+                  FROM sessions
+                 WHERE session_date = :d
+                 ORDER BY start_time
+            """
+        else:
+            q = """
+                SELECT id, session_date, start_time, capacity, booked_count, status, notes
+                  FROM sessions
+                 WHERE session_date = :d
+                   AND status <> 'cancelled'
+                 ORDER BY start_time
+            """
+        rows = s.execute(text(q), {"d": d}).mappings().all()
+        return [dict(r) for r in rows]
+
+def clients_for_session(session_id: int) -> List[Dict[str, Any]]:
+    """Clients with active/confirmed bookings for a session (used for reminders)."""
+    from .db import get_session
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT c.id, c.name, c.wa_number
+              FROM bookings b
+              JOIN clients  c ON c.id = b.client_id
+             WHERE b.session_id = :sid
+               AND COALESCE(NULLIF(c.wa_number,''),'') <> ''
+               AND (b.status IS NULL OR b.status IN ('confirmed','booked'))
+        """), {"sid": session_id}).mappings().all()
+        return [dict(r) for r in rows]
+
+def find_session_by_date_time(d: date, hhmm: str) -> Optional[Dict[str, Any]]:
+    """Lookup by date + HH:MM (excludes cancelled)."""
+    from .db import get_session
+    with get_session() as s:
+        r = s.execute(text("""
+            SELECT id, session_date, start_time, capacity, booked_count, status, notes
+              FROM sessions
+             WHERE session_date = :d
+               AND start_time = :t::time
+               AND status <> 'cancelled'
+             LIMIT 1
+        """), {"d": d, "t": hhmm}).mappings().first()
+        return dict(r) if r else None
+
+def cancel_next_booking_for_client(client_id: int) -> bool:
+    """Cancel client’s next upcoming booking."""
+    from .db import get_session
+    with get_session() as s:
+        r = s.execute(text(f"""
+            WITH nextb AS (
+              SELECT b.id
+                FROM bookings b
+                JOIN sessions s ON s.id = b.session_id
+               WHERE b.client_id = :cid
+                 AND (b.status IS NULL OR b.status IN ('booked','confirmed'))
+                 AND {_ts_expr()} > now()
+               ORDER BY s.session_date, s.start_time
+               LIMIT 1
+            )
+            UPDATE bookings b
+               SET status = 'cancelled'
+              FROM nextb
+             WHERE b.id = nextb.id
+            RETURNING b.id
+        """), {"cid": client_id}).first()
+        return bool(r)
+
+def mark_no_show_today(client_id: int) -> bool:
+    """Mark today’s booking as no-show."""
+    from .db import get_session
+    with get_session() as s:
+        r = s.execute(text("""
+            WITH todayb AS (
+              SELECT b.id
+                FROM bookings b
+                JOIN sessions s ON s.id = b.session_id
+               WHERE b.client_id = :cid
+                 AND s.session_date = CURRENT_DATE
+                 AND (b.status IS NULL OR b.status IN ('booked','confirmed'))
+               ORDER BY s.start_time
+               LIMIT 1
+            )
+            UPDATE bookings b
+               SET status = 'no_show'
+              FROM todayb
+             WHERE b.id = todayb.id
+            RETURNING b.id
+        """), {"cid": client_id}).first()
+        return bool(r)
+
 def cancel_sessions_from(start_date: date) -> int:
-    """
-    Mark all sessions from start_date forward as cancelled.
-    Returns the number of sessions affected.
-    """
+    """Cancel all sessions from a date forward. Returns count."""
     from .db import get_session
     with get_session() as s:
         res = s.execute(text("""
