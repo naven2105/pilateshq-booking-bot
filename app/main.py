@@ -1,8 +1,6 @@
-# app/main.py
 import logging
 import os
 from flask import Flask
-
 from .db import init_db
 from .router import register_routes
 from .tasks import register_tasks
@@ -11,7 +9,7 @@ app = Flask(__name__)
 
 # Logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, log_level))
+logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
 logger = logging.getLogger(__name__)
 
 # One-time DB init
@@ -25,9 +23,9 @@ def _init_once():
         except Exception as e:
             logger.exception("❌ Database init failed: %s", str(e))
 
-# Routes
+# Mount routes
 register_routes(app)
-register_tasks(app)
+register_tasks(app)  # <— this line must exist
 
 # Health
 @app.route("/", methods=["GET"])
