@@ -1,68 +1,143 @@
 import logging
-from datetime import date, datetime
+from datetime import datetime, timedelta, date
+from sqlalchemy import text
+
+from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa
-from .crud import sessions_next_hour, sessions_for_day, clients_for_session
 from .config import NADINE_WA
 
-def _status_emoji(status: str) -> str:
-    st = (status or "").lower()
-    if st == "full":
-        return "🔒"
-    if st == "open":
-        return "✅"
-    return "•"
+
+def _list_upcoming_sessions_today():
+    """
+    Return today's sessions that are still upcoming (start_time >= now::time)
+    as a list of dicts: [{session_date, start_time, capacity, booked_count, status, notes}, ...]
+    """
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT session_date, start_time, capacity, booked_count, status, notes
+            FROM sessions
+            WHERE session_date = CURRENT_DATE
+              AND start_time >= (now() AT TIME ZONE 'UTC')::time
+            ORDER BY session_date, start_time
+        """)).mappings().all()
+        return [dict(r) for r in rows]
+
+
+def _list_sessions_next_hour():
+    """
+    Return sessions that start within the next hour (now .. now+1h) today.
+    Useful for the "next hour" admin ping.
+    """
+    with get_session() as s:
+        rows = s.execute(text("""
+            SELECT session_date, start_time, capacity, booked_count, status, notes
+            FROM sessions
+            WHERE session_date = CURRENT_DATE
+              AND start_time >= (now() AT TIME ZONE 'UTC')::time
+              AND start_time <  ((now() AT TIME ZONE 'UTC') + interval '1 hour')::time
+            ORDER BY start_time
+        """)).mappings().all()
+        return [dict(r) for r in rows]
+
+
+def _format_day_summary(rows):
+    """
+    Pretty print today's upcoming sessions for admin.
+    Example line: • 09:00 (1/6) ✅
+    """
+    if not rows:
+        return "🗓 Today’s sessions (upcoming: 0)\n— none —"
+
+    lines = []
+    for r in rows:
+        cap = r.get("capacity") or 0
+        booked = r.get("booked_count") or 0
+        status = (r.get("status") or "").strip().lower()
+        emoji = "🔒" if status == "full" or booked >= cap else "✅"
+        hhmm = str(r["start_time"])[:5]
+        lines.append(f"• {hhmm} ({booked}/{cap}) {emoji}")
+
+    return f"🗓 Today’s sessions (upcoming: {len(rows)})\n" + "\n".join(lines)
+
+
+def _format_next_hour(rows):
+    """
+    Pretty print the 'next hour' block for admin.
+    """
+    if not rows:
+        return "🕒 Next hour: no upcoming session."
+    lines = []
+    for r in rows:
+        cap = r.get("capacity") or 0
+        booked = r.get("booked_count") or 0
+        hhmm = str(r["start_time"])[:5]
+        lines.append(f"• {hhmm} ({booked}/{cap})")
+    return "🕒 Next hour:\n" + "\n".join(lines)
+
 
 def register_tasks(app):
-    @app.route("/tasks/run-reminders", methods=["POST", "GET"])
+    """
+    Mounts task endpoints on the Flask app.
+    - /tasks/admin-notify   : For ADMIN only (Nadine) – pushes today's upcoming + next-hour
+    - /tasks/run-reminders  : Client reminders (next-hour and tomorrow) + daily admin summary
+    Both accept GET and POST so you can test in the browser or curl.
+    """
+    if not NADINE_WA:
+        logging.warning("[TASKS] NADINE_WA not set; admin messages will be skipped.")
+
+    @app.route("/tasks/admin-notify", methods=["GET", "POST"])
+    def admin_notify():
+        """
+        Sends two messages to the admin:
+        1) Today's upcoming sessions summary (now onward)
+        2) Next-hour sessions block
+        Always returns 200 even if no sessions (so cron stays happy).
+        """
+        try:
+            admin_wa = normalize_wa(NADINE_WA) if NADINE_WA else None
+            if not admin_wa:
+                logging.info("[TASKS] admin-notify skipped; NADINE_WA not configured.")
+                return "ok admin-notify skipped (no admin)", 200
+
+            # Build messages
+            upcoming = _list_upcoming_sessions_today()
+            next_hour = _list_sessions_next_hour()
+
+            body_today = _format_day_summary(upcoming)
+            body_next  = _format_next_hour(next_hour)
+
+            # Push to admin
+            send_whatsapp_text(admin_wa, body_today)
+            send_whatsapp_text(admin_wa, body_next)
+            logging.info(f"[TASKS] admin-notify sent (today_upcoming={len(upcoming)}, next_hour={len(next_hour)})")
+            return "ok", 200
+        except Exception as e:
+            logging.exception("[TASKS] admin-notify failed: %s", e)
+            return "error", 500
+
+    @app.route("/tasks/run-reminders", methods=["GET", "POST"])
     def run_reminders():
         """
-        Manual/cron trigger:
-          1) Next-hour client reminders
-          2) Tomorrow schedule to clients (if you decide to add later)
-          3) Owner daily schedule (today), showing only *upcoming* sessions
-        This endpoint is READ-ONLY against sessions/bookings tables.
+        Minimal version kept for compatibility:
+        - Sends the admin today's upcoming summary + next-hour block (same as admin-notify)
+        - (Client reminders can be added here later when you enable client messaging)
         """
-        sent = 0
         try:
-            # 1) Next-hour client reminders (to booked clients)
-            for sess in sessions_next_hour():
-                for c in clients_for_session(sess["id"]):
-                    body = (
-                        f"⏰ Reminder: Pilates session at {sess['start_time']} today. "
-                        f"Reply CANCEL if you can't make it."
-                    )
-                    send_whatsapp_text(c["wa_number"], body)
-                    sent += 1
+            admin_wa = normalize_wa(NADINE_WA) if NADINE_WA else None
+            sent = 0
 
-            # 3) Owner summary (today). Only show upcoming sessions from now.
-            if NADINE_WA:
-                now = datetime.utcnow()
-                today_items = sessions_for_day(date.today())
+            if admin_wa:
+                upcoming = _list_upcoming_sessions_today()
+                next_hour = _list_sessions_next_hour()
+                send_whatsapp_text(admin_wa, _format_day_summary(upcoming)); sent += 1
+                send_whatsapp_text(admin_wa, _format_next_hour(next_hour));  sent += 1
+                logging.info(f"[TASKS] run-reminders admin messages sent={sent}")
+            else:
+                logging.info("[TASKS] run-reminders: admin not configured; skipped.")
 
-                # filter to upcoming
-                upcoming = []
-                for s in today_items:
-                    # combine today's date and start_time to compare with now
-                    hhmm = str(s["start_time"])
-                    # we don't need exact tz alignment here for testing; it's a simple visual filter
-                    if hhmm >= now.strftime("%H:%M:%S"):
-                        upcoming.append(s)
-
-                if upcoming:
-                    lines = [
-                        f"{_status_emoji(s['status'])} {s['start_time']} "
-                        f"({s['booked_count']}/{s['capacity']}, {s['status']})"
-                        for s in upcoming
-                    ]
-                    header = f"🗓 Today’s sessions (upcoming: {len(upcoming)})"
-                    send_whatsapp_text(normalize_wa(NADINE_WA), header + "\n• " + "\n• ".join(lines))
-                else:
-                    send_whatsapp_text(normalize_wa(NADINE_WA), "🗓 Today’s sessions (upcoming: 0)\n— none —")
-
-            logging.info(f"[TASKS] reminders sent={sent}")
             return f"ok sent={sent}", 200
-
         except Exception as e:
-            logging.exception(f"[TASKS] run-reminders failed: {e}")
-            # Return 500 so Render shows failure clearly
+            logging.exception("[TASKS] run-reminders failed: %s", e)
             return "error", 500
+
+    logging.info("[TASKS] endpoints ready: /tasks/admin-notify, /tasks/run-reminders")
