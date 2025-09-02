@@ -124,3 +124,14 @@ def register_tasks(app):
             logging.exception("[TASKS] admin-notify failed: %s", e)
         logging.info("[TASKS] admin-notify sent")
         return "ok", 200
+
+@app.route("/tasks/debug-ping-admin", methods=["GET","POST"])
+def debug_ping_admin():
+    from .utils import send_whatsapp_text
+    from .config import NADINE_WA
+    import logging
+    logging.info(f"[debug] NADINE_WA='{NADINE_WA}'")
+    if not NADINE_WA:
+        return "NADINE_WA not set", 500
+    send_whatsapp_text(NADINE_WA, "🔔 Debug: admin reachable?")
+    return "sent", 200
