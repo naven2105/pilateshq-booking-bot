@@ -2,6 +2,7 @@
 import logging
 from typing import List, Dict, Any
 from flask import request
+from sqlalchemy import text
 
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa
@@ -18,7 +19,7 @@ def _rows_to_dicts(rows) -> List[Dict[str, Any]]:
 def _sessions_today_upcoming() -> List[Dict[str, Any]]:
     """All sessions today at/after 'now' (SAST), ordered."""
     with get_session() as s:
-        rows = s.execute("""
+        rows = s.execute(text("""
             WITH now_local AS (
                 SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg') AS ts
             )
@@ -27,13 +28,13 @@ def _sessions_today_upcoming() -> List[Dict[str, Any]]:
             WHERE session_date = (now_local.ts)::date
               AND start_time >= (now_local.ts)::time
             ORDER BY session_date, start_time
-        """).mappings().all()
+        """)).mappings().all()
         return _rows_to_dicts(rows)
 
 def _sessions_today_full_day() -> List[Dict[str, Any]]:
     """All sessions today (SAST), regardless of time."""
     with get_session() as s:
-        rows = s.execute("""
+        rows = s.execute(text("""
             WITH now_local AS (
                 SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg') AS ts
             )
@@ -41,13 +42,13 @@ def _sessions_today_full_day() -> List[Dict[str, Any]]:
             FROM sessions, now_local
             WHERE session_date = (now_local.ts)::date
             ORDER BY session_date, start_time
-        """).mappings().all()
+        """)).mappings().all()
         return _rows_to_dicts(rows)
 
 def _sessions_next_hour() -> List[Dict[str, Any]]:
     """Sessions starting within the next hour from 'now' (SAST)."""
     with get_session() as s:
-        rows = s.execute("""
+        rows = s.execute(text("""
             WITH now_local AS (
                 SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg') AS ts
             ),
@@ -63,13 +64,13 @@ def _sessions_next_hour() -> List[Dict[str, Any]]:
               AND start_time >= bounds.t_now
               AND start_time <  bounds.t_next
             ORDER BY start_time
-        """).mappings().all()
+        """)).mappings().all()
         return _rows_to_dicts(rows)
 
 def _sessions_tomorrow() -> List[Dict[str, Any]]:
     """All sessions tomorrow (SAST)."""
     with get_session() as s:
-        rows = s.execute("""
+        rows = s.execute(text("""
             WITH now_local AS (
                 SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg')::date + 1 AS d
             )
@@ -77,20 +78,20 @@ def _sessions_tomorrow() -> List[Dict[str, Any]]:
             FROM sessions, now_local
             WHERE session_date = now_local.d
             ORDER BY start_time
-        """).mappings().all()
+        """)).mappings().all()
         return _rows_to_dicts(rows)
 
 def _clients_for_session(session_id: int) -> List[Dict[str, Any]]:
     """Confirmed clients for a session."""
     with get_session() as s:
-        rows = s.execute("""
+        rows = s.execute(text("""
             SELECT c.id, c.wa_number, COALESCE(NULLIF(c.name,''), '(no name)') AS name
             FROM bookings b
             JOIN clients c ON c.id = b.client_id
             WHERE b.session_id = :sid
               AND b.status = 'confirmed'
             ORDER BY c.name
-        """, {"sid": session_id}).mappings().all()
+        """), {"sid": session_id}).mappings().all()
         return _rows_to_dicts(rows)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -195,10 +196,8 @@ def register_tasks(app):
                 send_whatsapp_text(c["wa_number"], body)
                 sent += 1
 
-        # 3) Optional admin daily recap (we keep this small since /tasks/admin-notify is the hourly workhorse)
+        # 3) Optional admin daily recap
         if daily and NADINE_WA:
-            # At 20:00 we prefer a full-day recap; earlier calls can choose upcoming.
-            # If you want strictly full-day at 06:00 and upcoming after, add a clock check here.
             body_today = _fmt_today_block(upcoming_only=False)
             send_whatsapp_text(normalize_wa(NADINE_WA), body_today)
             send_whatsapp_text(normalize_wa(NADINE_WA), _fmt_next_hour_block())
