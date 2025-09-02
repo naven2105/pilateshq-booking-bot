@@ -1,6 +1,7 @@
 # app/tasks.py
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any
 from flask import request
 from sqlalchemy import text
 
@@ -9,198 +10,201 @@ from .utils import send_whatsapp_text, normalize_wa
 from .config import NADINE_WA
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SQL helpers (local, to avoid missing-import errors)
-# All time logic uses Africa/Johannesburg local time to match studio hours.
+# SQL helpers (Africa/Johannesburg local-time aware using Postgres)
+# sessions table: id, session_date::date, start_time::time, capacity, booked_count, status
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _rows_to_dicts(rows) -> List[Dict[str, Any]]:
-    return [dict(r) for r in rows]
+def _sessions_today_full_day():
+    """
+    All of today's sessions (local SAST), ordered by time.
+    """
+    with get_session() as s:
+        rows = s.execute(text("""
+            WITH tz AS (
+              SELECT (now() AT TIME ZONE 'Africa/Johannesburg')::date AS today
+            )
+            SELECT id, session_date, start_time, capacity, booked_count, status
+            FROM sessions, tz
+            WHERE session_date = tz.today
+            ORDER BY start_time
+        """)).mappings().all()
+        return [dict(r) for r in rows]
 
-def _sessions_today_upcoming() -> List[Dict[str, Any]]:
-    """All sessions today at/after 'now' (SAST), ordered."""
+def _sessions_today_upcoming():
+    """
+    Today's sessions from 'now' onwards (local SAST), ordered by time.
+    """
     with get_session() as s:
         rows = s.execute(text("""
             WITH now_local AS (
-                SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg') AS ts
+              SELECT (now() AT TIME ZONE 'Africa/Johannesburg') AS ts
             )
-            SELECT id, session_date, start_time, capacity, booked_count, status, notes
+            SELECT id, session_date, start_time, capacity, booked_count, status
             FROM sessions, now_local
             WHERE session_date = (now_local.ts)::date
               AND start_time >= (now_local.ts)::time
-            ORDER BY session_date, start_time
+            ORDER BY start_time
         """)).mappings().all()
-        return _rows_to_dicts(rows)
+        return [dict(r) for r in rows]
 
-def _sessions_today_full_day() -> List[Dict[str, Any]]:
-    """All sessions today (SAST), regardless of time."""
+def _sessions_next_hour():
+    """
+    Sessions starting within the next hour (local SAST).
+    """
     with get_session() as s:
         rows = s.execute(text("""
             WITH now_local AS (
-                SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg') AS ts
+              SELECT (now() AT TIME ZONE 'Africa/Johannesburg') AS ts
             )
-            SELECT id, session_date, start_time, capacity, booked_count, status, notes
+            SELECT id, session_date, start_time, capacity, booked_count, status
             FROM sessions, now_local
             WHERE session_date = (now_local.ts)::date
-            ORDER BY session_date, start_time
-        """)).mappings().all()
-        return _rows_to_dicts(rows)
-
-def _sessions_next_hour() -> List[Dict[str, Any]]:
-    """Sessions starting within the next hour from 'now' (SAST)."""
-    with get_session() as s:
-        rows = s.execute(text("""
-            WITH now_local AS (
-                SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg') AS ts
-            ),
-            bounds AS (
-                SELECT (ts)::date AS d,
-                       (DATE_TRUNC('minute', ts))::time AS t_now,
-                       (DATE_TRUNC('minute', ts) + INTERVAL '1 hour')::time AS t_next
-                FROM now_local
-            )
-            SELECT id, session_date, start_time, capacity, booked_count, status, notes
-            FROM sessions, bounds
-            WHERE session_date = bounds.d
-              AND start_time >= bounds.t_now
-              AND start_time <  bounds.t_next
+              AND start_time >= (now_local.ts)::time
+              AND start_time < ((now_local.ts + interval '1 hour')::time)
             ORDER BY start_time
         """)).mappings().all()
-        return _rows_to_dicts(rows)
+        return [dict(r) for r in rows]
 
-def _sessions_tomorrow() -> List[Dict[str, Any]]:
-    """All sessions tomorrow (SAST)."""
+def _sessions_tomorrow_full_day():
+    """
+    All of tomorrow's sessions (local SAST), ordered by time.
+    Useful for 20:00 'tomorrow preview'.
+    """
     with get_session() as s:
         rows = s.execute(text("""
-            WITH now_local AS (
-                SELECT (NOW() AT TIME ZONE 'Africa/Johannesburg')::date + 1 AS d
+            WITH tz AS (
+              SELECT ((now() AT TIME ZONE 'Africa/Johannesburg')::date + INTERVAL '1 day')::date AS d
             )
-            SELECT id, session_date, start_time, capacity, booked_count, status, notes
-            FROM sessions, now_local
-            WHERE session_date = now_local.d
+            SELECT id, session_date, start_time, capacity, booked_count, status
+            FROM sessions, tz
+            WHERE session_date = tz.d
             ORDER BY start_time
         """)).mappings().all()
-        return _rows_to_dicts(rows)
-
-def _clients_for_session(session_id: int) -> List[Dict[str, Any]]:
-    """Confirmed clients for a session."""
-    with get_session() as s:
-        rows = s.execute(text("""
-            SELECT c.id, c.wa_number, COALESCE(NULLIF(c.name,''), '(no name)') AS name
-            FROM bookings b
-            JOIN clients c ON c.id = b.client_id
-            WHERE b.session_id = :sid
-              AND b.status = 'confirmed'
-            ORDER BY c.name
-        """), {"sid": session_id}).mappings().all()
-        return _rows_to_dicts(rows)
+        return [dict(r) for r in rows]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Formatting helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _fmt_line(sess: Dict[str, Any]) -> str:
-    """One session line with emoji status and capacity info."""
-    cap = sess.get("capacity") or 0
-    bk  = sess.get("booked_count") or 0
-    status = (sess.get("status") or "").lower()
-    emoji = "🔒" if status == "full" or bk >= cap else "✅"
-    return f"• {sess['start_time']} ({bk}/{cap}, {status}) {emoji}"
+def _fmt_status_emoji(status: str) -> str:
+    st = (status or "").lower()
+    if st == "full":
+        return "🔒"
+    if st == "open":
+        return "✅"
+    return "•"
+
+def _fmt_line(r: dict) -> str:
+    hhmm = str(r["start_time"])  # e.g., '09:00:00'
+    # show HH:MM only
+    hhmm = hhmm[:5]
+    cap = int(r.get("capacity") or 0)
+    bkd = int(r.get("booked_count") or 0)
+    st  = str(r.get("status") or "")
+    return f"• {hhmm} ({bkd}/{cap}, {st} {_fmt_status_emoji(st)})"
+
+def _fmt_block(title: str, items: list[dict]) -> str:
+    if not items:
+        return f"{title}\n—\u00A0none\u00A0—"  # keep styling with NBSPs
+    lines = [title] + [_fmt_line(r) for r in items]
+    return "\n".join(lines)
 
 def _fmt_today_block(upcoming_only: bool) -> str:
+    """
+    Title shows count of upcoming sessions so Nadine sees at a glance.
+    """
     items = _sessions_today_upcoming() if upcoming_only else _sessions_today_full_day()
-    if not items:
-        header = "🗓 Today’s sessions (upcoming: 0)"
-        return header + "\n— none —"
-    upcoming_count = len(items) if upcoming_only else len([i for i in items if i["status"] in ("open","full","cancelled","closed")])
-    header = f"🗓 Today’s sessions (upcoming: {upcoming_count})"
-    lines = [header] + [_fmt_line(s) for s in items]
-    return "\n".join(lines)
+    header = f"🗓 Today’s sessions (upcoming: {len(items)})" if upcoming_only else "🗓 Today’s sessions"
+    return _fmt_block(header, items)
 
 def _fmt_next_hour_block() -> str:
     items = _sessions_next_hour()
-    if not items:
-        return "🕒 Next hour: no upcoming session."
-    lines = ["🕒 Next hour:"] + [_fmt_line(s) for s in items]
-    return "\n".join(lines)
+    header = "🕒 Next hour:"
+    return _fmt_block(header, items)
+
+def _fmt_tomorrow_block() -> str:
+    items = _sessions_tomorrow_full_day()
+    header = "🔮 Tomorrow’s sessions:"
+    return _fmt_block(header, items)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Task routes
-# Register these on the Flask app in app.main
+# Flask route registration
 # ──────────────────────────────────────────────────────────────────────────────
 
 def register_tasks(app):
-    @app.route("/tasks/debug-ping-admin", methods=["GET", "POST"])
-    def debug_ping_admin():
-        """
-        Minimal reachability test:
-        - Logs the current NADINE_WA value
-        - Sends a single text to admin
-        """
-        logging.info(f"[debug] NADINE_WA='{NADINE_WA}' (normalized='{normalize_wa(NADINE_WA)}')")
-        if not NADINE_WA:
-            return "NADINE_WA not set", 500
-        send_whatsapp_text(NADINE_WA, "🔔 Debug: admin reachable?")
-        return "sent", 200
-
-    @app.route("/tasks/admin-notify", methods=["POST", "GET"])
+    """
+    Exposes:
+      POST /tasks/admin-notify         → sends “today (upcoming only)” + “next hour”
+      POST /tasks/run-reminders?daily=0|1
+           daily=0 → sends “next hour” (hourly cron)
+           daily=1 → sends “today full-day + tomorrow preview” (20:00 cron)
+      POST /tasks/debug-ping-admin     → quick delivery check
+    """
+    @app.post("/tasks/admin-notify")
     def admin_notify():
-        """
-        Admin-focused ping:
-        - Always sends *two* blocks:
-            1) Today’s upcoming sessions (from now; SAST)
-            2) Next-hour window summary
-        - Sends even if empty (shows '— none —' and 'no upcoming session')
-        """
-        src = request.args.get("src", "manual")
-        logging.info(f"[admin-notify] src={src}")
+        try:
+            src = request.args.get("src", "manual")
+            logging.info(f"[admin-notify] src={src}")
 
-        if not NADINE_WA:
-            logging.warning("[admin-notify] NADINE_WA not set; skipping send.")
+            to = normalize_wa(NADINE_WA)
+            if not to:
+                logging.error("[admin-notify] NADINE_WA is empty")
+                return "err", 500
+
+            body_today = _fmt_today_block(upcoming_only=True)
+            body_hour = _fmt_next_hour_block()
+            msg = f"{body_today}\n\n{body_hour}"
+
+            code, resp = send_whatsapp_text(to, msg)
+            if code == 400 and "470" in resp:
+                logging.warning("[admin-notify] Outside 24h window; ask Nadine to send 'Admin' to reopen the session.")
+            logging.info("[TASKS] admin-notify sent")
             return "ok", 200
+        except Exception as e:
+            logging.exception(e)
+            return "err", 500
 
-        # 1) Today’s (upcoming from now)
-        body_today = _fmt_today_block(upcoming_only=True)
-        send_whatsapp_text(NADINE_WA, body_today)
-
-        # 2) Next-hour window
-        body_hour = _fmt_next_hour_block()
-        send_whatsapp_text(NADINE_WA, body_hour)
-
-        logging.info("[TASKS] admin-notify sent")
-        return "ok", 200
-
-    @app.route("/tasks/run-reminders", methods=["POST", "GET"])
+    @app.post("/tasks/run-reminders")
     def run_reminders():
         """
-        Client reminders + admin daily recap (optional):
-        - daily=0 (default): only client next-hour + client tomorrow reminders
-        - daily=1: also send an admin 'Today’s sessions (full-day or upcoming)' + 'Next hour' block
+        Hourly:   daily=0 → “next hour” only
+        Nightly:  daily=1 → “today (full) + tomorrow”
         """
-        src = request.args.get("src", "manual")
-        daily = (request.args.get("daily", "0") == "1")
-        logging.info(f"[run-reminders] src={src}")
+        try:
+            src = request.args.get("src", "manual")
+            daily_flag = (request.args.get("daily", "0") == "1")
+            logging.info(f"[run-reminders] src={src}")
 
-        sent = 0
+            to = normalize_wa(NADINE_WA)
+            if not to:
+                return "ok sent=0", 200
 
-        # 1) Next-hour client reminders
-        for sess in _sessions_next_hour():
-            for c in _clients_for_session(sess["id"]):
-                body = f"⏰ Reminder: Pilates session at {sess['start_time']} today. Reply CANCEL if you can't make it."
-                send_whatsapp_text(c["wa_number"], body)
-                sent += 1
+            if daily_flag:
+                # 20:00 recap (full day) + tomorrow preview
+                msg = f"{_fmt_today_block(upcoming_only=False)}\n\n{_fmt_tomorrow_block()}"
+            else:
+                # hourly window (just the next hour)
+                msg = _fmt_next_hour_block()
 
-        # 2) Tomorrow client reminders
-        for sess in _sessions_tomorrow():
-            for c in _clients_for_session(sess["id"]):
-                body = f"📅 Reminder: Your Pilates session is tomorrow at {sess['start_time']}."
-                send_whatsapp_text(c["wa_number"], body)
-                sent += 1
+            code, resp = send_whatsapp_text(to, msg)
+            if code == 400 and "470" in resp:
+                logging.warning("[run-reminders] Outside 24h window; ask Nadine to send 'Admin' to reopen the session.")
 
-        # 3) Optional admin daily recap
-        if daily and NADINE_WA:
-            body_today = _fmt_today_block(upcoming_only=False)
-            send_whatsapp_text(normalize_wa(NADINE_WA), body_today)
-            send_whatsapp_text(normalize_wa(NADINE_WA), _fmt_next_hour_block())
+            logging.info(f"[TASKS] run-reminders sent=1 [run-reminders] src={src}")
+            return "ok sent=1", 200
+        except Exception as e:
+            logging.exception(e)
+            return "err", 500
 
-        logging.info(f"[TASKS] run-reminders sent={sent} [run-reminders] src={src}")
-        return f"ok sent={sent}", 200
+    @app.post("/tasks/debug-ping-admin")
+    def debug_ping_admin():
+        """
+        Quick “hello” to confirm delivery without running SQL.
+        """
+        to = normalize_wa(NADINE_WA)
+        if not to:
+            logging.error("[debug] NADINE_WA empty")
+            return "err", 500
+        logging.info(f"[debug] NADINE_WA='{NADINE_WA}' (normalized='{to}')")
+        send_whatsapp_text(to, "👋 Debug ping from server.")
+        return "sent", 200
