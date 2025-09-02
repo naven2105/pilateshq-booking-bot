@@ -8,9 +8,7 @@ Admin command handler (WhatsApp).
 - Refined UPDATE flow:
     snapshot → choose field → show current + prompt
     → preview diff → confirm/undo → back to menu
-Notes:
-- We avoid "side-by-side" UI by sending a compact snapshot + prompts.
-- Prompts are plain text (no "Choose" footer), diffs use 2–3 buttons.
+- Phone validation: SA numbers must normalize to +27XXXXXXXXX (9 digits after +27)
 """
 
 from __future__ import annotations
@@ -143,6 +141,34 @@ def _update_menu(to: str, cid: int):
 def _ask_text_prompt(to: str, header: str, prompt: str):
     """Send a plain text prompt (no list) so Nadine replies directly."""
     return send_whatsapp_text(to, f"*{header}*\n{prompt}\n\nType *CANCEL* to abort.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phone normalization & strict SA validation
+# ──────────────────────────────────────────────────────────────────────────────
+def _normalize_and_validate_sa(raw: str) -> tuple[bool, str, str]:
+    """
+    Normalize with your utils.normalize_wa() then validate strictly as SA:
+      E.164: +27 followed by 9 digits (total length 12)
+    Accept inputs like 082..., 27..., +27..., with/without spaces/dashes.
+    Returns: (is_valid, normalized_value, error_message_if_any)
+    """
+    norm = normalize_wa(raw or "")
+    if not norm:
+        return False, "", "Please send a phone number."
+    if not re.fullmatch(r"\+27\d{9}", norm):
+        # Helpful guidance for Nadine
+        return (
+            False,
+            norm,
+            "Phone must be a *South African* number.\n"
+            "Format examples I accept:\n"
+            "• 0821234567  → becomes +27821234567\n"
+            "• 27123456789 → becomes +27123456789 (must be +27 + 9 digits)\n"
+            "• +27821234567 (already OK)\n"
+            "Please resend."
+        )
+    return True, norm, ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -295,7 +321,7 @@ def handle_admin_action(sender: str, text: str):
             return _book_type_menu(wa)
         return _root_menu(wa)
 
-    # ── UPDATE: choose field (now with refined prompts)
+    # ── UPDATE: choose field
     if up in ("ADMIN_EDIT_NAME", "ADMIN_EDIT_PHONE", "ADMIN_EDIT_DOB", "ADMIN_EDIT_MEDICAL", "ADMIN_EDIT_CREDITS"):
         if not state.get("cid"):
             return _client_picker(wa, "Update: pick client")
@@ -482,7 +508,7 @@ def handle_admin_action(sender: str, text: str):
             state["await"] = None
             return _update_menu(wa, state["cid"]) if state.get("flow") == "UPDATE" and state.get("cid") else _root_menu(wa)
 
-        # NEW client wizard (kept minimal; you previously discussed removing plan/credits here)
+        # NEW client wizard (lean; plan/credits not here)
         if state.get("flow") == "NEW":
             buf = state.setdefault("buffer", {})
             step = state["await"]
@@ -495,13 +521,12 @@ def handle_admin_action(sender: str, text: str):
                 return _ask_text_prompt(wa, "New Client", "Reply with the *phone* (0…, 27…, or +27…).")
 
             if step == "PHONE":
-                norm = normalize_wa(raw)
-                if not norm.startswith("+27"):
-                    return _ask_text_prompt(wa, "New Client", "Please send a valid SA phone (0…, 27…, or +27…).")
+                ok, norm, err = _normalize_and_validate_sa(raw)
+                if not ok:
+                    return _ask_text_prompt(wa, "New Client", err)
                 # Create or fetch:
                 row = crud.create_client(buf["NAME"], norm) or crud.get_or_create_client(norm)
                 cid = row["id"]
-                # Optional: ask DOB then Medical; to keep lean we stop here
                 state["flow"] = state["await"] = None
                 state["cid"] = None
                 state["buffer"] = {}
@@ -529,11 +554,11 @@ def handle_admin_action(sender: str, text: str):
                     ]
                 )
 
-            # PHONE
+            # PHONE (strict SA validation here)
             if aw == "U_PHONE_INPUT":
-                norm = normalize_wa(raw)
-                if not norm.startswith("+27"):
-                    return _ask_text_prompt(wa, "Edit Phone", "Not SA format. Send 0…, 27…, or +27….")
+                ok, norm, err = _normalize_and_validate_sa(raw)
+                if not ok:
+                    return _ask_text_prompt(wa, "Edit Phone", err)
                 old_phone = prof.get("wa_number") or ""
                 warn = "⚠️ Another client uses this number.\n\n" if _dup_by_phone(norm, exclude_cid=cid) else ""
                 state["buffer"]["PENDING_PHONE"] = norm
@@ -614,13 +639,10 @@ def handle_admin_action(sender: str, text: str):
         prof = crud.get_client_profile(cid) or {}
 
         if up == "ADMIN_EDIT_AGAIN":
-            # Go back to the last awaited prompt type
-            # If we reached diff stage, we had set await to an *_INPUT value originally.
-            # We keep it unchanged so Nadine can retype the value.
+            # Re-show prompt for the current awaited input type
             aw = state.get("await")
             if not aw:
                 return _update_menu(wa, cid)
-            # Re-show the right prompt:
             if aw == "U_NAME_INPUT":
                 return _ask_text_prompt(wa, "Edit Name", f"Current: *{prof.get('name') or '—'}*\nReply with the *new full name*.")
             if aw == "U_PHONE_INPUT":
@@ -737,7 +759,10 @@ def handle_admin_action(sender: str, text: str):
         if nlp:
             intent = nlp.get("intent")
             if intent == "add_client":
-                res = crud.create_client(nlp["name"], normalize_wa(nlp["number"]))
+                ok, norm, err = _normalize_and_validate_sa(nlp["number"])
+                if not ok:
+                    return send_whatsapp_text(wa, f"⚠️ Invalid phone.\n{err}")
+                res = crud.create_client(nlp["name"], norm)
                 return send_whatsapp_text(wa, "✅ Client added." if res else "⚠️ Could not add client.")
             if intent == "update_dob":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
@@ -752,23 +777,23 @@ def handle_admin_action(sender: str, text: str):
             if intent == "cancel_next":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
-                ok = getattr(crud, "cancel_next_booking_for_client", lambda *_: False)(match[0]["id"])
-                return send_whatsapp_text(wa, "✅ Next session cancelled." if ok else "⚠️ No upcoming booking found.")
+                okf = getattr(crud, "cancel_next_booking_for_client", lambda *_: False)(match[0]["id"])
+                return send_whatsapp_text(wa, "✅ Next session cancelled." if okf else "⚠️ No upcoming booking found.")
             if intent == "off_sick_today":
                 return send_whatsapp_text(wa, "✅ Noted off sick (stub).")
             if intent == "no_show_today":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
-                ok = getattr(crud, "mark_no_show_today", lambda *_: False)(match[0]["id"])
-                return send_whatsapp_text(wa, "✅ No-show recorded." if ok else "⚠️ No booking found today.")
+                okn = getattr(crud, "mark_no_show_today", lambda *_: False)(match[0]["id"])
+                return send_whatsapp_text(wa, "✅ No-show recorded." if okn else "⚠️ No booking found today.")
             if intent == "book_single":
                 sess = getattr(crud, "find_session_by_date_time", lambda *_: None)(date.fromisoformat(nlp["date"]), nlp["time"])
                 if not sess: return send_whatsapp_text(wa, "⚠️ No matching session found.")
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
                 prof = crud.get_client_profile(match[0]["id"])
-                ok = booking.admin_reserve(prof["wa_number"], sess["id"], seats=1)
-                return send_whatsapp_text(wa, "✅ Booked." if ok else "⚠️ Could not book (full?).")
+                okb = booking.admin_reserve(prof["wa_number"], sess["id"], seats=1)
+                return send_whatsapp_text(wa, "✅ Booked." if okb else "⚠️ Could not book (full?).")
             if intent == "book_recurring":
                 return send_whatsapp_text(wa, "✅ Recurring booking stub (wire your weekly finder).")
 
@@ -791,7 +816,7 @@ def handle_admin_action(sender: str, text: str):
             return send_whatsapp_text(wa, "Client not found.")
         return send_whatsapp_text(wa, _profile_text(cid))
 
-    # Strict templates backup (unchanged)
+    # Strict templates backup (unchanged, grouped here)
     _strict = _strict_templates_handler(wa, raw)
     if _strict is not None:
         return _strict
@@ -874,9 +899,12 @@ def _strict_templates_handler(sender: str, raw: str):
     m = re.fullmatch(r'\s*ADD\s+CLIENT\s+"(.+?)"\s+PHONE\s+([+\d][\d\s-]+)\s*', raw, flags=re.IGNORECASE)
     if m:
         name = m.group(1).strip()
-        phone = re.sub(r"[\s-]+", "", m.group(2))
-        summary = f"Add client:\n• Name: {name}\n• Phone: {phone}"
-        token = _build_token("ADD_CLIENT", name=name, phone=phone)
+        phone_raw = re.sub(r"[\s-]+", "", m.group(2))
+        ok, norm, err = _normalize_and_validate_sa(phone_raw)
+        if not ok:
+            return send_whatsapp_text(sender, f"⚠️ Invalid phone.\n{err}")
+        summary = f"Add client:\n• Name: {name}\n• Phone: {norm}"
+        token = _build_token("ADD_CLIENT", name=name, phone=norm)
         return send_whatsapp_buttons(sender, summary, [
             {"id": token, "title": "Confirm"},
             {"id": "ADMIN_ABORT", "title": "Cancel"},
