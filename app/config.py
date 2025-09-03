@@ -24,6 +24,3 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 # …so we can pass the entire text as a single variable.
 ADMIN_TEMPLATE_NAME = os.environ.get("ADMIN_TEMPLATE_NAME", "admin_update")
 ADMIN_TEMPLATE_LANG = os.environ.get("ADMIN_TEMPLATE_LANG", "en")
-
-# timezone used for scheduling logic
-TZ_NAME = os.getenv("TZ_NAME", "Africa/Johannesburg")

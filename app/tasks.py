@@ -6,7 +6,7 @@ from flask import Blueprint, request
 from .db import get_session
 from sqlalchemy import text
 
-from .config import NADINE_WA, TZ_NAME
+from .config import NADINE_WA
 from .utils import send_whatsapp_text, normalize_wa
 
 bp = Blueprint("tasks", __name__)
@@ -20,7 +20,7 @@ def _sessions_next_hour():
     with get_session() as s:
         rows = s.execute(text(f"""
             WITH now_local AS (
-              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE :tz AS ts
+              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg' AS ts
             ),
             window AS (
               SELECT date_trunc('hour', ts) + interval '1 hour' AS t0,
@@ -40,7 +40,7 @@ def _sessions_today_upcoming():
     with get_session() as s:
         rows = s.execute(text(f"""
             WITH now_local AS (
-              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE :tz AS ts
+              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg' AS ts
             )
             SELECT id, session_date, start_time, capacity, booked_count, status, notes
             FROM sessions, now_local
@@ -55,7 +55,7 @@ def _sessions_today_full_day():
     with get_session() as s:
         rows = s.execute(text(f"""
             WITH now_local AS (
-              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE :tz AS ts
+              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg' AS ts
             )
             SELECT id, session_date, start_time, capacity, booked_count, status, notes
             FROM sessions, now_local
@@ -69,7 +69,7 @@ def _sessions_tomorrow():
     with get_session() as s:
         rows = s.execute(text(f"""
             WITH now_local AS (
-              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE :tz AS ts
+              SELECT (now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg' AS ts
             )
             SELECT id, session_date, start_time, capacity, booked_count, status, notes
             FROM sessions, now_local
