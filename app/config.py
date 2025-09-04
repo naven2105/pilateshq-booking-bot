@@ -1,41 +1,31 @@
 # app/config.py
 import os
-import logging
 
-# ------------------------------
-# WhatsApp Cloud API / Meta
-# ------------------------------
-# IMPORTANT: set these in Render → Environment
-ACCESS_TOKEN     = os.environ.get("ACCESS_TOKEN", "").strip()
-PHONE_NUMBER_ID  = os.environ.get("PHONE_NUMBER_ID", "").strip()   # e.g. 802833389569115
-VERIFY_TOKEN     = os.environ.get("VERIFY_TOKEN", "testtoken").strip()
+# ── Meta / WhatsApp Cloud API ────────────────────────────────────────────────
+ACCESS_TOKEN     = os.environ.get("ACCESS_TOKEN", "")
+PHONE_NUMBER_ID  = os.environ.get("PHONE_NUMBER_ID", "")  # e.g. "802833389569115"
+VERIFY_TOKEN     = os.environ.get("VERIFY_TOKEN", "testtoken")
 
-# WA Messages endpoint, versioned. (Cloud API auto-upgrades anyway, but keep v21 aligned with docs.)
-GRAPH_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages" if PHONE_NUMBER_ID else ""
+# Graph endpoint (version can be bumped without code changes)
+GRAPH_VER = os.environ.get("GRAPH_VER", "v21.0")
+GRAPH_URL = f"https://graph.facebook.com/{GRAPH_VER}/{PHONE_NUMBER_ID}/messages"
 
-# ------------------------------
-# Admin (single-admin mode is fine)
-# ------------------------------
-# Can be 062..., +27..., 27… (we normalize elsewhere).
+# ── Admin (leave blank during testing if you don’t want admin messages) ──────
+# Accepts 0XXXXXXXXX / 27XXXXXXXXX / +27XXXXXXXXX. We normalize before use.
 NADINE_WA = os.environ.get("NADINE_WA", "").strip()
-# Optional: if you later support multiple admins:
-ADMIN_WA_LIST = [x.strip() for x in os.environ.get("ADMIN_WA_LIST", "").split(",") if x.strip()]
 
-# ------------------------------
-# Database
-# ------------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# ── Database ─────────────────────────────────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# ------------------------------
-# Timezone for all “today/next hour” calculations
-# ------------------------------
-# Set TZ_NAME in Render → Environment if you need to change from SA time.
-TZ_NAME = os.environ.get("TZ_NAME", "Africa/Johannesburg").strip() or "Africa/Johannesburg"
-logging.info(f"[CONFIG] TZ_NAME={TZ_NAME}")
+# ── Local timezone used in SQL (PostgreSQL AT TIME ZONE) ─────────────────────
+# Keep this in sync with your studio’s local time.
+TZ_NAME = os.environ.get("TZ_NAME", "Africa/Johannesburg")
 
-# ------------------------------
-# Templates (for HSM / outside 24h window)
-# ------------------------------
-# Keep a simple “admin_update” template that accepts one {{1}} body var.
-ADMIN_TEMPLATE_NAME = os.environ.get("ADMIN_TEMPLATE_NAME", "admin_update").strip()
-ADMIN_TEMPLATE_LANG = os.environ.get("ADMIN_TEMPLATE_LANG", "en").strip()
+# ── Templates for outbound messages (outside 24h window) ─────────────────────
+# Keep a very simple, generic template that accepts one big text variable.
+# Suggested approved template:
+#   Name: admin_update
+#   Language: en
+#   Body: "{{1}}"
+ADMIN_TEMPLATE_NAME = os.environ.get("ADMIN_TEMPLATE_NAME", "admin_update")
+ADMIN_TEMPLATE_LANG = os.environ.get("ADMIN_TEMPLATE_LANG", "en")
