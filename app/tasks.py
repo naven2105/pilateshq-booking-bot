@@ -2,33 +2,34 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from flask import request
 from sqlalchemy import text
 
 from .db import get_session
-from .utils import normalize_wa, send_whatsapp_text, send_whatsapp_template
+from .utils import normalize_wa, send_whatsapp_text  # (template send left out on purpose)
 from .config import NADINE_WA, TZ_NAME
 
 
 # ───────────────────────────
-# Session lookups (local tz)
+# Session lookups (Africa/Johannesburg local time via SQL)
 # ───────────────────────────
 
 def _sessions_next_hour():
-    """Sessions that start within the next hour (local TZ)."""
+    """Sessions that start within the next hour (SA local)."""
     with get_session() as s:
         rows = s.execute(
             text("""
                 WITH now_local AS (
                     SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
                 ),
-                window AS (
+                win AS (
                     SELECT ts, (ts + INTERVAL '1 hour') AS ts_plus FROM now_local
                 )
                 SELECT id, session_date, start_time, capacity, booked_count, status, COALESCE(notes,'') AS notes
-                FROM sessions, window
-                WHERE (session_date + start_time) >= window.ts
-                  AND (session_date + start_time) <  window.ts_plus
+                FROM sessions, win
+                WHERE (session_date + start_time) >= win.ts
+                  AND (session_date + start_time) <  win.ts_plus
                 ORDER BY start_time
             """),
             {"tz": TZ_NAME},
@@ -37,7 +38,7 @@ def _sessions_next_hour():
 
 
 def _sessions_today_upcoming():
-    """Today’s sessions that are still upcoming (local TZ)."""
+    """Today’s sessions that are still upcoming (SA local)."""
     with get_session() as s:
         rows = s.execute(
             text("""
@@ -56,7 +57,7 @@ def _sessions_today_upcoming():
 
 
 def _sessions_today_full_day():
-    """All of today’s sessions (local TZ date)."""
+    """All of today’s sessions (SA local date)."""
     with get_session() as s:
         rows = s.execute(
             text("""
@@ -74,7 +75,7 @@ def _sessions_today_full_day():
 
 
 def _sessions_tomorrow_full_day():
-    """All of tomorrow’s sessions (local TZ date)."""
+    """All of tomorrow’s sessions (SA local date)."""
     with get_session() as s:
         rows = s.execute(
             text("""
@@ -122,7 +123,7 @@ def register_tasks(app):
     def admin_notify():
         """
         Hourly admin summary.
-        - Around 04:00 UTC (≈06:00 SAST): show full-day.
+        - At ~04:00 UTC (≈06:00 SAST) show full-day.
         - Other hours: upcoming-only.
         Always append a “next hour” line (even if none).
         """
@@ -130,7 +131,7 @@ def register_tasks(app):
             src = request.args.get("src", "unknown")
             logging.info(f"[admin-notify] src={src}")
 
-            # Get the current UTC hour via DB to avoid app server TZ drift.
+            # Get DB now() hour in UTC (we only need the hour to decide full/upcoming)
             with get_session() as s:
                 now_utc_hour = s.execute(text("SELECT EXTRACT(HOUR FROM now())::int AS h")).mappings().first()["h"]
 
@@ -143,10 +144,9 @@ def register_tasks(app):
 
             to = normalize_wa(NADINE_WA)
             if not to:
-                logging.warning("[admin-notify] NADINE_WA not configured; skipping send.")
+                logging.warning("[admin-notify] NADINE_WA not configured.")
                 return "ok", 200
 
-            # Keep reliable: plain text send
             send_whatsapp_text(to, msg)
             logging.info("[TASKS] admin-notify sent")
             return "ok", 200
@@ -159,7 +159,7 @@ def register_tasks(app):
     def run_reminders():
         """
         - daily=0 (default): send client next-hour reminders (if attendees exist).
-        - daily=1: admin recap for today (manual test/fallback).
+        - daily=1: admin recap for today (kept for manual tests / fallback).
         """
         try:
             src = request.args.get("src", "unknown")
@@ -200,7 +200,6 @@ def register_tasks(app):
 
                     hhmm = str(sess["start_time"])[:5]
 
-                    # Use plain text for now (templates available if you choose)
                     for a in attendees:
                         send_whatsapp_text(
                             normalize_wa(a["wa"]),
