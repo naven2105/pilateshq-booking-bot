@@ -10,6 +10,15 @@ import requests
 
 from .config import ACCESS_TOKEN, GRAPH_URL
 
+from .config import NADINE_WA
+
+def notify_admin(text_message: str):
+    to = normalize_wa(NADINE_WA or "")
+    if not to:
+        logging.warning("[notify_admin] NADINE_WA not configured; skipping.")
+        return
+    send_whatsapp_text(to, text_message)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Phone number normalization (South Africa defaults supported)
 # Accepts: 0XXXXXXXXX, 27XXXXXXXXX, +27XXXXXXXXX, or already-international.

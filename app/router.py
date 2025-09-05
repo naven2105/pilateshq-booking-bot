@@ -5,10 +5,42 @@ import logging
 from flask import request
 
 from app.config import VERIFY_TOKEN, NADINE_WA
-from app.utils import normalize_wa, send_whatsapp_text
+from app.utils import normalize_wa, send_whatsapp_text, notify_admin
 from app.onboarding import handle_onboarding, capture_onboarding_free_text
 from app.admin import handle_admin_action
 
+from . import crud
+
+def handle_incoming_text(sender_wa: str, body_text: str):
+    wa = normalize_wa(sender_wa)
+    txt = (body_text or "").strip().lower()
+
+    # ... your existing routing ...
+
+    # Only for regular clients (not admin UI):
+    if "cancel" in txt:
+        # Try to infer the client’s next upcoming booking
+        info = crud.find_next_upcoming_booking_by_wa(wa)
+        if info:
+            # Tell the client we’ve recorded their request (no DB change)
+            send_whatsapp_text(wa,
+                "Thanks — we’ve notified the studio. An admin will confirm your cancellation shortly. 🙏")
+
+            # Notify admin with the details (no DB write here)
+            human_name = info.get("name") or wa
+            hhmm = str(info["start_time"])[:5]
+            msg = (
+                "❗ Cancel request received\n"
+                f"• Client: {human_name} ({info['wa_number']})\n"
+                f"• Session: {info['session_date']} {hhmm}\n"
+                "No database change was made. Please review and cancel if needed."
+            )
+            notify_admin(msg)
+        else:
+            # No upcoming booking found
+            send_whatsapp_text(wa,
+                "We couldn’t find an upcoming booking to cancel. If you think this is a mistake, please reply with the date/time.")
+        return
 
 def _admin_set():
     """Single-admin mode: only Nadine's number is admin."""
