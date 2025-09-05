@@ -1,23 +1,11 @@
 # app/admin.py
-# -*- coding: utf-8 -*-
-"""
-Admin command handler (WhatsApp).
-- Authenticates admin
-- Supports single-word intents: NEW / UPDATE / CANCEL / VIEW / BOOK
-- Preserves strict template fallbacks (ADD CLIENT "..." PHONE ..., etc.)
-- Refined UPDATE flow:
-    snapshot → choose field → show current + prompt
-    → preview diff → confirm/undo → back to menu
-- Phone validation: SA numbers must normalize to +27XXXXXXXXX (9 digits after +27)
-"""
-
 from __future__ import annotations
 
 import os
 import re
 import logging
 from datetime import date
-from urllib.parse import quote, unquote
+from typing import Optional, Dict, Any
 
 from sqlalchemy import text
 
@@ -31,9 +19,7 @@ from . import crud
 from . import booking
 from .db import get_session
 
-# Optional NLP helpers for legacy/quick commands
 from .admin_nlp import parse_admin_command, parse_admin_client_command
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Admin auth
@@ -50,176 +36,147 @@ def _is_admin(sender: str) -> bool:
     logging.debug(f"[ADMIN AUTH] sender={wa} allow={sorted(list(allow))} ok={ok}")
     return ok
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Intents & state
+# ──────────────────────────────────────────────────────────────────────────────
+INTENTS = {"NEW", "UPDATE", "CANCEL", "VIEW", "BOOK", "CANCEL_INBOX"}
+
+# In-memory per-admin state
+ADMIN_STATE: Dict[str, Dict[str, Any]] = {}
+
+def _get_state(wa: str) -> Dict[str, Any]:
+    st = ADMIN_STATE.get(wa)
+    if not st:
+        st = {"flow": None, "await_": None, "cid": None, "buffer": {}, "book": {}, "page": 0}
+        ADMIN_STATE[wa] = st
+    return st
+
+def _set_state(
+    wa: str,
+    *,
+    flow: Optional[str] = None,
+    await_: Optional[str] = None,
+    cid: Optional[int] = None,
+    buffer: Optional[dict] = None,
+    book: Optional[dict] = None,
+    page: Optional[int] = None,
+):
+    st = _get_state(wa)
+    if flow is not None:
+        st["flow"] = flow
+    if await_ is not None:
+        st["await_"] = await_
+    if cid is not None or cid is None:
+        st["cid"] = cid
+    if buffer is not None:
+        st["buffer"] = buffer
+    if book is not None:
+        st["book"] = book
+    if page is not None:
+        st["page"] = max(0, int(page))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# In-memory per-admin state (simple)
-# ──────────────────────────────────────────────────────────────────────────────
-# ADMIN_STATE["+27..."] = {
-#   "flow": "NEW" | "UPDATE" | "CANCEL" | "VIEW" | "BOOK",
-#   "await": "... field or step ...",
-#   "cid": int | None,              # current selected client id
-#   "buffer": dict,                 # transient values for wizards/edits
-#   "book": dict,                   # booking choices
-#   "undo": { "field": str, "cid": int, "old": Any } | None,  # last change
-# }
-ADMIN_STATE: dict[str, dict] = {}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Root menu + intent shortcuts
+# Root & common UIs
 # ──────────────────────────────────────────────────────────────────────────────
 def _root_menu(to: str):
     return send_whatsapp_list(
         to, "Admin", "Type a single word to start or tap:", "ADMIN_ROOT",
         [
-            {"id": "ADMIN_INTENT_NEW",    "title": "➕ New"},
-            {"id": "ADMIN_INTENT_UPDATE", "title": "✏️ Update"},
-            {"id": "ADMIN_INTENT_CANCEL", "title": "❌ Cancel"},
-            {"id": "ADMIN_INTENT_VIEW",   "title": "👁️ View"},
-            {"id": "ADMIN_INTENT_BOOK",   "title": "📅 Book"},
+            {"id": "ADMIN_INTENT_NEW",          "title": "➕ New"},
+            {"id": "ADMIN_INTENT_UPDATE",       "title": "✏️ Update"},
+            {"id": "ADMIN_INTENT_CANCEL",       "title": "❌ Cancel (per client)"},
+            {"id": "ADMIN_INTENT_VIEW",         "title": "👁️ View"},
+            {"id": "ADMIN_INTENT_BOOK",         "title": "📅 Book"},
+            {"id": "ADMIN_INTENT_CANCEL_INBOX", "title": "🗂 Cancel Requests"},
         ],
     )
 
-
 def _client_picker(to: str, title="Clients", q: str | None = None):
-    """List latest or name-filtered clients as a list picker."""
     rows = []
-    matches = crud.find_clients_by_name(q, limit=10) if q else crud.list_clients(limit=10)
-    for c in matches:
+    try:
+        if q:
+            matches = crud.find_clients_by_name(q, limit=10)
+        else:
+            matches = getattr(crud, "list_clients", lambda **_: [])(limit=10)
+    except Exception:
+        logging.exception("client picker failed")
+        matches = []
+
+    for c in matches or []:
         rows.append({
             "id": f"ADMIN_PICK_CLIENT_{c['id']}",
-            "title": (c["name"] or "(no name)")[:24],
-            "description": f"{c['wa_number']} • {c.get('credits',0)} cr"
+            "title": (c.get("name") or "(no name)")[:24],
+            "description": f"{c.get('wa_number','')} • {c.get('credits',0)} cr"
         })
     body = "Pick a client:" + (f' (search="{q}")' if q else "")
     return send_whatsapp_list(to, title, body, "ADMIN_CLIENTS", rows or [{"id": "ADMIN_ROOT", "title": "⬅️ Back"}])
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Profile snapshot + menus
-# ──────────────────────────────────────────────────────────────────────────────
-def _profile_text(cid: int) -> str:
-    prof = crud.get_client_profile(cid)
-    if not prof:
-        return "Client not found."
-    bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
-    text = (f"👤 {prof['name']}\n"
-            f"📱 {prof['wa_number']}\n"
-            f"🎂 DOB: {bday or '—'}\n"
-            f"🎟️ Credits: {prof.get('credits',0)}\n"
-            f"📝 Notes: {(prof.get('medical_notes') or '—')[:300]}")
-    return text
-
-
 def _show_profile(to: str, cid: int):
-    return send_whatsapp_text(to, _profile_text(cid))
-
-
-def _update_menu(to: str, cid: int):
-    """Show a snapshot (text) + a list of editable fields (list)."""
     prof = crud.get_client_profile(cid)
     if not prof:
         return send_whatsapp_text(to, "Client not found.")
+    bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-")
+    text = (f"👤 {prof.get('name')}\n"
+            f"📱 {prof.get('wa_number')}\n"
+            f"📅 Plan: {prof.get('plan','')}\n"
+            f"🎟️ Credits: {prof.get('credits',0)}\n"
+            f"🎂 DOB: {bday or '—'}\n"
+            f"📝 Notes: {prof.get('medical_notes') or '—'}")
+    return send_whatsapp_text(to, text)
 
-    # First the snapshot as plain text
-    send_whatsapp_text(to, "🔧 *Update Client*\n" + _profile_text(cid))
-
-    # Then the edit list
+def _update_menu(to: str, cid: int):
+    prof = crud.get_client_profile(cid)
+    if not prof:
+        return send_whatsapp_text(to, "Client not found.")
+    subtitle = (
+        f"{prof.get('name')} • {prof.get('wa_number')} • Plan {prof.get('plan') or '—'} • "
+        f"{prof.get('credits',0)} cr"
+    )
     return send_whatsapp_list(
-        to, "Edit fields", f"What do you want to change for {prof['name']}?", "ADMIN_UPDATE",
+        to, "Update Client", f"{subtitle}\nEdit a field:", "ADMIN_UPDATE",
         [
             {"id": "ADMIN_EDIT_NAME",    "title": "👤 Name"},
-            {"id": "ADMIN_EDIT_PHONE",   "title": "📱 Phone"},
             {"id": "ADMIN_EDIT_DOB",     "title": "🎂 DOB"},
+            {"id": "ADMIN_EDIT_PLAN",    "title": "📅 Plan"},
             {"id": "ADMIN_EDIT_MEDICAL", "title": "🩺 Medical Notes"},
             {"id": "ADMIN_EDIT_CREDITS", "title": "🎟️ Credits (+/-)"},
+            {"id": "ADMIN_EDIT_PHONE",   "title": "📱 Phone (validated)"},
             {"id": "ADMIN_DONE",         "title": "✅ Done"},
         ],
     )
 
-
-def _ask_text_prompt(to: str, header: str, prompt: str):
-    """Send a plain text prompt (no list) so Nadine replies directly."""
-    return send_whatsapp_text(to, f"*{header}*\n{prompt}\n\nType *CANCEL* to abort.")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Phone normalization & strict SA validation
-# ──────────────────────────────────────────────────────────────────────────────
-def _normalize_and_validate_sa(raw: str) -> tuple[bool, str, str]:
-    """
-    Normalize with your utils.normalize_wa() then validate strictly as SA:
-      E.164: +27 followed by 9 digits (total length 12)
-    Accept inputs like 082..., 27..., +27..., with/without spaces/dashes.
-    Returns: (is_valid, normalized_value, error_message_if_any)
-    """
-    norm = normalize_wa(raw or "")
-    if not norm:
-        return False, "", "Please send a phone number."
-    if not re.fullmatch(r"\+27\d{9}", norm):
-        # Helpful guidance for Nadine
-        return (
-            False,
-            norm,
-            "Phone must be a *South African* number.\n"
-            "Format examples I accept:\n"
-            "• 0821234567  → becomes +27821234567\n"
-            "• 27123456789 → becomes +27123456789 (must be +27 + 9 digits)\n"
-            "• +27821234567 (already OK)\n"
-            "Please resend."
-        )
-    return True, norm, ""
-
+def _ask_free_text(to: str, header: str, prompt: str, back_id="ADMIN_INTENT_UPDATE"):
+    return send_whatsapp_list(
+        to, header, prompt, "ADMIN_BACK",
+        [{"id": back_id, "title": "⬅️ Back"}]
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-level updates (SQL via get_session)
+# DB small helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _save_name(cid: int, name: str):
     with get_session() as s:
         s.execute(text("UPDATE clients SET name=:nm WHERE id=:cid"),
                   {"nm": name[:120], "cid": cid})
 
-def _save_phone(cid: int, wa_number: str):
+def _save_plan(cid: int, plan: str):
     with get_session() as s:
-        s.execute(text("UPDATE clients SET wa_number=:wa WHERE id=:cid"),
-                  {"wa": wa_number, "cid": cid})
+        s.execute(text("UPDATE clients SET plan=:p WHERE id=:cid"),
+                  {"p": plan[:20], "cid": cid})
 
-def _save_dob(cid: int, day: int, month: int):
-    crud.update_client_dob(cid, int(day), int(month))
+def _save_phone(cid: int, phone: str):
+    norm = normalize_wa(phone)
+    if not norm.startswith("+27"):
+        raise ValueError("Phone must be South African format (0…, 27…, +27…)")
+    with get_session() as s:
+        s.execute(text("UPDATE clients SET wa_number=:w WHERE id=:cid"),
+                  {"w": norm, "cid": cid})
 
-def _save_medical(cid: int, note: str, append: bool):
-    crud.update_client_medical(cid, note[:500], append=append)
-
-def _adjust_credits(cid: int, delta: int):
+def _save_credits_delta(cid: int, delta: int):
     crud.adjust_client_credits(cid, delta)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Duplicate checks (gentle warnings)
-# ──────────────────────────────────────────────────────────────────────────────
-def _dup_by_phone(wa: str, exclude_cid: int | None = None) -> bool:
-    with get_session() as s:
-        q = "SELECT id FROM clients WHERE wa_number = :wa"
-        params = {"wa": wa}
-        if exclude_cid:
-            q += " AND id <> :cid"
-            params["cid"] = exclude_cid
-        r = s.execute(text(q), params).first()
-        return bool(r)
-
-def _dup_by_name(name: str, exclude_cid: int | None = None) -> bool:
-    with get_session() as s:
-        q = "SELECT id FROM clients WHERE LOWER(name) = LOWER(:nm)"
-        params = {"nm": name}
-        if exclude_cid:
-            q += " AND id <> :cid"
-            params["cid"] = exclude_cid
-        r = s.execute(text(q), params).first()
-        return bool(r)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Booking menus (as before)
+# Booking pickers
 # ──────────────────────────────────────────────────────────────────────────────
 def _book_type_menu(to: str):
     return send_whatsapp_list(
@@ -254,55 +211,144 @@ def _book_slot_menu(to: str):
         rows or [{"id": "ADMIN_ROOT", "title": "⬅️ Back"}]
     )
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Month helper
+# Cancel Requests Inbox (NEW)
 # ──────────────────────────────────────────────────────────────────────────────
-def _month_to_int(mon: str) -> int | None:
-    mon = mon.strip().lower()
-    table = {
-        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
-        "nov": 11, "november": 11, "dec": 12, "december": 12
-    }
-    return table.get(mon)
+def _fmt_cancel_row(r: dict) -> tuple[str, str]:
+    """Return (title, description) for a cancel request list row."""
+    nm = (r.get("client_name") or "Client")[:24]
+    dt = f"{r.get('session_date')} {str(r.get('start_time'))[:5]}"
+    title = f"{nm} – {dt}"
+    reason = r.get("reason") or r.get("via") or "request"
+    desc = f"#{r.get('id')} • {reason}"
+    return title, desc
 
+def _cancel_inbox_page(to: str, page: int = 0, page_size: int = 10):
+    page = max(0, int(page))
+    rows = crud.list_cancel_requests(status="open", limit=page_size, offset=page * page_size)
+    items = []
+    for r in rows:
+        title, desc = _fmt_cancel_row(r)
+        items.append({"id": f"ADMIN_CANCEL_REQ_{r['id']}", "title": title, "description": desc})
+
+    # pagination controls
+    nav = []
+    if page > 0:
+        nav.append({"id": f"ADMIN_CANCEL_PAGE_{page-1}", "title": "⬅️ Prev"})
+    if len(rows) == page_size:
+        nav.append({"id": f"ADMIN_CANCEL_PAGE_{page+1}", "title": "➡️ Next"})
+    if not items:
+        items = [{"id": "ADMIN_ROOT", "title": "No open requests — back"}]
+
+    body = f"Open cancel requests (page {page+1})"
+    return send_whatsapp_list(to, "🗂 Cancel Requests", body, "ADMIN_CANCEL_INBOX", items + nav)
+
+def _cancel_request_detail(to: str, rid: int):
+    r = crud.get_cancel_request(rid)
+    if not r:
+        return send_whatsapp_text(to, f"Cancel request #{rid} not found.")
+    title = f"Cancel request #{rid}"
+    nm = r.get("client_name") or "Client"
+    dt = f"{r.get('session_date')} {str(r.get('start_time'))[:5]}"
+    rsn = r.get("reason") or "—"
+    txt = (f"👤 {nm}\n"
+           f"🗓 {dt}\n"
+           f"🧾 Booking #{r.get('booking_id')}\n"
+           f"📝 Reason: {rsn}\n\n"
+           f"What would you like to do?")
+    return send_whatsapp_buttons(to, txt, [
+        {"id": f"ADMIN_CANCEL_REQ_CONFIRM_{rid}", "title": "✅ Confirm"},
+        {"id": f"ADMIN_CANCEL_REQ_RESCH_{rid}",   "title": "📅 Reschedule"},
+        {"id": f"ADMIN_CANCEL_REQ_DECLINE_{rid}", "title": "🚫 Decline"},
+        {"id": f"ADMIN_INTENT_CANCEL_INBOX",      "title": "⬅️ Back to inbox"},
+    ])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
-def handle_admin_action(sender: str, text: str):
-    """Main dispatcher for admin messages & interactive IDs."""
+def handle_admin_action(sender: str, text_in: str):
     if not _is_admin(sender):
-        return send_whatsapp_text(sender, "⛔ Only Nadine (admin) can perform admin functions.")
+        return send_whatsapp_text(sender, "⛔ Only admin can perform admin functions.")
 
     wa = normalize_wa(sender)
-    state = ADMIN_STATE.get(wa) or {"flow": None, "await": None, "cid": None, "buffer": {}, "book": {}, "undo": None}
-    ADMIN_STATE[wa] = state
+    state = _get_state(wa)
 
-    raw = (text or "").strip()
+    raw = (text_in or "").strip()
     up = raw.upper()
-    logging.info(f"[ADMIN CMD] '{raw}' (flow={state.get('flow')} await={state.get('await')} cid={state.get('cid')})")
+    logging.info(f"[ADMIN CMD] '{raw}' (flow={state['flow']} await={state['await_']} cid={state['cid']} page={state.get('page',0)})")
 
-    # ── Intent shortcuts (interactive list taps)
+    # ── NEW: Cancel-request decisions (from buttons)
+    if up.startswith("ADMIN_CANCEL_REQ_CONFIRM_"):
+        try:
+            rid = int(up.split("_")[-1])
+        except ValueError:
+            return send_whatsapp_text(wa, "Invalid cancel id.")
+        res = _admin_cancel_request_decide(wa, rid, decision="confirmed")
+        # return to detail (shows success) then inbox
+        _cancel_request_detail(wa, rid)
+        return _cancel_inbox_page(wa, state.get("page", 0))
+
+    if up.startswith("ADMIN_CANCEL_REQ_DECLINE_"):
+        try:
+            rid = int(up.split("_")[-1])
+        except ValueError:
+            return send_whatsapp_text(wa, "Invalid cancel id.")
+        res = _admin_cancel_request_decide(wa, rid, decision="declined")
+        _cancel_request_detail(wa, rid)
+        return _cancel_inbox_page(wa, state.get("page", 0))
+
+    if up.startswith("ADMIN_CANCEL_REQ_RESCH_"):
+        try:
+            rid = int(up.split("_")[-1])
+        except ValueError:
+            return send_whatsapp_text(wa, "Invalid cancel id.")
+        res = _admin_cancel_request_decide(wa, rid, decision="reschedule")
+        _cancel_request_detail(wa, rid)
+        return _cancel_inbox_page(wa, state.get("page", 0))
+
+    # ── NEW: Cancel Requests inbox navigation
+    if up == "ADMIN_INTENT_CANCEL_INBOX":
+        _set_state(wa, flow="CANCEL_INBOX", page=0)
+        return _cancel_inbox_page(wa, 0)
+
+    if up.startswith("ADMIN_CANCEL_PAGE_"):
+        try:
+            page = int(up.replace("ADMIN_CANCEL_PAGE_", ""))
+        except ValueError:
+            page = 0
+        _set_state(wa, page=page)
+        return _cancel_inbox_page(wa, page)
+
+    if up.startswith("ADMIN_CANCEL_REQ_") and not any(up.startswith(x) for x in (
+        "ADMIN_CANCEL_REQ_CONFIRM_", "ADMIN_CANCEL_REQ_DECLINE_", "ADMIN_CANCEL_REQ_RESCH_")):
+        try:
+            rid = int(up.replace("ADMIN_CANCEL_REQ_", ""))
+        except ValueError:
+            return send_whatsapp_text(wa, "Invalid selection.")
+        return _cancel_request_detail(wa, rid)
+
+    # ── Intent shortcuts (interactive buttons)
     if up == "ADMIN_INTENT_NEW":
-        state["flow"], state["await"], state["cid"], state["buffer"], state["book"], state["undo"] = "NEW", "NAME", None, {}, {}, None
-        return _ask_text_prompt(wa, "New Client", "Reply with the client's *full name*.")
+        _set_state(wa, flow="NEW", await_="NAME", cid=None, buffer={}, book={}, page=0)
+        return _ask_free_text(wa, "New Client", "Reply with the client's full name.", "ADMIN_INTENT_NEW")
+
     if up == "ADMIN_INTENT_UPDATE":
-        state["flow"], state["await"] = "UPDATE", None
+        _set_state(wa, flow="UPDATE", await_=None, page=0)
         return _client_picker(wa, "Update: pick client")
+
     if up == "ADMIN_INTENT_CANCEL":
-        state["flow"], state["await"] = "CANCEL", None
+        _set_state(wa, flow="CANCEL", await_=None, page=0)
         return _client_picker(wa, "Cancel: pick client")
+
     if up == "ADMIN_INTENT_VIEW":
-        state["flow"], state["await"] = "VIEW", None
+        _set_state(wa, flow="VIEW", await_=None, page=0)
         return _client_picker(wa, "View: pick client")
+
     if up == "ADMIN_INTENT_BOOK":
-        state["flow"], state["await"] = "BOOK", None
+        _set_state(wa, flow="BOOK", await_=None, page=0)
         return _client_picker(wa, "Book: pick client")
 
-    # ── Client selection
+    # ── Client selection from list
     if up.startswith("ADMIN_PICK_CLIENT_"):
         try:
             cid = int(up.replace("ADMIN_PICK_CLIENT_", ""))
@@ -312,154 +358,42 @@ def handle_admin_action(sender: str, text: str):
         if state["flow"] == "VIEW":
             return _show_profile(wa, cid)
         if state["flow"] == "UPDATE":
-            state["await"] = None
             return _update_menu(wa, cid)
         if state["flow"] == "CANCEL":
-            # Needs your CRUD helper if you want: cancel all/upcoming etc.
-            return send_whatsapp_text(wa, "Cancel-by-client not wired yet (stub).")
+            return send_whatsapp_text(wa, "Use the 🗂 Cancel Requests inbox for client-initiated cancellations.")
         if state["flow"] == "BOOK":
             return _book_type_menu(wa)
         return _root_menu(wa)
 
-    # ── UPDATE: choose field
-    if up in ("ADMIN_EDIT_NAME", "ADMIN_EDIT_PHONE", "ADMIN_EDIT_DOB", "ADMIN_EDIT_MEDICAL", "ADMIN_EDIT_CREDITS"):
-        if not state.get("cid"):
+    # ── UPDATE: edit selections
+    if up in ("ADMIN_EDIT_NAME", "ADMIN_EDIT_DOB", "ADMIN_EDIT_PLAN", "ADMIN_EDIT_MEDICAL", "ADMIN_EDIT_CREDITS", "ADMIN_EDIT_PHONE"):
+        if not state["cid"]:
             return _client_picker(wa, "Update: pick client")
-        cid = state["cid"]
-        prof = crud.get_client_profile(cid)
-        if not prof:
-            return send_whatsapp_text(wa, "Client not found.")
-
         if up == "ADMIN_EDIT_NAME":
-            state["await"] = "U_NAME_INPUT"
-            return _ask_text_prompt(wa, "Edit Name",
-                                    f"Current: *{prof['name']}*\nReply with the *new full name*.")
-
-        if up == "ADMIN_EDIT_PHONE":
-            state["await"] = "U_PHONE_INPUT"
-            return _ask_text_prompt(wa, "Edit Phone",
-                                    f"Current: *{prof['wa_number']}*\nReply with the *new SA phone* (0…, 27…, or +27…).")
-
+            state["await_"] = "NAME"
+            return _ask_free_text(wa, "Edit Name", "Reply with the client's full name.")
         if up == "ADMIN_EDIT_DOB":
-            state["await"] = "U_DOB_INPUT"
-            bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-") or "—"
-            return _ask_text_prompt(wa, "Edit DOB",
-                                    f"Current: *{bday}*\nReply as *DD MON* (e.g., 21 MAY).")
-
+            state["await_"] = "DOB"
+            return _ask_free_text(wa, "Edit DOB", "Reply as DD MON (e.g., 21 MAY).")
+        if up == "ADMIN_EDIT_PLAN":
+            state["await_"] = "PLAN"
+            return _ask_free_text(wa, "Edit Plan", "Reply with: 1x, 2x, or 3x.")
         if up == "ADMIN_EDIT_MEDICAL":
-            state["await"] = None
-            current = prof.get("medical_notes") or "—"
-            # show small submenu as buttons: View / Append / Replace
-            send_whatsapp_text(wa, f"*Medical Notes*\nCurrent (first 300 chars):\n{current[:300]}")
-            return send_whatsapp_list(
-                wa, "Medical Notes", "Choose how to modify:", "ADMIN_MEDICAL",
-                [
-                    {"id": "ADMIN_MEDICAL_APPEND",  "title": "➕ Append"},
-                    {"id": "ADMIN_MEDICAL_REPLACE", "title": "♻️ Replace"},
-                    {"id": "ADMIN_UPDATE_BACK",     "title": "⬅️ Back"},
-                ],
-            )
-
+            state["await_"] = "MEDICAL"
+            return _ask_free_text(wa, "Edit Medical Notes", "Reply with the medical note (replaces existing).")
         if up == "ADMIN_EDIT_CREDITS":
-            state["await"] = None
-            return send_whatsapp_list(
-                wa, "Adjust Credits", "Quick adjust or choose Custom:", "ADMIN_CREDITS",
-                [
-                    {"id": "ADMIN_CREDITS_APPLY_+1", "title": "+1"},
-                    {"id": "ADMIN_CREDITS_APPLY_+2", "title": "+2"},
-                    {"id": "ADMIN_CREDITS_APPLY_-1", "title": "-1"},
-                    {"id": "ADMIN_CREDITS_APPLY_-2", "title": "-2"},
-                    {"id": "ADMIN_CREDITS_CUSTOM",   "title": "✍️ Custom…"},
-                    {"id": "ADMIN_UPDATE_BACK",      "title": "⬅️ Back"},
-                ],
-            )
-
-    # Submenu actions for Medical Notes
-    if up in ("ADMIN_MEDICAL_APPEND", "ADMIN_MEDICAL_REPLACE"):
-        if not state.get("cid"):
-            return _client_picker(wa, "Update: pick client")
-        state["await"] = "U_MEDICAL_APPEND" if up.endswith("APPEND") else "U_MEDICAL_REPLACE"
-        mode = "append a new note" if up.endswith("APPEND") else "replace notes"
-        return _ask_text_prompt(wa, "Medical Notes", f"Reply with the text to *{mode}*.")
-
-    if up == "ADMIN_UPDATE_BACK":
-        if not state.get("cid"):
-            return _client_picker(wa, "Update: pick client")
+            state["await_"] = "CREDITS"
+            return _ask_free_text(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
+        if up == "ADMIN_EDIT_PHONE":
+            state["await_"] = "PHONE"
+            return _ask_free_text(wa, "Edit Phone", "Reply with SA phone (0XXXXXXXXX, 27…, or +27…).")
         return _update_menu(wa, state["cid"])
 
-    # Quick credits
-    if up.startswith("ADMIN_CREDITS_APPLY_"):
-        if not state.get("cid"):
-            return _client_picker(wa, "Update: pick client")
-        cid = state["cid"]
-        delta_str = up.replace("ADMIN_CREDITS_APPLY_", "")
-        try:
-            delta = int(delta_str)
-        except ValueError:
-            return send_whatsapp_text(wa, "Invalid credits value.")
-        # Save with undo support:
-        prof = crud.get_client_profile(cid)
-        old = prof.get("credits", 0)
-        _adjust_credits(cid, delta)
-        new = old + delta
-        state["undo"] = {"field": "credits", "cid": cid, "old": old}
-        send_whatsapp_buttons(
-            wa,
-            f"✅ Credits updated: {old} → {new}\nUndo?",
-            [
-                {"id": "ADMIN_UNDO_LAST", "title": "↩️ Undo"},
-                {"id": "ADMIN_UPDATE_BACK", "title": "Back"},
-            ]
-        )
-        return
-
-    if up == "ADMIN_CREDITS_CUSTOM":
-        if not state.get("cid"):
-            return _client_picker(wa, "Update: pick client")
-        state["await"] = "U_CREDITS_INPUT"
-        return _ask_text_prompt(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
-
-    # Undo last change (if stored)
-    if up == "ADMIN_UNDO_LAST":
-        undo = state.get("undo")
-        if not undo:
-            return send_whatsapp_text(wa, "Nothing to undo.")
-        cid = undo.get("cid")
-        field = undo.get("field")
-        old = undo.get("old")
-        if field == "name":
-            _save_name(cid, old)
-        elif field == "wa_number":
-            _save_phone(cid, old)
-        elif field == "dob":
-            try:
-                d, m = old  # tuple (day, month)
-                _save_dob(cid, d, m)
-            except Exception:
-                pass
-        elif field == "medical_notes":
-            # Full revert (replace with old)
-            _save_medical(cid, old or "", append=False)
-        elif field == "credits":
-            prof = crud.get_client_profile(cid)
-            now = prof.get("credits", 0)
-            delta = (old or 0) - now
-            if delta:
-                _adjust_credits(cid, delta)
-        state["undo"] = None
-        send_whatsapp_text(wa, "↩️ Reverted.")
-        return _update_menu(wa, cid)
-
-    # Done (reset) from update menu
     if up == "ADMIN_DONE":
-        state["flow"] = state["await"] = None
-        state["cid"] = None
-        state["buffer"] = {}
-        state["book"] = {}
-        state["undo"] = None
+        _set_state(wa, flow=None, await_=None, cid=None, buffer={}, book={}, page=0)
         return _root_menu(wa)
 
-    # ── BOOK flow (unchanged core)
+    # ── BOOK: type/mode/slot selection
     if up.startswith("ADMIN_BOOK_TYPE_"):
         t = up.replace("ADMIN_BOOK_TYPE_", "").lower()
         state["book"]["type"] = t
@@ -478,13 +412,15 @@ def handle_admin_action(sender: str, text: str):
         state["book"]["slot_id"] = slot_id
         prof = crud.get_client_profile(state["cid"]) if state["cid"] else None
         nm = prof["name"] if prof else "client"
-        body = (f"Confirm booking for {nm}\n"
-                f"• Type: {state['book'].get('type')}\n"
-                f"• Mode: {state['book'].get('mode')}\n"
-                f"• Slot ID: {slot_id}")
+        body = (
+            f"Confirm booking for {nm}\n"
+            f"• Type: {state['book'].get('type')}\n"
+            f"• Mode: {state['book'].get('mode')}\n"
+            f"• Slot ID: {slot_id}"
+        )
         return send_whatsapp_buttons(wa, body, [
-            {"id": "ADMIN_BOOK_CONFIRM", "title": "Confirm"},
-            {"id": "ADMIN_INTENT_BOOK",  "title": "Back"},
+            {"id": f"ADMIN_BOOK_CONFIRM", "title": "Confirm"},
+            {"id": "ADMIN_INTENT_BOOK",   "title": "Back"},
         ])
 
     if up == "ADMIN_BOOK_CONFIRM":
@@ -499,270 +435,34 @@ def handle_admin_action(sender: str, text: str):
         state["book"] = {}
         return _update_menu(wa, state["cid"])
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Text input capture (NEW & UPDATE flows)
-    # ──────────────────────────────────────────────────────────────────────
-    if state.get("await"):
-        # Allow cancel
-        if raw.strip().upper() == "CANCEL":
-            state["await"] = None
-            return _update_menu(wa, state["cid"]) if state.get("flow") == "UPDATE" and state.get("cid") else _root_menu(wa)
+    # ── NEW flow driver
+    if up == "ADMIN_NEW_NEXT":
+        return _new_next(wa, state)
 
-        # NEW client wizard (lean; plan/credits not here)
-        if state.get("flow") == "NEW":
-            buf = state.setdefault("buffer", {})
-            step = state["await"]
+    # ── Free-text capture for awaited fields
+    if state["await_"]:
+        return _capture_free_text(wa, state, raw)
 
-            if step == "NAME":
-                if len(raw.strip()) < 2:
-                    return _ask_text_prompt(wa, "New Client", "Name seems too short — reply with *full name*.")
-                buf["NAME"] = raw.strip().title()[:120]
-                state["await"] = "PHONE"
-                return _ask_text_prompt(wa, "New Client", "Reply with the *phone* (0…, 27…, or +27…).")
-
-            if step == "PHONE":
-                ok, norm, err = _normalize_and_validate_sa(raw)
-                if not ok:
-                    return _ask_text_prompt(wa, "New Client", err)
-                # Create or fetch:
-                row = crud.create_client(buf["NAME"], norm) or crud.get_or_create_client(norm)
-                cid = row["id"]
-                state["flow"] = state["await"] = None
-                state["cid"] = None
-                state["buffer"] = {}
-                return send_whatsapp_text(wa, "✅ New client saved.")
-
-        # UPDATE flow inputs with preview/confirm
-        if state.get("flow") == "UPDATE" and state.get("cid"):
-            cid = state["cid"]
-            prof = crud.get_client_profile(cid) or {}
-            aw = state["await"]
-
-            # NAME
-            if aw == "U_NAME_INPUT":
-                new_name = raw.strip().title()[:120]
-                old_name = prof.get("name") or ""
-                warn = "⚠️ Duplicate name exists.\n\n" if _dup_by_name(new_name, exclude_cid=cid) else ""
-                state["buffer"]["PENDING_NAME"] = new_name
-                return send_whatsapp_buttons(
-                    wa,
-                    f"{warn}Change *Name*:\n• From: {old_name or '—'}\n• To:   {new_name}\n\nSave?",
-                    [
-                        {"id": "ADMIN_SAVE_NAME",    "title": "✅ Save"},
-                        {"id": "ADMIN_EDIT_AGAIN",   "title": "↩️ Edit"},
-                        {"id": "ADMIN_CANCEL_EDIT",  "title": "❌ Cancel"},
-                    ]
-                )
-
-            # PHONE (strict SA validation here)
-            if aw == "U_PHONE_INPUT":
-                ok, norm, err = _normalize_and_validate_sa(raw)
-                if not ok:
-                    return _ask_text_prompt(wa, "Edit Phone", err)
-                old_phone = prof.get("wa_number") or ""
-                warn = "⚠️ Another client uses this number.\n\n" if _dup_by_phone(norm, exclude_cid=cid) else ""
-                state["buffer"]["PENDING_PHONE"] = norm
-                return send_whatsapp_buttons(
-                    wa,
-                    f"{warn}Change *Phone*:\n• From: {old_phone or '—'}\n• To:   {norm}\n\nSave?",
-                    [
-                        {"id": "ADMIN_SAVE_PHONE",   "title": "✅ Save"},
-                        {"id": "ADMIN_EDIT_AGAIN",   "title": "↩️ Edit"},
-                        {"id": "ADMIN_CANCEL_EDIT",  "title": "❌ Cancel"},
-                    ]
-                )
-
-            # DOB
-            if aw == "U_DOB_INPUT":
-                m = re.fullmatch(r"\s*(\d{1,2})\s+([A-Za-z]{3,})\s*", raw.strip())
-                if not m:
-                    return _ask_text_prompt(wa, "Edit DOB", "Format *DD MON* (e.g., 21 MAY).")
-                day_s, mon_s = m.group(1), m.group(2)
-                mon_i = _month_to_int(mon_s)
-                if mon_i is None:
-                    return _ask_text_prompt(wa, "Edit DOB", "Month must be JAN, FEB, …")
-                bday_old = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-") or "—"
-                bday_new = f"{int(day_s)}-{mon_i}"
-                state["buffer"]["PENDING_DOB"] = (int(day_s), int(mon_i))
-                return send_whatsapp_buttons(
-                    wa,
-                    f"Change *DOB*:\n• From: {bday_old}\n• To:   {bday_new}\n\nSave?",
-                    [
-                        {"id": "ADMIN_SAVE_DOB",     "title": "✅ Save"},
-                        {"id": "ADMIN_EDIT_AGAIN",   "title": "↩️ Edit"},
-                        {"id": "ADMIN_CANCEL_EDIT",  "title": "❌ Cancel"},
-                    ]
-                )
-
-            # MEDICAL
-            if aw in ("U_MEDICAL_APPEND", "U_MEDICAL_REPLACE"):
-                new_note = raw.strip()[:500]
-                mode = "append" if aw.endswith("APPEND") else "replace"
-                current = (prof.get("medical_notes") or "")[:300]
-                preview_new = (new_note[:300] + ("…" if len(new_note) > 300 else ""))
-                state["buffer"]["PENDING_MEDICAL"] = {"text": new_note, "append": (mode == "append")}
-                return send_whatsapp_buttons(
-                    wa,
-                    f"Change *Medical Notes* ({mode}):\n• Current (first 300): {current or '—'}\n• New (first 300): {preview_new or '—'}\n\nSave?",
-                    [
-                        {"id": "ADMIN_SAVE_MEDICAL", "title": "✅ Save"},
-                        {"id": "ADMIN_EDIT_AGAIN",   "title": "↩️ Edit"},
-                        {"id": "ADMIN_CANCEL_EDIT",  "title": "❌ Cancel"},
-                    ]
-                )
-
-            # CREDITS custom
-            if aw == "U_CREDITS_INPUT":
-                m = re.fullmatch(r"\s*([+-]?\d+)\s*", raw)
-                if not m:
-                    return _ask_text_prompt(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
-                delta = int(m.group(1))
-                prof = crud.get_client_profile(cid)
-                old = prof.get("credits", 0)
-                new = old + delta
-                state["buffer"]["PENDING_CREDITS_DELTA"] = delta
-                return send_whatsapp_buttons(
-                    wa,
-                    f"Change *Credits*:\n• From: {old}\n• To:   {new}\n\nApply?",
-                    [
-                        {"id": "ADMIN_SAVE_CREDITS", "title": "✅ Save"},
-                        {"id": "ADMIN_EDIT_AGAIN",   "title": "↩️ Edit"},
-                        {"id": "ADMIN_CANCEL_EDIT",  "title": "❌ Cancel"},
-                    ]
-                )
-
-    # ── SAVE / EDIT AGAIN / CANCEL for diffs
-    if up in ("ADMIN_EDIT_AGAIN", "ADMIN_CANCEL_EDIT", "ADMIN_SAVE_NAME", "ADMIN_SAVE_PHONE", "ADMIN_SAVE_DOB", "ADMIN_SAVE_MEDICAL", "ADMIN_SAVE_CREDITS"):
-        if not state.get("cid"):
-            return _client_picker(wa, "Update: pick client")
-        cid = state["cid"]
-        prof = crud.get_client_profile(cid) or {}
-
-        if up == "ADMIN_EDIT_AGAIN":
-            # Re-show prompt for the current awaited input type
-            aw = state.get("await")
-            if not aw:
-                return _update_menu(wa, cid)
-            if aw == "U_NAME_INPUT":
-                return _ask_text_prompt(wa, "Edit Name", f"Current: *{prof.get('name') or '—'}*\nReply with the *new full name*.")
-            if aw == "U_PHONE_INPUT":
-                return _ask_text_prompt(wa, "Edit Phone", f"Current: *{prof.get('wa_number') or '—'}*\nReply with the *new SA phone* (0…, 27…, or +27…).")
-            if aw == "U_DOB_INPUT":
-                bday = f"{(prof.get('birthday_day') or '')}-{(prof.get('birthday_month') or '')}".strip("-") or "—"
-                return _ask_text_prompt(wa, "Edit DOB", f"Current: *{bday}*\nReply as *DD MON* (e.g., 21 MAY).")
-            if aw in ("U_MEDICAL_APPEND", "U_MEDICAL_REPLACE"):
-                mode = "append a new note" if aw.endswith("APPEND") else "replace notes"
-                return _ask_text_prompt(wa, "Medical Notes", f"Reply with the text to *{mode}*.")
-            if aw == "U_CREDITS_INPUT":
-                return _ask_text_prompt(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
-            return _update_menu(wa, cid)
-
-        if up == "ADMIN_CANCEL_EDIT":
-            state["await"] = None
-            state["buffer"].pop("PENDING_NAME", None)
-            state["buffer"].pop("PENDING_PHONE", None)
-            state["buffer"].pop("PENDING_DOB", None)
-            state["buffer"].pop("PENDING_MEDICAL", None)
-            state["buffer"].pop("PENDING_CREDITS_DELTA", None)
-            return _update_menu(wa, cid)
-
-        # SAVE branches with undo tracking:
-        if up == "ADMIN_SAVE_NAME":
-            new_name = state["buffer"].get("PENDING_NAME")
-            if new_name is None:
-                return _update_menu(wa, cid)
-            old = prof.get("name")
-            _save_name(cid, new_name)
-            state["undo"] = {"field": "name", "cid": cid, "old": old}
-            state["await"] = None
-            state["buffer"].pop("PENDING_NAME", None)
-            send_whatsapp_buttons(wa, f"✅ Name updated.\nUndo?", [
-                {"id": "ADMIN_UNDO_LAST",   "title": "↩️ Undo"},
-                {"id": "ADMIN_UPDATE_BACK", "title": "Back"},
-            ])
-            return
-
-        if up == "ADMIN_SAVE_PHONE":
-            new_phone = state["buffer"].get("PENDING_PHONE")
-            if new_phone is None:
-                return _update_menu(wa, cid)
-            old = prof.get("wa_number")
-            _save_phone(cid, new_phone)
-            state["undo"] = {"field": "wa_number", "cid": cid, "old": old}
-            state["await"] = None
-            state["buffer"].pop("PENDING_PHONE", None)
-            send_whatsapp_buttons(wa, f"✅ Phone updated.\nUndo?", [
-                {"id": "ADMIN_UNDO_LAST",   "title": "↩️ Undo"},
-                {"id": "ADMIN_UPDATE_BACK", "title": "Back"},
-            ])
-            return
-
-        if up == "ADMIN_SAVE_DOB":
-            tup = state["buffer"].get("PENDING_DOB")
-            if not tup:
-                return _update_menu(wa, cid)
-            old = (prof.get("birthday_day"), prof.get("birthday_month"))
-            d, m = tup
-            _save_dob(cid, int(d), int(m))
-            state["undo"] = {"field": "dob", "cid": cid, "old": old}
-            state["await"] = None
-            state["buffer"].pop("PENDING_DOB", None)
-            send_whatsapp_buttons(wa, f"✅ DOB updated.\nUndo?", [
-                {"id": "ADMIN_UNDO_LAST",   "title": "↩️ Undo"},
-                {"id": "ADMIN_UPDATE_BACK", "title": "Back"},
-            ])
-            return
-
-        if up == "ADMIN_SAVE_MEDICAL":
-            obj = state["buffer"].get("PENDING_MEDICAL") or {}
-            text_new = obj.get("text", "")
-            append = obj.get("append", True)
-            old_full = prof.get("medical_notes") or ""
-            _save_medical(cid, text_new, append=append if text_new else False)
-            state["undo"] = {"field": "medical_notes", "cid": cid, "old": old_full}
-            state["await"] = None
-            state["buffer"].pop("PENDING_MEDICAL", None)
-            send_whatsapp_buttons(wa, f"✅ Medical notes updated.\nUndo?", [
-                {"id": "ADMIN_UNDO_LAST",   "title": "↩️ Undo"},
-                {"id": "ADMIN_UPDATE_BACK", "title": "Back"},
-            ])
-            return
-
-        if up == "ADMIN_SAVE_CREDITS":
-            delta = state["buffer"].get("PENDING_CREDITS_DELTA")
-            if delta is None:
-                return _update_menu(wa, cid)
-            prof = crud.get_client_profile(cid)
-            old = prof.get("credits", 0)
-            _adjust_credits(cid, int(delta))
-            state["undo"] = {"field": "credits", "cid": cid, "old": old}
-            state["await"] = None
-            state["buffer"].pop("PENDING_CREDITS_DELTA", None)
-            new = old + int(delta)
-            send_whatsapp_buttons(wa, f"✅ Credits updated: {old} → {new}\nUndo?", [
-                {"id": "ADMIN_UNDO_LAST",   "title": "↩️ Undo"},
-                {"id": "ADMIN_UPDATE_BACK", "title": "Back"},
-            ])
-            return
-
-    # ──────────────────────────────────────────────────────────────────────
-    # NLP fallback & strict template backups (unchanged behavior)
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Single-word intents typed
     low = raw.lower()
-    if low in ("new", "update", "cancel", "view", "book"):
-        # Map to the same interactive intents
-        return handle_admin_action(wa, f"ADMIN_INTENT_{low.upper()}")
+    if low in ("new", "update", "cancel", "view", "book", "inbox"):
+        map_word = {
+            "new": "ADMIN_INTENT_NEW",
+            "update": "ADMIN_INTENT_UPDATE",
+            "cancel": "ADMIN_INTENT_CANCEL",
+            "view": "ADMIN_INTENT_VIEW",
+            "book": "ADMIN_INTENT_BOOK",
+            "inbox": "ADMIN_INTENT_CANCEL_INBOX",
+        }
+        return handle_admin_action(wa, map_word[low])
 
-    # Try your NLP helpers if not in a wizard state
-    if not state.get("await"):
+    # ── NLP fallbacks
+    if not state.get("await_"):
         nlp = parse_admin_client_command(raw) or parse_admin_command(raw)
         if nlp:
             intent = nlp.get("intent")
             if intent == "add_client":
-                ok, norm, err = _normalize_and_validate_sa(nlp["number"])
-                if not ok:
-                    return send_whatsapp_text(wa, f"⚠️ Invalid phone.\n{err}")
-                res = crud.create_client(nlp["name"], norm)
+                res = crud.create_client(nlp["name"], normalize_wa(nlp["number"]))
                 return send_whatsapp_text(wa, "✅ Client added." if res else "⚠️ Could not add client.")
             if intent == "update_dob":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
@@ -777,265 +477,297 @@ def handle_admin_action(sender: str, text: str):
             if intent == "cancel_next":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
-                okf = getattr(crud, "cancel_next_booking_for_client", lambda *_: False)(match[0]["id"])
-                return send_whatsapp_text(wa, "✅ Next session cancelled." if okf else "⚠️ No upcoming booking found.")
+                ok = getattr(crud, "cancel_next_booking_for_client", lambda *_: False)(match[0]["id"])
+                return send_whatsapp_text(wa, "✅ Next session cancelled." if ok else "⚠️ No upcoming booking found.")
             if intent == "off_sick_today":
                 return send_whatsapp_text(wa, "✅ Noted off sick (stub).")
             if intent == "no_show_today":
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
-                okn = getattr(crud, "mark_no_show_today", lambda *_: False)(match[0]["id"])
-                return send_whatsapp_text(wa, "✅ No-show recorded." if okn else "⚠️ No booking found today.")
+                ok = getattr(crud, "mark_no_show_today", lambda *_: False)(match[0]["id"])
+                return send_whatsapp_text(wa, "✅ No-show recorded." if ok else "⚠️ No booking found today.")
             if intent == "book_single":
                 sess = getattr(crud, "find_session_by_date_time", lambda *_: None)(date.fromisoformat(nlp["date"]), nlp["time"])
                 if not sess: return send_whatsapp_text(wa, "⚠️ No matching session found.")
                 match = crud.find_clients_by_name(nlp["name"], limit=1)
                 if not match: return send_whatsapp_text(wa, "⚠️ No client found.")
                 prof = crud.get_client_profile(match[0]["id"])
-                okb = booking.admin_reserve(prof["wa_number"], sess["id"], seats=1)
-                return send_whatsapp_text(wa, "✅ Booked." if okb else "⚠️ Could not book (full?).")
+                ok = booking.admin_reserve(prof["wa_number"], sess["id"], seats=1)
+                return send_whatsapp_text(wa, "✅ Booked." if ok else "⚠️ Could not book (full?).")
             if intent == "book_recurring":
                 return send_whatsapp_text(wa, "✅ Recurring booking stub (wire your weekly finder).")
 
-    # Interactive day/slots (legacy list navigation kept)
-    if raw.startswith("ADMIN_DAY_"):
-        d = raw.replace("ADMIN_DAY_", "")
-        try:
-            slots = crud.list_slots_for_day(date.fromisoformat(d))
-            rows = [{"id": f"ADMIN_SLOT_{r['id']}", "title": str(r["start_time"]), "description": f"seats {r['seats_left']}"} for r in slots]
-            return send_whatsapp_list(wa, f"Slots {d}", "Pick a slot:", "ADMIN_MENU", rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
-        except Exception as e:
-            logging.exception(e)
-            return _root_menu(wa)
-
-    if raw.startswith("ADMIN_VIEW_"):
-        cid_s = raw.replace("ADMIN_VIEW_", "")
-        cid = int(cid_s) if cid_s.isdigit() else None
-        prof = crud.get_client_profile(cid) if cid else None
-        if not prof:
-            return send_whatsapp_text(wa, "Client not found.")
-        return send_whatsapp_text(wa, _profile_text(cid))
-
-    # Strict templates backup (unchanged, grouped here)
-    _strict = _strict_templates_handler(wa, raw)
-    if _strict is not None:
-        return _strict
-
-    # Default → root menu
+    # Otherwise, show the root
     return _root_menu(wa)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# NEW CLIENT WIZARD
+# ──────────────────────────────────────────────────────────────────────────────
+def _start_new(wa: str, state: dict):
+    _set_state(wa, await_="NAME", buffer={}, cid=None)
+    return _ask_free_text(wa, "New Client", "Reply with the client's full name.", "ADMIN_INTENT_NEW")
+
+def _new_next(wa: str, state: dict):
+    step = state.get("await_")
+    buf = state.get("buffer", {})
+    if step == "NAME":
+        _set_state(wa, await_="PHONE")
+        return _ask_free_text(wa, "New Client", "Reply with the client's phone (0XXXXXXXXX, +27…, or 27…).", "ADMIN_INTENT_NEW")
+    if step == "PHONE":
+        _set_state(wa, await_="PLAN")
+        return _ask_free_text(wa, "New Client", "Reply with plan: 1x, 2x, or 3x.", "ADMIN_INTENT_NEW")
+    if step == "PLAN":
+        _set_state(wa, await_="DOB")
+        return _ask_free_text(wa, "New Client", "Reply DOB as DD MON (e.g., 21 MAY).", "ADMIN_INTENT_NEW")
+    if step == "DOB":
+        _set_state(wa, await_="MEDICAL")
+        return _ask_free_text(wa, "New Client", "Medical notes (optional). Reply '-' to skip.", "ADMIN_INTENT_NEW")
+    if step == "MEDICAL":
+        name = (buf.get("NAME") or "").strip()
+        phone = normalize_wa(buf.get("PHONE") or "")
+        plan = (buf.get("PLAN") or "").lower()
+        day, mon = buf.get("DOB_DAY"), buf.get("DOB_MON")
+        medical = (buf.get("MEDICAL") or "").strip()
+
+        row = crud.create_client(name, phone) or crud.get_or_create_client(phone)
+        cid = row["id"]
+        if plan in ("1x", "2x", "3x"):
+            _save_plan(cid, plan)
+        if day and mon:
+            try:
+                crud.update_client_dob(cid, int(day), int(mon))
+            except Exception:
+                logging.exception("DOB update failed")
+        if medical and medical != "-":
+            crud.update_client_medical(cid, medical, append=False)
+
+        _set_state(wa, flow=None, await_=None, cid=None, buffer={}, book={}, page=0)
+        send_whatsapp_text(wa, "✅ New client saved.")
+        return _root_menu(wa)
+
+    return _start_new(wa, state)
+
+def _capture_free_text(wa: str, state: dict, raw: str):
+    field = state.get("await_")
+    txt = (raw or "").strip()
+
+    # NEW flow capture
+    if state.get("flow") == "NEW":
+        buf = state.setdefault("buffer", {})
+        if field == "NAME":
+            if len(txt) < 2:
+                return _ask_free_text(wa, "New Client", "Name seems too short — please reply with full name.", "ADMIN_INTENT_NEW")
+            buf["NAME"] = txt.title()[:120]
+            state["await_"] = "PHONE"
+            return _ask_free_text(wa, "New Client", "Reply with the client's phone (0XXXXXXXXX, +27…, or 27…).", "ADMIN_INTENT_NEW")
+
+        if field == "PHONE":
+            norm = normalize_wa(txt)
+            if not norm.startswith("+27"):
+                return _ask_free_text(wa, "New Client", "Please send a valid SA phone (0…, 27…, or +27…).", "ADMIN_INTENT_NEW")
+            buf["PHONE"] = norm
+            state["await_"] = "PLAN"
+            return _ask_free_text(wa, "New Client", "Reply with plan: 1x, 2x, or 3x.", "ADMIN_INTENT_NEW")
+
+        if field == "PLAN":
+            low = txt.lower()
+            if low not in ("1x", "2x", "3x"):
+                return _ask_free_text(wa, "New Client", "Please reply with 1x, 2x, or 3x.", "ADMIN_INTENT_NEW")
+            buf["PLAN"] = low
+            state["await_"] = "DOB"
+            return _ask_free_text(wa, "New Client", "Reply DOB as DD MON (e.g., 21 MAY).", "ADMIN_INTENT_NEW")
+
+        if field == "DOB":
+            m = re.fullmatch(r"\s*(\d{1,2})\s+([A-Za-z]{3,})\s*", txt)
+            if not m:
+                return _ask_free_text(wa, "New Client", "Format DD MON (e.g., 21 MAY).", "ADMIN_INTENT_NEW")
+            day_s, mon_s = m.group(1), m.group(2)
+            mon_i = _month_to_int(mon_s)
+            if mon_i is None:
+                return _ask_free_text(wa, "New Client", "Month must be JAN, FEB, …", "ADMIN_INTENT_NEW")
+            buf["DOB_DAY"], buf["DOB_MON"] = day_s, mon_i
+            state["await_"] = "MEDICAL"
+            return _ask_free_text(wa, "New Client", "Medical notes (optional). Reply '-' to skip.", "ADMIN_INTENT_NEW")
+
+        if field == "MEDICAL":
+            buf["MEDICAL"] = txt[:500]
+            state["await_"] = "MEDICAL"
+            return handle_admin_action(wa, "ADMIN_NEW_NEXT")
+
+    # UPDATE flow capture
+    if state.get("flow") == "UPDATE" and state.get("cid"):
+        cid = state["cid"]
+        if field == "NAME":
+            if len(txt) < 2:
+                return _ask_free_text(wa, "Edit Name", "Name seems too short — please reply with full name.")
+            _save_name(cid, txt.title()[:120])
+            state["await_"] = None
+            send_whatsapp_text(wa, "✅ Name updated.")
+            return _update_menu(wa, cid)
+
+        if field == "PLAN":
+            low = txt.lower()
+            if low not in ("1x", "2x", "3x"):
+                return _ask_free_text(wa, "Edit Plan", "Please reply with 1x, 2x, or 3x.")
+            _save_plan(cid, low)
+            state["await_"] = None
+            send_whatsapp_text(wa, "✅ Plan updated.")
+            return _update_menu(wa, cid)
+
+        if field == "MEDICAL":
+            crud.update_client_medical(cid, txt[:500], append=False)
+            state["await_"] = None
+            send_whatsapp_text(wa, "✅ Medical notes updated.")
+            return _update_menu(wa, cid)
+
+        if field == "CREDITS":
+            m = re.fullmatch(r"\s*([+-]?\d+)\s*", txt)
+            if not m:
+                return _ask_free_text(wa, "Adjust Credits", "Reply with +N or -N (e.g., +1, -2).")
+            delta = int(m.group(1))
+            _save_credits_delta(cid, delta)
+            state["await_"] = None
+            send_whatsapp_text(wa, f"✅ Credits adjusted by {delta}.")
+            return _update_menu(wa, cid)
+
+        if field == "DOB":
+            m = re.fullmatch(r"\s*(\d{1,2})\s+([A-Za-z]{3,})\s*", txt)
+            if not m:
+                return _ask_free_text(wa, "Edit DOB", "Format DD MON (e.g., 21 MAY).")
+            day_s, mon_s = m.group(1), m.group(2)
+            mon_i = _month_to_int(mon_s)
+            if mon_i is None:
+                return _ask_free_text(wa, "Edit DOB", "Month must be JAN, FEB, …")
+            crud.update_client_dob(cid, int(day_s), int(mon_i))
+            state["await_"] = None
+            send_whatsapp_text(wa, "✅ DOB updated.")
+            return _update_menu(wa, cid)
+
+        if field == "PHONE":
+            try:
+                _save_phone(cid, txt)
+            except Exception as e:
+                return _ask_free_text(wa, "Edit Phone", f"{e}. Try again.")
+            state["await_"] = None
+            send_whatsapp_text(wa, "✅ Phone updated.")
+            return _update_menu(wa, cid)
+
+    # default
+    state["await_"] = None
+    return _root_menu(wa)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Strict template backups (unchanged, grouped here)
+# Cancel request decisions (admin)
 # ──────────────────────────────────────────────────────────────────────────────
-TEMPLATE_HELP = (
-    "🧭 *Admin Command Templates (exact)*\n"
-    "• ADD CLIENT \"Full Name\" PHONE 0XXXXXXXXX\n"
-    "• SET DOB \"Full Name\" DD MON      (e.g., 21 MAY)\n"
-    "• ADD NOTE \"Full Name\" - free text note\n"
-    "• CANCEL NEXT \"Full Name\"\n"
-    "• NOSHOW TODAY \"Full Name\"\n"
-    "• BOOK \"Full Name\" ON YYYY-MM-DD HH:MM\n"
-    "• SHOW CLIENTS\n"
-    "• SHOW SLOTS\n"
-    "• VIEW \"Full Name\""
-)
+def _admin_cancel_request_decide(wa: str, req_id: int, decision: str):
+    """
+    decision ∈ {'confirmed','declined','reschedule'}
+    On confirmed: mark bookings.status='cancelled', decrement sessions.booked_count, mark cancel_requests.status='confirmed', notify client.
+    On declined/reschedule: mark cancel_requests.status, notify client.
+    """
+    try:
+        req = crud.get_cancel_request(req_id)
+        if not req:
+            return send_whatsapp_text(wa, f"⚠️ Cancel request #{req_id} not found.")
+    except Exception:
+        logging.exception("get_cancel_request failed")
+        return send_whatsapp_text(wa, f"⚠️ Cancel request #{req_id} not found.")
 
-def _show_template(recipient: str, error_msg: str | None = None):
-    if error_msg:
-        send_whatsapp_text(recipient, f"⚠️ {error_msg}\n\n{TEMPLATE_HELP}")
-    else:
-        send_whatsapp_text(recipient, TEMPLATE_HELP)
+    client = crud.get_client_profile(req["client_id"]) if req.get("client_id") else None
+    client_wa = normalize_wa(client["wa_number"]) if client else None
+    hhmm = str(req.get("start_time"))[:5] if req.get("start_time") else "time"
 
-def _build_token(action: str, **kwargs) -> str:
-    parts = [action.upper()]
-    for k, v in kwargs.items():
-        parts.append(f"{k}={quote(str(v))}")
-    return "ADMIN_CONFIRM__" + "|".join(parts)
-
-def _parse_token(payload: str) -> tuple[str, dict]:
-    if payload.startswith("ADMIN_CONFIRM__"):
-        payload = payload[len("ADMIN_CONFIRM__"):]
-    pieces = payload.split("|")
-    action = pieces[0].upper() if pieces else ""
-    args = {}
-    for p in pieces[1:]:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            args[k] = unquote(v)
-    return action, args
-
-def _resolve_single_client(sender: str, name: str, next_prefix: str | None = None):
-    matches = crud.find_clients_by_name(name, limit=6)
-    if not matches:
-        send_whatsapp_text(sender, f"⚠️ No client matching “{name}”.")
-        return None
-    if len(matches) == 1 or not next_prefix:
-        return matches[0]
-    rows = [{"id": f"{next_prefix}{m['id']}", "title": m["name"][:24], "description": m["wa_number"]} for m in matches]
-    send_whatsapp_list(sender, "Who do you mean?", "Pick a client:", "ADMIN_MENU", rows)
-    return None
-
-def _strict_templates_handler(sender: str, raw: str):
-    up = raw.upper()
-
-    # Menu/help shortcuts
-    if up in ("ADMIN", "ADMIN_MENU"):
-        return _root_menu(sender)
-    if up in ("HELP", "ADMIN_HELP", "?"):
-        return _show_template(sender, None)
-    if up in ("SHOW CLIENTS", "LIST CLIENTS", "ADMIN_LIST_CLIENTS"):
-        clients = crud.list_clients(limit=20)
-        rows = [{"id": f"ADMIN_VIEW_{c['id']}", "title": c["name"][:24], "description": f"{c['wa_number']} • {c.get('credits',0)} cr"} for c in clients]
-        return send_whatsapp_list(sender, "Clients", "Latest clients:", "ADMIN_MENU",
-                                  rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
-    if up in ("SHOW SLOTS", "LIST SLOTS", "ADMIN_LIST_SLOTS"):
-        days = crud.list_days_with_open_slots(days=21, limit_days=10)
-        rows = [{"id": f"ADMIN_DAY_{d['session_date']}", "title": str(d['session_date']), "description": f"{d['slots']} open"} for d in days]
-        return send_whatsapp_list(sender, "Open Slots", "Choose a day:", "ADMIN_MENU",
-                                  rows or [{"id": "ADMIN_MENU", "title": "⬅️ Menu"}])
-
-    # 1) ADD CLIENT "Full Name" PHONE 0XXXXXXXXX
-    m = re.fullmatch(r'\s*ADD\s+CLIENT\s+"(.+?)"\s+PHONE\s+([+\d][\d\s-]+)\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name = m.group(1).strip()
-        phone_raw = re.sub(r"[\s-]+", "", m.group(2))
-        ok, norm, err = _normalize_and_validate_sa(phone_raw)
-        if not ok:
-            return send_whatsapp_text(sender, f"⚠️ Invalid phone.\n{err}")
-        summary = f"Add client:\n• Name: {name}\n• Phone: {norm}"
-        token = _build_token("ADD_CLIENT", name=name, phone=norm)
-        return send_whatsapp_buttons(sender, summary, [
-            {"id": token, "title": "Confirm"},
-            {"id": "ADMIN_ABORT", "title": "Cancel"},
-        ])
-
-    # 2) SET DOB "Full Name" DD MON
-    m = re.fullmatch(r'\s*SET\s+DOB\s+"(.+?)"\s+(\d{1,2})\s+([A-Za-z]{3,})\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name, day_s, mon_s = m.group(1).strip(), m.group(2), m.group(3)
-        mon_i = _month_to_int(mon_s)
-        if mon_i is None:
-            return _show_template(sender, "Invalid month (use JAN, FEB, …).")
-        client = _resolve_single_client(sender, name)
-        if not client:
-            return None
-        summary = f"Set DOB:\n• Client: {client['name']}\n• DOB: {day_s} {mon_s.upper()}"
-        token = _build_token("SET_DOB", cid=client["id"], day=day_s, mon=mon_i)
-        return send_whatsapp_buttons(sender, summary, [
-            {"id": token, "title": "Confirm"},
-            {"id": "ADMIN_ABORT", "title": "Cancel"},
-        ])
-
-    # 3) ADD NOTE "Full Name" - free text
-    m = re.fullmatch(r'\s*ADD\s+NOTE\s+"(.+?)"\s*-\s*(.+)\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name, note = m.group(1).strip(), m.group(2).strip()
-        client = _resolve_single_client(sender, name)
-        if not client:
-            return None
-        summary = f"Add Note:\n• Client: {client['name']}\n• Note: {note}"
-        token = _build_token("ADD_NOTE", cid=client["id"], note=note)
-        return send_whatsapp_buttons(sender, summary, [
-            {"id": token, "title": "Confirm"},
-            {"id": "ADMIN_ABORT", "title": "Cancel"},
-        ])
-
-    # 4) CANCEL NEXT "Full Name"
-    m = re.fullmatch(r'\s*CANCEL\s+NEXT\s+"(.+?)"\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name = m.group(1).strip()
-        client = _resolve_single_client(sender, name)
-        if not client:
-            return None
-        summary = f"Cancel next session:\n• Client: {client['name']}"
-        token = _build_token("CANCEL_NEXT", cid=client["id"])
-        return send_whatsapp_buttons(sender, summary, [
-            {"id": token, "title": "Confirm"},
-            {"id": "ADMIN_ABORT", "title": "Cancel"},
-        ])
-
-    # 5) NOSHOW TODAY "Full Name"
-    m = re.fullmatch(r'\s*NOSHOW\s+TODAY\s+"(.+?)"\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name = m.group(1).strip()
-        client = _resolve_single_client(sender, name)
-        if not client:
-            return None
-        summary = f"No-show today:\n• Client: {client['name']}"
-        token = _build_token("NOSHOW_TODAY", cid=client["id"])
-        return send_whatsapp_buttons(sender, summary, [
-            {"id": token, "title": "Confirm"},
-            {"id": "ADMIN_ABORT", "title": "Cancel"},
-        ])
-
-    # 6) BOOK "Full Name" ON YYYY-MM-DD HH:MM
-    m = re.fullmatch(r'\s*BOOK\s+"(.+?)"\s+ON\s+(\d{4}-\d{2}-\d{2})\s+([0-2]?\d:\d{2})\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name, dstr, hhmm = m.group(1).strip(), m.group(2), m.group(3)
-        client = _resolve_single_client(sender, name)
-        if not client:
-            return None
-        summary = f"Book session:\n• Client: {client['name']}\n• When: {dstr} {hhmm}"
-        token = _build_token("BOOK_DT", cid=client["id"], d=dstr, t=hhmm)
-        return send_whatsapp_buttons(sender, summary, [
-            {"id": token, "title": "Confirm"},
-            {"id": "ADMIN_ABORT", "title": "Cancel"},
-        ])
-
-    # 7) VIEW "Full Name"
-    m = re.fullmatch(r'\s*VIEW\s+"(.+?)"\s*', raw, flags=re.IGNORECASE)
-    if m:
-        name = m.group(1).strip()
-        client = _resolve_single_client(sender, name)
-        if not client:
-            return None
-        prof = crud.get_client_profile(client["id"])
-        if not prof:
-            return send_whatsapp_text(sender, "Client not found.")
-        return send_whatsapp_text(sender, _profile_text(client["id"]))
-
-    # Button confirmations for strict templates
-    if raw.startswith("ADMIN_CONFIRM__"):
-        action, args = _parse_token(raw)
-        logging.info(f"[ADMIN CONFIRM] action={action} args={args}")
+    if decision == "confirmed":
         try:
-            if action == "ADD_CLIENT":
-                res = crud.create_client(args["name"], args["phone"])
-                if not res:
-                    return send_whatsapp_text(sender, "⚠️ Could not add client.")
-                prof = crud.get_client_profile(res["id"])
-                return send_whatsapp_text(sender, "✅ *Client added*\n" + _profile_text(prof["id"]))
+            _confirm_cancel_inline(req)
+            _mark_cancel_request_status(req_id, "confirmed")
+            if client_wa:
+                send_whatsapp_text(client_wa, f"✅ Your {hhmm} session has been cancelled. We’ll carry your credit over and help you reschedule.")
+            return send_whatsapp_text(wa, f"✅ Cancelled booking #{req['booking_id']} and updated counts.")
+        except Exception:
+            logging.exception("confirm cancel failed")
+            return send_whatsapp_text(wa, "⚠️ Failed to cancel booking. Please try again.")
 
-            if action == "SET_DOB":
-                ok = crud.update_client_dob(int(args["cid"]), int(args["day"]), int(args["mon"]))
-                return send_whatsapp_text(sender, "✅ DOB updated." if ok else "⚠️ Update failed.")
+    if decision == "declined":
+        try:
+            _mark_cancel_request_status(req_id, "declined")
+            if client_wa:
+                send_whatsapp_text(client_wa, f"ℹ️ Cancellation for your {hhmm} session was not approved. Please contact the studio if needed.")
+            return send_whatsapp_text(wa, f"✅ Declined cancel request #{req_id}.")
+        except Exception:
+            logging.exception("decline cancel failed")
+            return send_whatsapp_text(wa, "⚠️ Failed to update request.")
 
-            if action == "ADD_NOTE":
-                ok = crud.update_client_medical(int(args["cid"]), args["note"], append=True)
-                return send_whatsapp_text(sender, "✅ Note added." if ok else "⚠️ Update failed.")
+    if decision == "reschedule":
+        try:
+            _mark_cancel_request_status(req_id, "reschedule")
+            if client_wa:
+                send_whatsapp_text(client_wa, f"📅 We’ll reschedule your {hhmm} session. The studio will message you with options.")
+            return send_whatsapp_text(wa, f"✅ Marked request #{req_id} for reschedule.")
+        except Exception:
+            logging.exception("reschedule mark failed")
+            return send_whatsapp_text(wa, "⚠️ Failed to update request.")
 
-            if action == "CANCEL_NEXT":
-                ok = crud.cancel_next_booking_for_client(int(args["cid"]))
-                return send_whatsapp_text(sender, "✅ Next session cancelled. (Credit +1)") if ok else send_whatsapp_text(sender, "⚠️ No upcoming booking found.")
+    return send_whatsapp_text(wa, "Unknown decision.")
 
-            if action == "NOSHOW_TODAY":
-                ok = crud.mark_no_show_today(int(args["cid"]))
-                return send_whatsapp_text(sender, "✅ No-show recorded.") if ok else send_whatsapp_text(sender, "⚠️ No booking found today.")
+def _get_cancel_request_inline(req_id: int) -> Optional[dict]:
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT
+              r.id,
+              r.booking_id,
+              r.client_id,
+              r.session_id,
+              r.status,
+              r.reason,
+              r.via,
+              r.created_at,
+              s.session_date,
+              s.start_time,
+              c.name AS client_name
+            FROM cancel_requests r
+            JOIN sessions s ON s.id = r.session_id
+            JOIN clients  c ON c.id = r.client_id
+            WHERE r.id = :rid
+        """), {"rid": req_id}).mappings().first()
+        return dict(row) if row else None
 
-            if action == "BOOK_DT":
-                sess = crud.find_session_by_date_time(date.fromisoformat(args["d"]), args["t"])
-                if not sess:
-                    return send_whatsapp_text(sender, "⚠️ No matching session found.")
-                ok = crud.create_booking(sess["id"], int(args["cid"]), seats=1, status="confirmed")
-                return send_whatsapp_text(sender, "✅ Booked.") if ok else send_whatsapp_text(sender, "⚠️ Could not book (full?).")
+def _mark_cancel_request_status(req_id: int, status: str):
+    with get_session() as s:
+        s.execute(text("""
+            UPDATE cancel_requests
+               SET status = :st
+             WHERE id = :rid
+        """), {"st": status, "rid": req_id})
 
-        except Exception as e:
-            logging.exception(e)
-            return send_whatsapp_text(sender, "⚠️ Error performing action.")
+def _confirm_cancel_inline(req: dict):
+    with get_session() as s:
+        b = s.execute(text("SELECT seats, session_id FROM bookings WHERE id=:bid FOR UPDATE"),
+                      {"bid": req["booking_id"]}).mappings().first()
+        if not b:
+            raise ValueError("booking not found")
+        seats = int(b.get("seats") or 1)
+        sess_id = int(b["session_id"])
 
-    if raw == "ADMIN_ABORT":
-        return send_whatsapp_text(sender, "Cancelled.")
+        s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:bid"),
+                  {"bid": req["booking_id"]})
 
-    # Not a strict-template input
-    return None
+        s.execute(text("""
+            UPDATE sessions
+               SET booked_count = GREATEST(booked_count - :seats, 0),
+                   status = CASE WHEN booked_count - :seats < capacity THEN 'open' ELSE status END
+             WHERE id = :sid
+        """), {"seats": seats, "sid": sess_id})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+def _month_to_int(mon: str) -> int | None:
+    mon = mon.strip().lower()
+    table = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
+        "nov": 11, "november": 11, "dec": 12, "december": 12
+    }
+    return table.get(mon)

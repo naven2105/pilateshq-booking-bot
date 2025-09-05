@@ -1,142 +1,177 @@
-# app/crud.py
-from __future__ import annotations
-
-from typing import Optional, List, Dict
 from sqlalchemy import text
+from typing import Optional, Dict, List
 from .db import get_session
-from .config import TZ_NAME  # e.g. "Africa/Johannesburg"
+from .config import TZ_NAME
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BOOKINGS / UPCOMING
-# ──────────────────────────────────────────────────────────────────────────────
-
-def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
-    """
-    Return the next upcoming confirmed booking (soonest future session) for this
-    WhatsApp number, or None if not found.
-
-    Notes:
-    - Time comparisons are done in local time (TZ_NAME) by converting DB now().
-    - We compare (session_date + start_time) to local 'now' for correctness.
-    """
-    from .utils import normalize_wa
-    wa = normalize_wa(wa_number)
-
-    with get_session() as s:
-        row = s.execute(
-            text(f"""
-                WITH now_local AS (
-                    SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-                )
-                SELECT
-                    b.id AS booking_id,
-                    s.id AS session_id,
-                    s.session_date,
-                    s.start_time,
-                    c.id AS client_id,
-                    c.name,
-                    c.wa_number
-                FROM bookings b
-                JOIN sessions s ON s.id = b.session_id
-                JOIN clients  c ON c.id = b.client_id
-                , now_local
-                WHERE c.wa_number = :wa
-                  AND b.status = 'confirmed'
-                  AND (s.session_date + s.start_time) > now_local.ts
-                ORDER BY s.session_date, s.start_time
-                LIMIT 1
-            """),
-            {"wa": wa, "tz": TZ_NAME},
-        ).mappings().first()
-        return dict(row) if row else None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CLIENT LISTING / SEARCH (used by admin picker)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def list_clients(limit: int = 10, offset: int = 0) -> List[Dict]:
-    """
-    Return a simple paginated list of clients for the admin picker.
-    Sorted by name then id. Fields kept small to fit WhatsApp list rows.
-    """
-    with get_session() as s:
-        rows = s.execute(
-            text("""
-                SELECT
-                    id,
-                    COALESCE(name, '')       AS name,
-                    COALESCE(wa_number, '')  AS wa_number,
-                    COALESCE(plan, '')       AS plan,
-                    COALESCE(credits, 0)     AS credits
-                FROM clients
-                ORDER BY COALESCE(name, ''), id
-                LIMIT :lim OFFSET :off
-            """),
-            {"lim": int(limit), "off": int(offset)},
-        ).mappings().all()
-        return [dict(r) for r in rows]
-
-
-def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> List[Dict]:
-    """
-    Case-insensitive search by name (substring). Falls back to list if query is empty.
-
-    Implementation:
-    - Uses ILIKE for case-insensitive contains. For very large tables, consider
-      adding a trigram index or switching name column to CITEXT type.
-    """
-    q = (q or "").strip()
-    if not q:
-        return list_clients(limit=limit, offset=offset)
-
-    with get_session() as s:
-        rows = s.execute(
-            text("""
-                SELECT
-                    id,
-                    COALESCE(name, '')       AS name,
-                    COALESCE(wa_number, '')  AS wa_number,
-                    COALESCE(plan, '')       AS plan,
-                    COALESCE(credits, 0)     AS credits
-                FROM clients
-                WHERE COALESCE(name, '') ILIKE :needle
-                ORDER BY COALESCE(name, ''), id
-                LIMIT :lim OFFSET :off
-            """),
-            {"needle": f"%{q}%", "lim": int(limit), "off": int(offset)},
-        ).mappings().all()
-        return [dict(r) for r in rows]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SESSIONS (tiny helper referenced by admin flow)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def find_session_by_date_time(d_iso: str, hhmm: str) -> Optional[Dict]:
-    """
-    Look up a session row by exact date string 'YYYY-MM-DD' and time 'HH:MM'.
-    Returns mapping {id, session_date, start_time, capacity, booked_count, status, notes} or None.
-
-    Useful for command: BOOK "<Name>" ON YYYY-MM-DD HH:MM
-    """
+def create_cancel_request(booking_id: int, client_id: int, session_id: int, reason: str = "", via: str = "client") -> Dict:
     with get_session() as s:
         row = s.execute(
             text("""
-                SELECT
-                    id,
-                    session_date,
-                    start_time,
-                    capacity,
-                    booked_count,
-                    status,
-                    COALESCE(notes,'') AS notes
-                FROM sessions
-                WHERE session_date = :d::date
-                  AND start_time   = :t::time
-                LIMIT 1
+                INSERT INTO cancel_requests (booking_id, client_id, session_id, reason, via, status)
+                VALUES (:bid, :cid, :sid, :reason, :via, 'open')
+                RETURNING id, booking_id, client_id, session_id, status, created_at
             """),
-            {"d": d_iso, "t": hhmm},
+            {"bid": booking_id, "cid": client_id, "sid": session_id, "reason": reason[:400], "via": via},
+        ).mappings().first()
+        return dict(row)
+
+def get_cancel_request(req_id: int) -> Optional[Dict]:
+    with get_session() as s:
+        row = s.execute(
+            text("""
+                SELECT cr.*, c.name, c.wa_number, s.session_date, s.start_time,
+                       b.status AS booking_status
+                FROM cancel_requests cr
+                JOIN clients  c ON c.id = cr.client_id
+                JOIN sessions s ON s.id = cr.session_id
+                JOIN bookings b ON b.id = cr.booking_id
+                WHERE cr.id = :rid
+            """),
+            {"rid": req_id},
         ).mappings().first()
         return dict(row) if row else None
+
+def list_open_cancel_requests(limit: int = 20) -> List[Dict]:
+    with get_session() as s:
+        rows = s.execute(
+            text("""
+                SELECT cr.id, cr.booking_id, cr.client_id, cr.session_id, cr.reason, cr.created_at,
+                       c.name, c.wa_number, s.session_date, s.start_time
+                FROM cancel_requests cr
+                JOIN clients  c ON c.id = cr.client_id
+                JOIN sessions s ON s.id = cr.session_id
+                WHERE cr.status = 'open'
+                ORDER BY cr.created_at
+                LIMIT :lim
+            """),
+            {"lim": int(limit)},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+def mark_cancel_request(req_id: int, new_status: str) -> None:
+    with get_session() as s:
+        s.execute(
+            text("""
+                UPDATE cancel_requests
+                SET status = :st, processed_at = CASE WHEN :st IN ('processed','declined') THEN now() ELSE processed_at END
+                WHERE id = :rid
+            """),
+            {"rid": req_id, "st": new_status},
+        )
+
+def apply_booking_cancellation(booking_id: int) -> bool:
+    """
+    Sets booking -> 'cancelled' and decrements the session.booked_count (but not below 0).
+    Returns True if a booking row was updated, else False (already cancelled / missing).
+    """
+    with get_session() as s:
+        # Move booking to cancelled if it is still confirmed
+        res = s.execute(
+            text("""
+                UPDATE bookings
+                SET status = 'cancelled'
+                WHERE id = :bid AND status = 'confirmed'
+                RETURNING session_id
+            """),
+            {"bid": booking_id},
+        ).mappings().first()
+        if not res:
+            return False
+        sess_id = res["session_id"]
+        # Decrement session booked_count safely
+        s.execute(
+            text("""
+                UPDATE sessions
+                SET booked_count = GREATEST(booked_count - 1, 0)
+                WHERE id = :sid
+            """),
+            {"sid": sess_id},
+        )
+        return True
+
+
+def create_cancel_request(booking_id: int, client_id: int, session_id: int, reason: str = "", via: str = "client") -> Dict:
+    with get_session() as s:
+        row = s.execute(
+            text("""
+                INSERT INTO cancel_requests (booking_id, client_id, session_id, reason, via, status)
+                VALUES (:bid, :cid, :sid, :reason, :via, 'open')
+                RETURNING id, booking_id, client_id, session_id, status, created_at
+            """),
+            {"bid": booking_id, "cid": client_id, "sid": session_id, "reason": reason[:400], "via": via},
+        ).mappings().first()
+        return dict(row)
+
+def get_cancel_request(req_id: int) -> Optional[Dict]:
+    with get_session() as s:
+        row = s.execute(
+            text("""
+                SELECT cr.*, c.name, c.wa_number, s.session_date, s.start_time,
+                       b.status AS booking_status
+                FROM cancel_requests cr
+                JOIN clients  c ON c.id = cr.client_id
+                JOIN sessions s ON s.id = cr.session_id
+                JOIN bookings b ON b.id = cr.booking_id
+                WHERE cr.id = :rid
+            """),
+            {"rid": req_id},
+        ).mappings().first()
+        return dict(row) if row else None
+
+def list_open_cancel_requests(limit: int = 20) -> List[Dict]:
+    with get_session() as s:
+        rows = s.execute(
+            text("""
+                SELECT cr.id, cr.booking_id, cr.client_id, cr.session_id, cr.reason, cr.created_at,
+                       c.name, c.wa_number, s.session_date, s.start_time
+                FROM cancel_requests cr
+                JOIN clients  c ON c.id = cr.client_id
+                JOIN sessions s ON s.id = cr.session_id
+                WHERE cr.status = 'open'
+                ORDER BY cr.created_at
+                LIMIT :lim
+            """),
+            {"lim": int(limit)},
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+def mark_cancel_request(req_id: int, new_status: str) -> None:
+    with get_session() as s:
+        s.execute(
+            text("""
+                UPDATE cancel_requests
+                SET status = :st, processed_at = CASE WHEN :st IN ('processed','declined') THEN now() ELSE processed_at END
+                WHERE id = :rid
+            """),
+            {"rid": req_id, "st": new_status},
+        )
+
+def apply_booking_cancellation(booking_id: int) -> bool:
+    """
+    Sets booking -> 'cancelled' and decrements the session.booked_count (but not below 0).
+    Returns True if a booking row was updated, else False (already cancelled / missing).
+    """
+    with get_session() as s:
+        # Move booking to cancelled if it is still confirmed
+        res = s.execute(
+            text("""
+                UPDATE bookings
+                SET status = 'cancelled'
+                WHERE id = :bid AND status = 'confirmed'
+                RETURNING session_id
+            """),
+            {"bid": booking_id},
+        ).mappings().first()
+        if not res:
+            return False
+        sess_id = res["session_id"]
+        # Decrement session booked_count safely
+        s.execute(
+            text("""
+                UPDATE sessions
+                SET booked_count = GREATEST(booked_count - 1, 0)
+                WHERE id = :sid
+            """),
+            {"sid": sess_id},
+        )
+        return True
