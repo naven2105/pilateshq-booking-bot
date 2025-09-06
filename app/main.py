@@ -1,4 +1,20 @@
-import logging
+from flask import Flask
+from .router import register_routes
+from .tasks import register_tasks
+
+app = Flask(__name__)
+
+# Define health ONCE here
+@app.get("/health")
+def health():
+    return "ok", 200
+
+# Register app routes / tasks once (idempotent guards inside)
+register_routes(app)
+register_tasks(app)
+
+
+""" import logging
 import os
 from flask import Flask
 from .db import init_db
@@ -30,4 +46,4 @@ register_tasks(app)  # <— this line must exist
 # Health
 @app.route("/", methods=["GET"])
 def health():
-    return "✅ PilatesHQ Bot is running", 200
+    return "✅ PilatesHQ Bot is running", 200 """
