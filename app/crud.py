@@ -1,9 +1,9 @@
 # app/crud.py
 from __future__ import annotations
-
 from typing import Optional, List, Dict
 from sqlalchemy import text
 from .db import get_session
+from .utils import normalize_wa
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,3 +127,36 @@ def create_cancel_request(
             },
         ).mappings().first()
         return int(row["id"])
+
+def client_exists_by_wa(raw_wa: str) -> bool:
+    """
+    Return True if a client with this WhatsApp number exists (after normalization), else False.
+    """
+    wa = normalize_wa(raw_wa or "")
+    if not wa:
+        return False
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"),
+            {"wa": wa},
+        ).first()
+        return row is not None
+
+def get_client_by_wa(raw_wa: str) -> dict | None:
+    """
+    Fetch a minimal client record by WA number; returns dict or None.
+    """
+    wa = normalize_wa(raw_wa or "")
+    if not wa:
+        return None
+    with get_session() as s:
+        row = s.execute(
+            text("""
+                SELECT id, name, wa_number, plan, credits
+                FROM clients
+                WHERE wa_number = :wa
+                LIMIT 1
+            """),
+            {"wa": wa},
+        ).mappings().first()
+        return dict(row) if row else None
