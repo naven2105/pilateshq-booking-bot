@@ -1,7 +1,10 @@
+# app/router.py
 import logging
-from flask import request, jsonify
+from flask import request
 from .utils import normalize_wa
 from .admin import handle_admin_action
+from .crud import client_exists_by_wa
+from .prospect import start_or_resume  # to log potential clients
 
 def register_routes(app):
     # idempotent guard
