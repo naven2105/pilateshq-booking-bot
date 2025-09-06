@@ -185,3 +185,29 @@ def send_whatsapp_buttons(to: str, body: str, buttons: list[dict], header: str |
         "interactive": interactive,
     }
     return _wa_post(payload)
+
+#Add an image sender
+def send_whatsapp_image(to: str, image_url: str, caption: str | None = None):
+    """
+    Send an image by public HTTPS URL. Uses the same GRAPH_URL / ACCESS_TOKEN as text.
+    """
+    import requests, logging
+    from .config import GRAPH_URL, ACCESS_TOKEN
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "image",
+        "image": {"link": image_url}
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(GRAPH_URL, json=payload, headers=headers, timeout=30)
+    try:
+        logging.info("[WA RESP %s] %s", r.status_code, r.text)
+    except Exception:
+        pass
+    return r.status_code, r.text
