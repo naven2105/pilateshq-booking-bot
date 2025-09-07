@@ -1,5 +1,6 @@
 # app/utils.py
 from __future__ import annotations
+from .config import ADMIN_NUMBERS
 
 import json
 import logging
@@ -227,3 +228,26 @@ def send_admin_text_or_template(
     if USE_TEMPLATES and template_name:
         return send_whatsapp_template(to, template_name, template_components)
     return send_whatsapp_text(to, fallback_text)
+
+#bot always show the full menu after every reply 
+PUBLIC_MENU = (
+    "✨ *PilatesHQ Info*\n"
+    "1) *Address & parking* — 71 Grant Ave, Norwood (safe off-street)\n"
+    "2) *Group sizes* — max 6 per class\n"
+    "3) *Equipment* — Reformers, Wall Units, Wunda chairs, props, mats\n"
+    "4) *Pricing* — Groups from R180\n"
+    "5) *Schedule* — Weekdays 06:00–18:00; Sat 08:00–10:00\n"
+    "6) *How to start* — Most begin with a 1:1 assessment\n\n"
+    "• Reply *BOOK* to start a booking conversation\n"
+    "• Reply *CANCEL* to request a cancellation of your next booking\n"
+    "• Reply *NAME John Smith* to save/update your name"
+)
+
+def send_menu(to: str) -> None:
+    """Send the public menu as a separate message to avoid hitting length limits."""
+    send_whatsapp_text(to, PUBLIC_MENU)
+
+def send_with_menu(to: str, text: str) -> None:
+    """Send a reply, then the menu. Keeps messages short and readable."""
+    send_whatsapp_text(to, text)
+    send_menu(to)
