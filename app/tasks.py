@@ -12,14 +12,15 @@ from .config import NADINE_WA, TZ_NAME
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SQL helpers (Africa/Johannesburg local via AT TIME ZONE)
-# Each query aggregates confirmed attendee names per session.
+# Each query aggregates confirmed attendee names per session via a DISTINCT+ORDER
+# subquery to avoid the Postgres "DISTINCT with ORDER BY" restriction.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _rows_next_hour():
     """
-    Sessions starting within the next hour (local time), plus aggregated names.
+    Sessions starting within the next hour (local time), with aggregated names.
     """
-    sql = text(f"""
+    sql = text("""
         WITH now_local AS (
             SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
         ),
@@ -34,18 +35,20 @@ def _rows_next_hour():
             s.booked_count,
             s.status,
             COALESCE(s.notes, '') AS notes,
-            COALESCE(
-                STRING_AGG(c.name, ', ' ORDER BY c.name)
-                  FILTER (WHERE b.status = 'confirmed'),
-                ''
-            ) AS names
+            COALESCE((
+                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
+                FROM (
+                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
+                    FROM bookings b2
+                    JOIN clients  c2 ON c2.id = b2.client_id
+                    WHERE b2.session_id = s.id
+                      AND b2.status = 'confirmed'
+                ) d
+            ), '') AS names
         FROM sessions s
         CROSS JOIN window
-        LEFT JOIN bookings b ON b.session_id = s.id
-        LEFT JOIN clients  c ON c.id        = b.client_id
         WHERE (s.session_date + s.start_time) >= window.ts
           AND (s.session_date + s.start_time) <  window.ts_plus
-        GROUP BY s.id
         ORDER BY s.start_time;
     """)
     with get_session() as s:
@@ -54,10 +57,10 @@ def _rows_next_hour():
 
 def _rows_today(upcoming_only: bool):
     """
-    Today’s sessions (local date). If upcoming_only=True, start_time >= now_local::time.
+    Today’s sessions (local date).
+    If upcoming_only=True, include start_times >= now_local::time.
     Includes aggregated names.
     """
-    comp = ">=" if upcoming_only else ">="
     time_filter = "AND s.start_time >= (now_local.ts)::time" if upcoming_only else ""
     sql = text(f"""
         WITH now_local AS (
@@ -71,18 +74,20 @@ def _rows_today(upcoming_only: bool):
             s.booked_count,
             s.status,
             COALESCE(s.notes, '') AS notes,
-            COALESCE(
-                STRING_AGG(c.name, ', ' ORDER BY c.name)
-                  FILTER (WHERE b.status = 'confirmed'),
-                ''
-            ) AS names
+            COALESCE((
+                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
+                FROM (
+                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
+                    FROM bookings b2
+                    JOIN clients  c2 ON c2.id = b2.client_id
+                    WHERE b2.session_id = s.id
+                      AND b2.status = 'confirmed'
+                ) d
+            ), '') AS names
         FROM sessions s
         CROSS JOIN now_local
-        LEFT JOIN bookings b ON b.session_id = s.id
-        LEFT JOIN clients  c ON c.id        = b.client_id
         WHERE s.session_date = (now_local.ts)::date
         {time_filter}
-        GROUP BY s.id
         ORDER BY s.session_date, s.start_time;
     """)
     with get_session() as s:
@@ -91,7 +96,6 @@ def _rows_today(upcoming_only: bool):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Formatting
-# (Show names; drop “1/6” visual; keep a light status emoji.)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _fmt_status(row: dict) -> str:
@@ -106,9 +110,7 @@ def _fmt_rows_with_names(rows: list[dict]) -> str:
         hhmm   = str(r["start_time"])[:5]
         names  = (r.get("names") or "").strip()
         status = _fmt_status(r)
-        # If no names yet, say “(no bookings)”; otherwise list all names
         who = "(no bookings)" if not names else names
-        # Keep line succinct to stay under WA limits while still showing everyone
         lines.append(f"• {hhmm} – {who}  ({status})")
     return "\n".join(lines)
 
@@ -135,11 +137,10 @@ def register_tasks(app):
             src = request.args.get("src", "unknown")
             logging.info(f"[admin-notify] src={src}")
 
-            # Figure out current hour at DB to align with infra time
+            # Align hour check to DB clock
             with get_session() as s:
                 now_utc_hour = s.execute(text("SELECT EXTRACT(HOUR FROM now())::int AS h")).mappings().first()["h"]
 
-            # 04 UTC (≈ 06 SAST) → full day; otherwise upcoming-only
             body_today = _fmt_today_block(upcoming_only=False if now_utc_hour == 4 else True)
 
             nxt = _rows_next_hour()
@@ -165,7 +166,7 @@ def register_tasks(app):
         """
         Client reminder runner:
           • daily=0 (default) → next-hour reminders to booked clients
-          • daily=1 → send admin a daily recap (kept for manual checks)
+          • daily=1 → send admin a daily recap (manual check)
         """
         try:
             src = request.args.get("src", "unknown")
@@ -174,7 +175,6 @@ def register_tasks(app):
 
             if daily:
                 rows = _rows_today(upcoming_only=False)
-                # Keep admin recap terse; names already included
                 to = normalize_wa(NADINE_WA)
                 if to:
                     send_whatsapp_text(to, f"🗓 Today (full day)\n{_fmt_rows_with_names(rows)}")
