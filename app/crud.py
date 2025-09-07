@@ -27,8 +27,12 @@ def client_exists_by_wa(wa_number: str) -> bool:
 def upsert_public_client(wa_number: str, name: str | None):
     """
     Ensure a client row exists for this WA number.
-    - If name is provided and non-empty => set/overwrite name.
-    - If name is empty/missing => write a safe placeholder (NOT NULL friendly).
+
+    - If name provided => set name (first time or keep existing if empty).
+    - If name missing/blank => use 'Guest ####' (last 4 digits of WA).
+    - Write a NON-NULL plan on insert (e.g., 'prospect') to satisfy schema.
+    - Do NOT overwrite an existing plan on conflict.
+
     Returns dict(id, name, wa_number).
     """
     wa_norm = normalize_wa(wa_number)
@@ -41,10 +45,16 @@ def upsert_public_client(wa_number: str, name: str | None):
         row = s.execute(
             text("""
                 INSERT INTO clients (name, wa_number, credits, plan)
-                VALUES (COALESCE(NULLIF(:name, ''), :placeholder), :wa, 0, NULL)
+                VALUES (
+                    COALESCE(NULLIF(:name, ''), :placeholder),
+                    :wa,
+                    0,
+                    'prospect'                  -- << set a safe non-null default
+                )
                 ON CONFLICT (wa_number)
                 DO UPDATE SET
                     name = COALESCE(NULLIF(EXCLUDED.name, ''), clients.name)
+                    -- plan is intentionally NOT overwritten here
                 RETURNING id, name, wa_number
             """),
             {"name": nm_in, "placeholder": placeholder, "wa": wa_norm},
@@ -101,13 +111,11 @@ def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> list[dict]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_next_upcoming_booking_by_wa(wa_number: str):
-    """
-    Return the soonest future booking for this WA, using local (TZ_NAME) time.
-    """
+    """Return the soonest future booking for this WA, using local (TZ_NAME) time."""
     wa = normalize_wa(wa_number)
     with get_session() as s:
         row = s.execute(
-            text(f"""
+            text("""
                 WITH now_local AS (
                     SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
                 )
@@ -134,11 +142,10 @@ def find_next_upcoming_booking_by_wa(wa_number: str):
         return dict(row) if row else None
 
 
-# (Optional) cancellation request logging for admin workflow
 def create_cancel_request(client_id: int, session_id: int, reason: str | None = None) -> dict | None:
     """
     Log a client-initiated cancel request for admin to act on (no auto DB changes).
-    Requires a table like:
+    Requires:
 
         CREATE TABLE IF NOT EXISTS cancel_requests (
           id SERIAL PRIMARY KEY,
@@ -148,8 +155,6 @@ def create_cancel_request(client_id: int, session_id: int, reason: str | None = 
           status TEXT NOT NULL DEFAULT 'pending',  -- pending | actioned | rejected
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
-
-    Returns the inserted row (id, status, created_at).
     """
     with get_session() as s:
         row = s.execute(
