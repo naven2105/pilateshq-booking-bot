@@ -1,49 +1,21 @@
+# app/main.py
 from flask import Flask
-from .router import register_routes
 from .tasks import register_tasks
+from .router import register_routes
 
 app = Flask(__name__)
 
-# Define health ONCE here
+# Single authoritative health check
 @app.get("/health")
 def health():
     return "ok", 200
 
-# Register app routes / tasks once (idempotent guards inside)
+# Register app routes and task endpoints
 register_routes(app)
 register_tasks(app)
 
-
-""" import logging
-import os
-from flask import Flask
-from .db import init_db
-from .router import register_routes
-from .tasks import register_tasks
-
-app = Flask(__name__)
-
-# Logging
-log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
-logger = logging.getLogger(__name__)
-
-# One-time DB init
-@app.before_request
-def _init_once():
-    if not getattr(app, "_db_init_done", False):
-        try:
-            init_db()
-            app._db_init_done = True
-            logger.info("✅ Database initialized")
-        except Exception as e:
-            logger.exception("❌ Database init failed: %s", str(e))
-
-# Mount routes
-register_routes(app)
-register_tasks(app)  # <— this line must exist
-
-# Health
-@app.route("/", methods=["GET"])
-def health():
-    return "✅ PilatesHQ Bot is running", 200 """
+if __name__ == "__main__":
+    # Render sets PORT; locally you can run `python -m app.main`
+    import os
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
