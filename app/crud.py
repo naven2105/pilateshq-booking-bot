@@ -1,45 +1,76 @@
 # app/crud.py
-from __future__ import annotations
 
-from typing import Optional
+from __future__ import annotations
+from typing import Optional, List, Dict
+
 from sqlalchemy import text
 from .db import get_session
-from .utils import normalize_wa
 
 
-# ---------- Inbox logging (lead_messages) ----------
-def log_lead_message(wa_number: str, direction: str, body: str, meta: Optional[dict] = None) -> None:
-    """
-    Write an inbound/outbound message to the inbox table.
-    direction: 'in' | 'out'
-    """
-    wa = normalize_wa(wa_number)
-    if not wa:
-        return
-    with get_session() as s:
-        s.execute(
-            text("""
-                INSERT INTO lead_messages (wa_number, direction, body, meta)
-                VALUES (:wa, :dir, :body, COALESCE(:meta, '{}'::jsonb))
-            """),
-            {"wa": wa, "dir": direction, "body": body or "", "meta": meta},
-        )
-        s.commit()
+# ──────────────────────────────────────────────────────────────────────────────
+# Public client utilities
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-# ---------- Simple client lookups ----------
 def client_exists_by_wa(wa_number: str) -> bool:
+    """
+    True if a client record exists for this normalized WhatsApp number.
+    Assumes a UNIQUE constraint on clients.wa_number.
+    """
+    from .utils import normalize_wa
     wa = normalize_wa(wa_number)
     if not wa:
         return False
     with get_session() as s:
-        row = s.execute(text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"), {"wa": wa}).first()
+        row = s.execute(
+            text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"),
+            {"wa": wa},
+        ).first()
         return bool(row)
 
 
-# ---------- (Keep/merge your existing helpers below) ----------
-def find_next_upcoming_booking_by_wa(wa_number: str):
+def upsert_public_client(wa: str, name: Optional[str] = None) -> Dict:
+    """
+    Create or update a 'public' client row by WhatsApp number.
+    - If the WA number exists, update the name only when a non-empty name is given.
+    - If it doesn't exist, insert a minimal client (name may be NULL) with credits=0.
+
+    Returns: {id, name, wa_number}
+    """
+    from .utils import normalize_wa
+    wa_norm = normalize_wa(wa)
+    if not wa_norm:
+        raise ValueError("Invalid WA number for upsert_public_client")
+
+    with get_session() as s:
+        # Ensure the column wa_number has a UNIQUE index in your schema.
+        # We only update name if a new non-null value is supplied.
+        row = s.execute(
+            text("""
+                INSERT INTO clients (name, wa_number, credits, plan)
+                VALUES (:name, :wa, 0, NULL)
+                ON CONFLICT (wa_number)
+                DO UPDATE SET
+                    name = COALESCE(EXCLUDED.name, clients.name)
+                RETURNING id, name, wa_number
+            """),
+            {"name": name if (name and name.strip()) else None, "wa": wa_norm},
+        ).mappings().first()
+        return dict(row) if row else {"id": None, "name": name, "wa_number": wa_norm}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Booking lookup helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
+    """
+    Return the next upcoming booking (soonest future session) for this WA number,
+    or None if not found. Local time Africa/Johannesburg.
+    """
+    from .utils import normalize_wa
     wa = normalize_wa(wa_number)
+    if not wa:
+        return None
     with get_session() as s:
         row = s.execute(text("""
             WITH now_local AS (
@@ -65,7 +96,14 @@ def find_next_upcoming_booking_by_wa(wa_number: str):
         return dict(row) if row else None
 
 
-def list_clients(limit: int = 10, offset: int = 0) -> list[dict]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin pickers / search
+# ──────────────────────────────────────────────────────────────────────────────
+
+def list_clients(limit: int = 10, offset: int = 0) -> List[Dict]:
+    """
+    Simple paginated list of clients for admin pickers.
+    """
     with get_session() as s:
         rows = s.execute(
             text("""
@@ -84,7 +122,10 @@ def list_clients(limit: int = 10, offset: int = 0) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> list[dict]:
+def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> List[Dict]:
+    """
+    Case-insensitive substring search by name.
+    """
     q = (q or "").strip()
     if not q:
         return list_clients(limit=limit, offset=offset)
@@ -106,3 +147,24 @@ def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> list[dict]
             {"needle": f"%{q}%", "lim": int(limit), "off": int(offset)},
         ).mappings().all()
         return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional: admin cancellation requests queue
+# ──────────────────────────────────────────────────────────────────────────────
+
+def create_cancel_request(client_id: int, session_id: int, source: str = "client") -> Dict:
+    """
+    Enqueue a cancellation request for admin to review later.
+    Requires a table cancel_requests(client_id, session_id, source, created_at, status).
+    """
+    with get_session() as s:
+        row = s.execute(
+            text("""
+                INSERT INTO cancel_requests (client_id, session_id, source, status)
+                VALUES (:cid, :sid, :src, 'pending')
+                RETURNING id, client_id, session_id, source, status, created_at
+            """),
+            {"cid": int(client_id), "sid": int(session_id), "src": source},
+        ).mappings().first()
+        return dict(row)
