@@ -2,158 +2,269 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional, Tuple
+
 from flask import request, jsonify
 
-from .config import VERIFY_TOKEN, ADMIN_NUMBERS
-from .utils import normalize_wa, send_whatsapp_text, send_with_menu, send_menu
-from .crud import client_exists_by_wa, upsert_public_client, find_next_upcoming_booking_by_wa
+from .config import ADMIN_NUMBERS, VERIFY_TOKEN
+from .utils import normalize_wa, send_whatsapp_text
+from .admin import handle_admin_action
+from .crud import client_exists_by_wa, upsert_public_client
 
-def _is_admin(wa: str) -> bool:
-    wa_n = normalize_wa(wa)
-    return bool(wa_n and wa_n in {normalize_wa(n) for n in ADMIN_NUMBERS})
 
-FAQ_SNIPPETS = {
-    "address": "📍 We’re at 71 Grant Ave, Norwood, Johannesburg. Safe off-street parking is available.",
-    "parking": "🅿️ Safe off-street parking at 71 Grant Ave, Norwood.",
-    "group": "👥 Group classes are capped at 6 to keep coaching personal.",
-    "equipment": "🛠 We use Reformers, Wall Units, Wunda chairs, small props, and mats.",
-    "pricing": "💳 Groups from R180. (Ask for the current price list if needed.)",
-    "schedule": "🗓 Weekdays 06:00–18:00; Saturday 08:00–10:00.",
-    "start": "➡️ Most start with a 1:1 assessment so we can tailor your plan.",
-}
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers – Public/Lead Experience
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _try_create_cancel_request(client_id: int, session_id: int) -> bool:
-    try:
-        from .crud import create_cancel_request
-    except Exception:
-        logging.warning("[router] cancel_requests table not present; skipping queue insert.")
-        return False
-    try:
-        create_cancel_request(client_id, session_id, source="client")
-        return True
-    except Exception:
-        logging.exception("[router] failed to insert cancel_request")
-        return False
+PUBLIC_MENU = (
+    "—\n"
+    "📋 *Menu*\n"
+    "1) Pricing\n"
+    "2) Address & parking\n"
+    "3) Schedule\n"
+    "4) Group sizes\n"
+    "5) Equipment\n"
+    "6) How to start\n"
+    "7) Book (send request)\n"
+    "8) Contact\n"
+    "Reply with a number or keyword (e.g., *pricing*, *address*, *book*)."
+)
 
-def _handle_public_message(from_wa: str, text: str) -> None:
-    wa = normalize_wa(from_wa)
-    if not wa:
-        return
-    msg = (text or "").strip()
-    low = msg.lower()
+def _public_menu() -> str:
+    return PUBLIC_MENU
 
-    # Ensure a client row exists
-    if not client_exists_by_wa(wa):
-        upsert_public_client(wa, None)
+def _normalize(text: str) -> str:
+    return (text or "").strip().lower()
 
-    # NAME update
-    if low.startswith("name "):
-        new_name = msg[5:].strip()
-        if new_name:
-            row = upsert_public_client(wa, new_name)
-            send_with_menu(wa, f"✅ Saved your name as *{row.get('name') or new_name}*.")
-        else:
-            send_with_menu(wa, "Please send your name as: *NAME Jane Doe*")
-        return
+def _intent_and_payload(text: str) -> Tuple[str, Optional[str]]:
+    """
+    Map free text to high-level intents.
+    Returns (intent, payload) – payload may be None.
+    """
+    t = _normalize(text)
 
-    # FAQs
-    if any(k in low for k in ["address", "where", "parking"]):
-        send_with_menu(wa, FAQ_SNIPPETS["address"]); return
-    if "group" in low or "size" in low:
-        send_with_menu(wa, FAQ_SNIPPETS["group"]); return
-    if "equip" in low:
-        send_with_menu(wa, FAQ_SNIPPETS["equipment"]); return
-    if "price" in low or "cost" in low or "pay" in low:
-        send_with_menu(wa, FAQ_SNIPPETS["pricing"]); return
-    if "schedule" in low or "time" in low or "open" in low:
-        send_with_menu(wa, FAQ_SNIPPETS["schedule"]); return
-    if "start" in low or "assessment" in low:
-        send_with_menu(wa, FAQ_SNIPPETS["start"]); return
+    # Numeric quick picks
+    if t in {"1", "pricing", "price", "prices"}:
+        return "pricing", None
+    if t in {"2", "address", "parking", "where", "location"}:
+        return "address", None
+    if t in {"3", "schedule", "hours", "opening", "times"}:
+        return "schedule", None
+    if t in {"4", "group", "group sizes", "class size"}:
+        return "group_sizes", None
+    if t in {"5", "equipment", "machines", "reformer"}:
+        return "equipment", None
+    if t in {"6", "start", "how to start", "assessment"}:
+        return "how_to_start", None
+    if t in {"7", "book", "booking", "request"}:
+        return "book_request", None
+    if t in {"8", "contact", "phone", "email"}:
+        return "contact", None
 
-    # Booking prompt
-    if low.startswith("book"):
-        send_with_menu(
-            wa,
-            "Great! To get you booked, please *NAME Your Full Name* (if not saved), "
-            "and tell us your preferred day/time (e.g., *Tue 17:00*)."
+    # Friendly greetings → present menu
+    if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
+        return "menu", None
+
+    # Try smart keyword matching
+    if "price" in t or "cost" in t or "fee" in t:
+        return "pricing", None
+    if "address" in t or "parking" in t or "where" in t or "located" in t:
+        return "address", None
+    if "schedule" in t or "time" in t or "open" in t or "hour" in t:
+        return "schedule", None
+    if "group" in t or "size" in t:
+        return "group_sizes", None
+    if "equip" in t or "reformer" in t or "chair" in t or "mat" in t:
+        return "equipment", None
+    if "start" in t or "assessment" in t or "begin" in t:
+        return "how_to_start", None
+    if "book" in t or "reserve" in t:
+        return "book_request", None
+    if "contact" in t or "call" in t or "email" in t or "whatsapp" in t:
+        return "contact", None
+
+    # Fallback: show menu
+    return "menu", None
+
+def _faq_response(intent: str) -> str:
+    if intent == "pricing":
+        return (
+            "💳 *Pricing*\n"
+            "• Group classes from *R180*\n"
+            "• 1:1 assessment recommended for newcomers\n"
+            "• Packages available – ask us for current specials"
         )
+    if intent == "address":
+        return (
+            "📍 *Address & Parking*\n"
+            "PilatesHQ — *71 Grant Ave, Norwood, Johannesburg*\n"
+            "Safe off-street parking available."
+        )
+    if intent == "schedule":
+        return (
+            "🗓️ *Schedule*\n"
+            "• Weekdays: 06:00–18:00\n"
+            "• Saturday: 08:00–10:00\n"
+            "Ask for today’s availability and we’ll suggest times."
+        )
+    if intent == "group_sizes":
+        return (
+            "👥 *Group sizes*\n"
+            "Group classes are capped at *6* so coaching stays personal.\n"
+            "We also offer duos and privates."
+        )
+    if intent == "equipment":
+        return (
+            "🧰 *Equipment*\n"
+            "Reformers, Wall Units, Wunda Chairs, small props, and mats.\n"
+            "All sessions are guided by certified instructors."
+        )
+    if intent == "how_to_start":
+        return (
+            "🚀 *How to start*\n"
+            "Most clients begin with a *1:1 assessment* so we can tailor your plan.\n"
+            "Reply *Book* and we’ll forward your request to the studio."
+        )
+    if intent == "contact":
+        return (
+            "☎️ *Contact*\n"
+            "Prefer to chat? Message us here anytime.\n"
+            "We’ll introduce you to an instructor to get started."
+        )
+    if intent == "book_request":
+        return (
+            "✅ *Booking request noted!*\n"
+            "We’ve forwarded your request to the studio. An instructor will confirm time and next steps.\n"
+            "If you have preferred days/times, reply with them now."
+        )
+    # Default
+    return "Thanks! How can we help today?"
+
+def _handle_public_message(wa: str, body: str) -> None:
+    """
+    Lead/FAQ flow:
+    - Ensure the number exists in clients table as a lead (name optional).
+    - Answer common questions.
+    - Always append the menu to keep the conversation discoverable.
+    """
+    # Ensure (or create) client record as lead
+    try:
+        exists = client_exists_by_wa(wa)
+        if not exists:
+            # Create a light lead record; name can be set later
+            upsert_public_client(wa, None)
+    except Exception:
+        logging.exception("Lead upsert failed (non-fatal)")
+
+    intent, _ = _intent_and_payload(body)
+
+    # For “book request”, also ping admins via the normal admin channel
+    if intent == "book_request":
+        response = _faq_response(intent) + "\n\n" + _public_menu()
+        send_whatsapp_text(wa, response)
+        # Let admin flow know (simple signal message)
+        try:
+            for admin in ADMIN_NUMBERS:
+                send_whatsapp_text(
+                    normalize_wa(admin),
+                    f"📩 *New booking request* from {wa}\n"
+                    f"Message: {body.strip() or '(no extra details)'}"
+                )
+        except Exception:
+            logging.exception("Failed to notify admins about a booking request")
         return
 
-    # Client cancel request of next upcoming booking
-    if low.startswith("cancel"):
-        nxt = find_next_upcoming_booking_by_wa(wa)
-        if not nxt:
-            send_with_menu(wa, "You have no upcoming booking to cancel.")
-            return
+    # Normal FAQ reply
+    if intent == "menu":
+        send_whatsapp_text(wa, "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu())
+    else:
+        send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
 
-        created = _try_create_cancel_request(nxt["client_id"], nxt["session_id"])
-        if created:
-            send_with_menu(wa, "✅ Cancellation request sent to admin. We’ll confirm shortly.")
-        else:
-            send_with_menu(wa, "We’ve notified admin. They will confirm your cancellation shortly.")
 
-        when = f"{nxt['session_date']} {str(nxt['start_time'])[:5]}"
-        note = f"⚠️ Cancel request from *{nxt.get('name') or 'Client'}* for *{when}*."
-        for adm in ADMIN_NUMBERS:
-            adm_wa = normalize_wa(adm)
-            if adm_wa:
-                # Admin messages: no menu
-                send_whatsapp_text(adm_wa, note)
-        return
-
-    # Default greeting
-    send_with_menu(
-        wa,
-        "Hi! I can share *address & parking*, *group sizes*, *equipment*, *pricing*, *schedule*, "
-        "and how to *start*. You can also *BOOK* or *CANCEL*."
-    )
+# ──────────────────────────────────────────────────────────────────────────────
+# Flask wiring
+# ──────────────────────────────────────────────────────────────────────────────
 
 def register_routes(app):
-    # Home
-    if "home" not in app.view_functions:
-        def home():
-            return "OK", 200
-        app.add_url_rule("/", endpoint="home", view_func=home, methods=["GET"])
+    """
+    Mounts:
+      GET  /webhook  – Meta verification (hub.mode=subscribe; hub.verify_token; hub.challenge)
+      POST /webhook  – WhatsApp Cloud API inbound
+      GET  /         – simple OK
+    """
+    @app.get("/")
+    def root():
+        return "ok", 200
 
-    # Health
-    if "health" not in app.view_functions:
-        def health():
-            return jsonify({"ok": True}), 200
-        app.add_url_rule("/health", endpoint="health", view_func=health, methods=["GET"])
+    @app.get("/webhook")
+    def webhook_verify():
+        # Meta’s verification handshake
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
-    # Webhook verify
-    if "webhook_verify" not in app.view_functions:
-        def webhook_verify():
-            mode = request.args.get("hub.mode")
-            token = request.args.get("hub.verify_token")
-            challenge = request.args.get("hub.challenge")
-            if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-                return challenge, 200
-            return "forbidden", 403
-        app.add_url_rule("/webhook", endpoint="webhook_verify", view_func=webhook_verify, methods=["GET"])
+        if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+            return challenge, 200
+        return "forbidden", 403
 
-    # Webhook receive
-    if "webhook" not in app.view_functions:
-        def webhook():
-            try:
-                data = request.get_json(force=True, silent=True) or {}
-                entry = (data.get("entry") or [{}])[0]
-                changes = (entry.get("changes") or [{}])[0]
-                value = changes.get("value") or {}
-                messages = value.get("messages") or []
-                if not messages:
-                    return "ok", 200
-
-                msg = messages[0]
-                from_wa = normalize_wa(msg.get("from") or "")
-                body = ""
-                if msg.get("type") == "text":
-                    body = (msg.get("text") or {}).get("body", "") or ""
-
-                if from_wa:
-                    _handle_public_message(from_wa, body)
+    @app.post("/webhook")
+    def webhook():
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+            # WhatsApp payload structure (Cloud API):
+            # entry[0].changes[0].value.messages[0]
+            entry = (data.get("entry") or [])
+            if not entry:
                 return "ok", 200
-            except Exception:
-                logging.exception("[webhook] failed")
-                return "error", 500
-        app.add_url_rule("/webhook", endpoint="webhook", view_func=webhook, methods=["POST"])
+
+            changes = (entry[0].get("changes") or [])
+            if not changes:
+                return "ok", 200
+
+            value = changes[0].get("value") or {}
+            msgs = value.get("messages") or []
+            if not msgs:
+                return "ok", 200
+
+            msg = msgs[0]
+            from_wa_raw = msg.get("from") or ""
+            from_wa = normalize_wa(from_wa_raw)
+            msg_type = msg.get("type")
+
+            # Pull text body (supports text and interactive replies)
+            body = ""
+            if msg_type == "text":
+                body = (msg.get("text") or {}).get("body", "") or ""
+            elif msg_type == "interactive":
+                inter = msg.get("interactive") or {}
+                if inter.get("type") == "button_reply":
+                    body = (inter.get("button_reply") or {}).get("title", "") or ""
+                elif inter.get("type") == "list_reply":
+                    body = (inter.get("list_reply") or {}).get("title", "") or ""
+                else:
+                    body = ""
+            else:
+                # Other types (image, sticker, etc.) → prompt with menu
+                body = ""
+
+            # Route: admin vs public
+            if from_wa in ADMIN_NUMBERS:
+                # Keep admin handler signature consistent with your admin.py
+                try:
+                    handle_admin_action(from_wa, msg.get("id"))
+                except TypeError:
+                    # If your admin.py expects (wa, reply_id, body), try this:
+                    try:
+                        handle_admin_action(from_wa, msg.get("id"), body)
+                    except Exception:
+                        logging.exception("admin handler failed")
+                except Exception:
+                    logging.exception("admin handler failed")
+            else:
+                _handle_public_message(from_wa, body)
+
+            return "ok", 200
+
+        except Exception:
+            logging.exception("webhook failed")
+            return "error", 500

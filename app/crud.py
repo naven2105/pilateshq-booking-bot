@@ -1,21 +1,22 @@
 # app/crud.py
 from __future__ import annotations
 
+from typing import Optional, List, Dict
 from sqlalchemy import text
+
 from .db import get_session
 from .utils import normalize_wa
-from .config import TZ_NAME
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Clients (public / admin)
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Clients
+# ──────────────────────────────────────────────────────────────────────────────
 
 def client_exists_by_wa(wa_number: str) -> bool:
-    """Return True if a client with this WhatsApp number exists."""
+    """
+    True if a client with this WA number exists (normalized).
+    """
     wa = normalize_wa(wa_number)
-    if not wa:
-        return False
     with get_session() as s:
         row = s.execute(
             text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"),
@@ -24,107 +25,115 @@ def client_exists_by_wa(wa_number: str) -> bool:
         return bool(row)
 
 
-def upsert_public_client(wa_number: str, name: str | None):
+def upsert_public_client(wa_number: str, name: Optional[str]) -> Dict:
     """
-    Ensure a client row exists for this WA number.
-
-    - If name provided => set name (first time or keep existing if empty).
-    - If name missing/blank => use 'Guest ####' (last 4 digits of WA).
-    - Write a NON-NULL plan on insert (e.g., 'prospect') to satisfy schema.
-    - Do NOT overwrite an existing plan on conflict.
-
-    Returns dict(id, name, wa_number).
+    Create or gently update a *lead* client.
+    - Ensures NOT NULL constraints are respected (name & plan).
+    - If name is empty/None, uses a placeholder like 'Guest 4607'.
+    - plan is set to 'lead' (adjust if your schema has a different default).
     """
-    wa_norm = normalize_wa(wa_number)
-    nm_in = (name or "").strip()
+    wa = normalize_wa(wa_number)
 
-    last4 = wa_norm[-4:] if wa_norm and len(wa_norm) >= 4 else "0000"
-    placeholder = f"Guest {last4}"
+    # Derive a friendly placeholder if name missing/blank
+    name_clean = (name or "").strip()
+    if not name_clean:
+        last4 = wa[-4:] if len(wa) >= 4 else "lead"
+        name_clean = f"Guest {last4}"
 
     with get_session() as s:
         row = s.execute(
-            text("""
+            text(
+                """
                 INSERT INTO clients (name, wa_number, credits, plan)
-                VALUES (
-                    COALESCE(NULLIF(:name, ''), :placeholder),
-                    :wa,
-                    0,
-                    'prospect'                  -- << set a safe non-null default
-                )
+                VALUES (:name, :wa, 0, 'lead')
                 ON CONFLICT (wa_number)
                 DO UPDATE SET
-                    name = COALESCE(NULLIF(EXCLUDED.name, ''), clients.name)
-                    -- plan is intentionally NOT overwritten here
+                    name = COALESCE(NULLIF(EXCLUDED.name, ''), clients.name),
+                    plan = COALESCE(clients.plan, 'lead')
                 RETURNING id, name, wa_number
-            """),
-            {"name": nm_in, "placeholder": placeholder, "wa": wa_norm},
+                """
+            ),
+            {"name": name_clean, "wa": wa},
         ).mappings().first()
-        return dict(row) if row else None
+        return dict(row)  # {id, name, wa_number}
 
 
-def list_clients(limit: int = 10, offset: int = 0) -> list[dict]:
-    """Paginated list of clients for admin pickers."""
+def list_clients(limit: int = 10, offset: int = 0) -> List[Dict]:
+    """
+    Paginated list of clients for admin pickers.
+    """
     with get_session() as s:
         rows = s.execute(
-            text("""
+            text(
+                """
                 SELECT
-                  id,
-                  COALESCE(name,'')      AS name,
-                  COALESCE(wa_number,'') AS wa_number,
-                  COALESCE(plan,'')      AS plan,
-                  COALESCE(credits,0)    AS credits
+                    id,
+                    COALESCE(name,'')      AS name,
+                    COALESCE(wa_number,'') AS wa_number,
+                    COALESCE(plan,'')      AS plan,
+                    COALESCE(credits,0)    AS credits
                 FROM clients
                 ORDER BY COALESCE(name,''), id
                 LIMIT :lim OFFSET :off
-            """),
+                """
+            ),
             {"lim": int(limit), "off": int(offset)},
         ).mappings().all()
         return [dict(r) for r in rows]
 
 
-def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> list[dict]:
-    """Case-insensitive search by name."""
+def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> List[Dict]:
+    """
+    Case-insensitive name search; returns same brief shape as list_clients.
+    """
     q = (q or "").strip()
     if not q:
         return list_clients(limit=limit, offset=offset)
+
     with get_session() as s:
         rows = s.execute(
-            text("""
+            text(
+                """
                 SELECT
-                  id,
-                  COALESCE(name,'')      AS name,
-                  COALESCE(wa_number,'') AS wa_number,
-                  COALESCE(plan,'')      AS plan,
-                  COALESCE(credits,0)    AS credits
+                    id,
+                    COALESCE(name,'')      AS name,
+                    COALESCE(wa_number,'') AS wa_number,
+                    COALESCE(plan,'')      AS plan,
+                    COALESCE(credits,0)    AS credits
                 FROM clients
                 WHERE LOWER(COALESCE(name,'')) LIKE LOWER(:needle)
                 ORDER BY COALESCE(name,''), id
                 LIMIT :lim OFFSET :off
-            """),
+                """
+            ),
             {"needle": f"%{q}%", "lim": int(limit), "off": int(offset)},
         ).mappings().all()
         return [dict(r) for r in rows]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bookings / sessions
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Bookings / Sessions (used by client cancel flow, lookups, etc.)
+# ──────────────────────────────────────────────────────────────────────────────
 
-def find_next_upcoming_booking_by_wa(wa_number: str):
-    """Return the soonest future booking for this WA, using local (TZ_NAME) time."""
+def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
+    """
+    Returns the soonest future confirmed booking for this WA number (local SA time).
+    Shape: {booking_id, session_id, session_date, start_time, client_id, name, wa_number}
+    """
     wa = normalize_wa(wa_number)
     with get_session() as s:
         row = s.execute(
-            text("""
+            text(
+                """
                 WITH now_local AS (
-                    SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
+                    SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg') AS ts
                 )
                 SELECT
-                    b.id     AS booking_id,
-                    s.id     AS session_id,
+                    b.id AS booking_id,
+                    s.id AS session_id,
                     s.session_date,
                     s.start_time,
-                    c.id     AS client_id,
+                    c.id AS client_id,
                     c.name,
                     c.wa_number
                 FROM bookings b
@@ -136,33 +145,70 @@ def find_next_upcoming_booking_by_wa(wa_number: str):
                   AND (s.session_date + s.start_time) > now_local.ts
                 ORDER BY s.session_date, s.start_time
                 LIMIT 1
-            """),
-            {"wa": wa, "tz": TZ_NAME},
+                """
+            ),
+            {"wa": wa},
         ).mappings().first()
         return dict(row) if row else None
 
 
-def create_cancel_request(client_id: int, session_id: int, reason: str | None = None) -> dict | None:
+def cancel_all_future_bookings_by_wa(wa_number: str) -> int:
     """
-    Log a client-initiated cancel request for admin to act on (no auto DB changes).
-    Requires:
+    Marks all *future* bookings for this WA as 'cancel_requested'.
+    Returns count affected. (Admin can later action them.)
+    """
+    wa = normalize_wa(wa_number)
+    with get_session() as s:
+        res = s.execute(
+            text(
+                """
+                WITH now_local AS (
+                    SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg') AS ts
+                )
+                UPDATE bookings b
+                SET status = 'cancel_requested'
+                FROM clients c, sessions s, now_local
+                WHERE b.client_id = c.id
+                  AND b.session_id = s.id
+                  AND c.wa_number = :wa
+                  AND b.status = 'confirmed'
+                  AND (s.session_date + s.start_time) > now_local.ts
+                """
+            ),
+            {"wa": wa},
+        )
+        return res.rowcount or 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Optional — Admin-side triage (only used if you wire it up)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def create_cancel_request(booking_id: int, reason: Optional[str], source_wa: Optional[str]) -> Dict:
+    """
+    Inserts a row into a (hypothetical) cancel_requests table to track admin workflow.
+    Implement this table if you intend to use it:
 
         CREATE TABLE IF NOT EXISTS cancel_requests (
-          id SERIAL PRIMARY KEY,
-          client_id INT NOT NULL REFERENCES clients(id),
-          session_id INT NOT NULL REFERENCES sessions(id),
-          reason TEXT,
-          status TEXT NOT NULL DEFAULT 'pending',  -- pending | actioned | rejected
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            id SERIAL PRIMARY KEY,
+            booking_id INT NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+            source_wa  TEXT,
+            reason     TEXT,
+            status     TEXT NOT NULL DEFAULT 'open',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+    Returns {id, booking_id, status}.
     """
     with get_session() as s:
         row = s.execute(
-            text("""
-                INSERT INTO cancel_requests (client_id, session_id, reason, status)
-                VALUES (:cid, :sid, :reason, 'pending')
-                RETURNING id, client_id, session_id, reason, status, created_at
-            """),
-            {"cid": client_id, "sid": session_id, "reason": reason},
+            text(
+                """
+                INSERT INTO cancel_requests (booking_id, source_wa, reason, status)
+                VALUES (:bid, :wa, :reason, 'open')
+                RETURNING id, booking_id, status
+                """
+            ),
+            {"bid": int(booking_id), "wa": normalize_wa(source_wa or ""), "reason": reason},
         ).mappings().first()
-        return dict(row) if row else None
+        return dict(row)
