@@ -12,8 +12,8 @@ from .config import NADINE_WA, TZ_NAME
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SQL helpers (Africa/Johannesburg local via AT TIME ZONE)
-# Each query aggregates confirmed attendee names per session via a DISTINCT+ORDER
-# subquery to avoid the Postgres "DISTINCT with ORDER BY" restriction.
+# NOTE: do NOT use CTE name "window" (reserved in PostgreSQL). Use "win".
+# Names are aggregated via DISTINCT+ORDER subselect to avoid PG DISTINCT/ORDER rule.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _rows_next_hour():
@@ -24,7 +24,7 @@ def _rows_next_hour():
         WITH now_local AS (
             SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
         ),
-        window AS (
+        win AS (
             SELECT ts, (ts + INTERVAL '1 hour') AS ts_plus FROM now_local
         )
         SELECT
@@ -46,9 +46,9 @@ def _rows_next_hour():
                 ) d
             ), '') AS names
         FROM sessions s
-        CROSS JOIN window
-        WHERE (s.session_date + s.start_time) >= window.ts
-          AND (s.session_date + s.start_time) <  window.ts_plus
+        CROSS JOIN win
+        WHERE (s.session_date + s.start_time) >= win.ts
+          AND (s.session_date + s.start_time) <  win.ts_plus
         ORDER BY s.start_time;
     """)
     with get_session() as s:
@@ -130,7 +130,7 @@ def register_tasks(app):
         """
         Hourly admin summary:
           • 04:00 UTC pass (≈ 06:00 SAST): full-day overview
-          • Other hours (within your cron window): upcoming-only
+          • Other hours: upcoming-only
           • Always append a 'next hour' preview (even if none)
         """
         try:
