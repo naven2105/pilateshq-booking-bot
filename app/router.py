@@ -1,165 +1,112 @@
-# app/router.py
-"""
-Webhook + lightweight HTTP routes.
-- GET /webhook : Meta verification (hub.mode=subscribe)
-- POST /webhook: Handles inbound WhatsApp messages (Cloud API)
-- GET  /      : Simple root status
-NOTE: /health is defined in app/main.py to avoid duplicate endpoint errors.
-"""
+# router.py – replace your public handler logic with this
 
-from __future__ import annotations
+from .crud import upsert_public_client, client_exists_by_wa  # ensure these exist
+from .utils import normalize_wa, reply_to_whatsapp
 
-import logging
-from flask import request
-from typing import Any, Dict, Optional
+FAQS = {
+    "address": "We’re at 71 Grant Ave, Norwood, Johannesburg. Safe off-street parking is available.",
+    "group sizes": "Groups are capped at 6 to keep coaching personal.",
+    "equipment": "We use Reformers, Wall Units, Wunda chairs, Wunda chairs, small props, and mats.",
+    "pricing": "Groups from R180. Singles/Duos on request.",
+    "schedule": "Weekdays 06:00–18:00; Sat 08:00–10:00.",
+    "how to start": "Most start with a 1:1 assessment, then a first class in a small group.",
+}
 
-from .config import ADMIN_NUMBERS, VERIFY_TOKEN
-from .utils import (
-    normalize_wa,
-    send_whatsapp_text,
+MAIN_MENU = (
+    "\n\n*Menu*"
+    "\n• address"
+    "\n• group sizes"
+    "\n• equipment"
+    "\n• pricing"
+    "\n• schedule"
+    "\n• how to start"
+    "\n• book"
 )
 
-# Optional: simple public welcome used for non-admins
-PUBLIC_WELCOME = (
-    "Hi 👋 Thanks for messaging PilatesHQ!\n"
-    "I can help with: \n"
-    "• Address & parking\n"
-    "• Group sizes\n"
-    "• Equipment\n"
-    "• Pricing\n"
-    "• Schedule\n"
-    "• How to start\n\n"
-    "Reply with one of the topics (e.g., *Pricing*) or say *Book* to request a session.\n"
-)
+def _looks_like_name(msg: str) -> str | None:
+    m = msg.strip()
+    if m.lower().startswith("name:"):
+        n = m.split(":", 1)[1].strip()
+        return n if len(n) >= 2 else None
+    # simple heuristic: 2–5 words, letters/space/’- only
+    if 2 <= len(m.split()) <= 5 and all(part.replace("-", "").isalpha() for part in m.split()):
+        return m
+    return None
 
-def _extract_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Extract {from:'<wa_id>', text:'...'} from the Cloud API webhook JSON.
-    Returns None if no text message present (e.g., status updates).
-    """
-    try:
-        entry = payload.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return None
-        msg = messages[0]
-        if msg.get("type") != "text":
-            # You can expand to support interactive/buttons, images, etc.
-            return {
-                "from": msg.get("from"),
-                "text": "",
-                "raw": msg,
-            }
-        return {
-            "from": msg.get("from"),
-            "text": msg.get("text", {}).get("body", "").strip(),
-            "raw": msg,
-        }
-    except Exception:
-        logging.exception("[webhook] failed to parse payload")
-        return None
+def handle_public_message(sender_wa: str, text_lower: str, body_raw: str) -> None:
+    to = sender_wa
 
+    # 1) BOOKING INTENT (takes priority over FAQ)
+    if text_lower in {"book", "booking", "join", "start"}:
+        # Ask for name if we don't have this contact; or allow "name: ..." inline
+        n = _looks_like_name(body_raw)
+        if n:
+            upsert_public_client(wa=to, name=n)  # creates if missing, updates name if exists
+            reply_to_whatsapp(
+                to,
+                f"Great to meet you, *{n}*! 🎉\n"
+                "We’ll message you with available slots to get started.\n"
+                "If you already know your preferred days/times, reply here.\n"
+                + MAIN_MENU
+            )
+            return
 
-def register_routes(app):
-    @app.get("/")
-    def root():
-        return "PilatesHQ bot is running.", 200
+        # If client already exists we still allow updating name via “name: …”
+        if client_exists_by_wa(to):
+            reply_to_whatsapp(
+                to,
+                "Awesome — you’re on our list already. If your name is different on WhatsApp,"
+                " reply with *Name: Your Full Name*.\n"
+                "Or tell us your preferred days/times and we’ll confirm a spot.\n"
+                + MAIN_MENU
+            )
+            return
 
-    # ─────────────────────────────────────────────────────────────
-    # GET /webhook : Meta verification handshake
-    # ─────────────────────────────────────────────────────────────
-    @app.get("/webhook")
-    def webhook_verify():
-        try:
-            mode = request.args.get("hub.mode")
-            token = request.args.get("hub.verify_token")
-            challenge = request.args.get("hub.challenge")
+        reply_to_whatsapp(
+            to,
+            "Let’s get you set up! Please reply with *Name: Your Full Name* (e.g., *Name: Alex Jacobs*)."
+            + MAIN_MENU
+        )
+        return
 
-            if mode == "subscribe" and token == VERIFY_TOKEN:
-                logging.info("[webhook] verification OK")
-                return challenge, 200
-            logging.warning("[webhook] verification failed (mode=%r, token=%r)", mode, token)
-            return "forbidden", 403
-        except Exception:
-            logging.exception("[webhook] verification error")
-            return "error", 500
+    # 2) QUICK NAME CAPTURE (user may paste name without first typing 'book')
+    name_guess = _looks_like_name(body_raw)
+    if name_guess:
+        upsert_public_client(wa=to, name=name_guess)
+        reply_to_whatsapp(
+            to,
+            f"Thanks, *{name_guess}*! You’re on our list — we’ll reach out shortly with times.\n"
+            "If you have preferred days/times, reply here.\n"
+            + MAIN_MENU
+        )
+        return
 
-    # ─────────────────────────────────────────────────────────────
-    # POST /webhook : Cloud API messages
-    # ─────────────────────────────────────────────────────────────
-    @app.post("/webhook")
-    def webhook():
-        try:
-            payload = request.get_json(silent=True) or {}
-            msg = _extract_message(payload)
-            if not msg:
-                # Usually status/ack callbacks; must return 200 so Meta doesn’t retry
-                return "ok", 200
+    # 3) FAQ: exact keyword match first
+    if text_lower in FAQS:
+        reply_to_whatsapp(to, f"{FAQS[text_lower]}{MAIN_MENU}")
+        return
 
-            sender_wa = normalize_wa(msg["from"])
-            text = (msg.get("text") or "").strip()
+    # 4) Fuzzy intent → map common phrases to the nearest FAQ
+    if any(k in text_lower for k in ["where", "address", "location", "parking"]):
+        reply_to_whatsapp(to, f"{FAQS['address']}{MAIN_MENU}")
+        return
+    if any(k in text_lower for k in ["price", "cost", "how much"]):
+        reply_to_whatsapp(to, f"{FAQS['pricing']}{MAIN_MENU}")
+        return
+    if any(k in text_lower for k in ["hour", "open", "when", "time", "schedule"]):
+        reply_to_whatsapp(to, f"{FAQS['schedule']}{MAIN_MENU}")
+        return
+    if "equipment" in text_lower or "reformer" in text_lower:
+        reply_to_whatsapp(to, f"{FAQS['equipment']}{MAIN_MENU}")
+        return
+    if "start" in text_lower or "first class" in text_lower:
+        reply_to_whatsapp(to, f"{FAQS['how to start']}{MAIN_MENU}")
+        return
 
-            # Detect admin (your ADMIN_NUMBERS are normalized on load)
-            is_admin = sender_wa in ADMIN_NUMBERS
-
-            if is_admin:
-                # Keep your existing admin command handling if you have it.
-                # For now, just confirm we saw it:
-                if text:
-                    send_whatsapp_text(sender_wa, f"Admin command received: {text}")
-                else:
-                    send_whatsapp_text(sender_wa, "Admin message received.")
-                return "ok", 200
-
-            # PUBLIC (non-admin) path: reply with a friendly menu/FAQ starter
-            # You can route to a fuller NLU or FAQ flow here.
-            if not text:
-                send_whatsapp_text(sender_wa, PUBLIC_WELCOME)
-                return "ok", 200
-
-            # Very light keyword router for FAQs (you can replace with your RAG/FAQ handler)
-            lower = text.lower()
-            if "address" in lower or "parking" in lower:
-                send_whatsapp_text(
-                    sender_wa,
-                    "📍 *Address & parking*\nWe’re at *71 Grant Ave, Norwood, Johannesburg*. "
-                    "Safe off-street parking is available."
-                )
-            elif "group" in lower or "size" in lower:
-                send_whatsapp_text(
-                    sender_wa,
-                    "👥 *Group sizes*\nGroups are capped at *6* to keep coaching personal."
-                )
-            elif "equipment" in lower:
-                send_whatsapp_text(
-                    sender_wa,
-                    "🧰 *Equipment*\nReformers, Wall Units, Wunda chairs, small props, and mats."
-                )
-            elif "pricing" in lower or "price" in lower or "cost" in lower:
-                send_whatsapp_text(
-                    sender_wa,
-                    "💳 *Pricing*\nGroups from *R180*. 1:1 and duo also available."
-                )
-            elif "schedule" in lower or "hours" in lower or "time" in lower:
-                send_whatsapp_text(
-                    sender_wa,
-                    "🗓 *Schedule*\nWeekdays *06:00–18:00*; Sat *08:00–10:00*."
-                )
-            elif "start" in lower or "assessment" in lower or "book" in lower:
-                send_whatsapp_text(
-                    sender_wa,
-                    "✅ *How to start*\nMost start with a *1:1 assessment*. "
-                    "Reply *Book* to request your preferred day/time."
-                )
-            else:
-                # Default: send the menu again
-                send_whatsapp_text(sender_wa, PUBLIC_WELCOME)
-
-            return "ok", 200
-
-        except Exception:
-            # Always return 200 to stop Meta retries; log the failure for us
-            logging.exception("[webhook] error")
-            return "ok", 200
+    # 5) Default welcome + menu
+    reply_to_whatsapp(
+        to,
+        "Hi! I can help with studio info and getting you booked in. "
+        "Try *address*, *pricing*, *schedule*, or *book* to begin."
+        + MAIN_MENU
+    )
