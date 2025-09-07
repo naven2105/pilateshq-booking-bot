@@ -4,110 +4,139 @@ from __future__ import annotations
 import json
 import logging
 import re
-import requests
 from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from .config import (
     ACCESS_TOKEN,
     GRAPH_URL,
     USE_TEMPLATES,
     TEMPLATE_LANG,
-    TPL_ADMIN_HOURLY,
-    TPL_ADMIN_20H00,
-    TPL_NEXT_HOUR,
-    TPL_TOMORROW,
-    TPL_ADMIN_CANCEL_ALL,
-    TPL_ADMIN_UPDATE,
 )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# WhatsApp helpers
+# Phone normalization
 # ─────────────────────────────────────────────────────────────────────────────
 
-def normalize_wa(raw: str | None) -> str:
+def normalize_wa(raw: Optional[str]) -> Optional[str]:
     """
-    Normalize SA numbers: accept '0XXXXXXXXX', '27XXXXXXXXX', '+27XXXXXXXXX'.
-    Returns E.164 (+27...) or '' if invalid.
+    Normalize a South African number to WhatsApp E.164 without '+' (as Meta accepts both).
+    Examples:
+      "0620469153"      -> "27620469153"
+      "+27 62 046 9153" -> "27620469153"
+      "27-62-046-9153"  -> "27620469153"
+    If the number appears already international (starts with 27 or +27), keep it.
+    Returns None if input is missing/empty.
     """
     if not raw:
-        return ""
-    s = re.sub(r"\D+", "", raw)  # strip non-digits
-    # Common SA patterns
-    if s.startswith("0") and len(s) == 10:
-        return "+27" + s[1:]
-    if s.startswith("27") and len(s) == 11:
-        return "+" + s
-    if raw.startswith("+") and len(s) >= 10:
-        return "+" + s
-    return ""
+        return None
+    s = str(raw).strip()
+    # Strip spaces and non-digits except leading '+'
+    s = re.sub(r"[^\d+]", "", s)
+
+    if s.startswith("+"):
+        s = s[1:]  # Meta accepts without '+'
+
+    # If it starts with '0' assume South Africa local -> replace with country code 27
+    if s.startswith("0"):
+        s = "27" + s[1:]
+
+    # If it already starts with 27, keep as is
+    # Otherwise, if it looks like an international number without country code, return as-is
+    return s or None
 
 
-def _headers() -> Dict[str, str]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level sender
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wa_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
 
 
-def _post(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+def wa_post(payload: Dict[str, Any]) -> Tuple[int, Any]:
     """
-    Low-level sender. Returns (status_code, parsed_json or {}).
+    Perform the POST to WhatsApp Cloud API /messages.
+    Returns (status_code, parsed_json_or_text).
     """
     try:
-        resp = requests.post(GRAPH_URL, headers=_headers(), data=json.dumps(payload), timeout=20)
-        code = resp.status_code
+        resp = requests.post(GRAPH_URL, headers=_wa_headers(), data=json.dumps(payload), timeout=20)
         try:
-            body = resp.json()
+            data = resp.json()
         except Exception:
-            body = {"raw": resp.text}
-        logging.info("[WA RESP %s] %s", code, json.dumps(body))
-        return code, body
+            data = resp.text
+        logging.info("[WA RESP %s] %s", resp.status_code, json.dumps(data) if isinstance(data, dict) else data)
+        return resp.status_code, data
     except Exception as e:
-        logging.exception("WhatsApp POST failed")
-        return 0, {"error": str(e)}
+        logging.exception("WhatsApp POST failed: %s", e)
+        return 0, str(e)
 
 
-def send_whatsapp_text(to_e164: str, body: str) -> Tuple[int, Dict[str, Any]]:
+# ─────────────────────────────────────────────────────────────────────────────
+# High-level send helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_whatsapp_text(to: str, body: str) -> Tuple[int, Any]:
     """
-    Send a plain text message to a number (inside 24h window).
+    Send a plain text message.
     """
+    to_n = normalize_wa(to)
+    if not to_n:
+        return 0, "invalid recipient"
     payload = {
         "messaging_product": "whatsapp",
-        "to": to_e164,
+        "to": to_n,
         "type": "text",
         "text": {"body": body},
     }
-    return _post(payload)
+    return wa_post(payload)
 
 
-def reply_to_whatsapp(to_e164: str, body: str, reply_to_message_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
+def reply_to_whatsapp(reply_to_id: str, body: str, to: Optional[str] = None) -> Tuple[int, Any]:
     """
-    Reply to a specific inbound message by including WhatsApp 'context.message_id'.
-    - If reply_to_message_id is provided, WA will thread this as a reply.
-    - If omitted, behaves like a normal send.
+    Reply to a specific incoming message by ID (keeps the chat thread clean).
+    If `to` is provided, include it; otherwise Cloud API will route via context.
     """
     payload: Dict[str, Any] = {
         "messaging_product": "whatsapp",
-        "to": to_e164,
+        "context": {"message_id": reply_to_id},
         "type": "text",
         "text": {"body": body},
     }
-    if reply_to_message_id:
-        payload["context"] = {"message_id": reply_to_message_id}
-    return _post(payload)
+    if to:
+        to_n = normalize_wa(to)
+        if not to_n:
+            return 0, "invalid recipient"
+        payload["to"] = to_n
+    return wa_post(payload)
 
 
-def send_whatsapp_template(to_e164: str, template_name: str, components: Optional[List[Dict[str, Any]]] = None,
-                           language_code: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
+def send_whatsapp_template(
+    to: str,
+    template_name: str,
+    components: Optional[List[Dict[str, Any]]] = None,
+    language_code: Optional[str] = None,
+) -> Tuple[int, Any]:
     """
-    Send an approved template.
-    components example:
-      [{"type":"body","parameters":[{"type":"text","text":"09:00"}]}]
+    Send a *template message*.
+      - `components` should match Meta’s template component schema.
+        Example for a single body variable:
+          components=[{"type": "body", "parameters": [{"type": "text", "text": "09:00"}]}]
+      - Language code defaults to TEMPLATE_LANG from config.
     """
-    lang = language_code or TEMPLATE_LANG or "en"
+    to_n = normalize_wa(to)
+    if not to_n:
+        return 0, "invalid recipient"
+
+    lang = language_code or TEMPLATE_LANG
     payload: Dict[str, Any] = {
         "messaging_product": "whatsapp",
-        "to": to_e164,
+        "to": to_n,
         "type": "template",
         "template": {
             "name": template_name,
@@ -116,38 +145,71 @@ def send_whatsapp_template(to_e164: str, template_name: str, components: Optiona
     }
     if components:
         payload["template"]["components"] = components
-    return _post(payload)
+    return wa_post(payload)
 
 
-# Optional convenience wrappers if/when you toggle template mode
-def send_admin_hourly_template(to_e164: str, summary_text: str) -> Tuple[int, Dict[str, Any]]:
+def send_whatsapp_list(
+    to: str,
+    header_text: Optional[str],
+    body_text: str,
+    button_text: str,
+    sections: List[Dict[str, Any]],
+) -> Tuple[int, Any]:
     """
-    Uses a simple 1-variable admin template (e.g., 'admin_hourly_update' with body '{{1}}').
+    Send an interactive LIST message (admin pickers, etc.).
+
+    `sections` format (Meta spec):
+      sections = [
+        {
+          "title": "Optional Section Title",
+          "rows": [
+            {"id": "row_1_id", "title": "Row 1 Title", "description": "Optional desc"},
+            {"id": "row_2_id", "title": "Row 2 Title"},
+          ],
+        },
+        ...
+      ]
+
+    WhatsApp limits: up to 10 total rows across all sections; keep text short.
     """
-    comps = [{"type": "body", "parameters": [{"type": "text", "text": summary_text}]}]
-    return send_whatsapp_template(to_e164, TPL_ADMIN_HOURLY, comps)
+    to_n = normalize_wa(to)
+    if not to_n:
+        return 0, "invalid recipient"
+
+    interactive: Dict[str, Any] = {
+        "type": "list",
+        "body": {"text": body_text},
+        "action": {
+            "button": button_text,
+            "sections": sections,
+        },
+    }
+    if header_text:
+        interactive["header"] = {"type": "text", "text": header_text}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_n,
+        "type": "interactive",
+        "interactive": interactive,
+    }
+    return wa_post(payload)
 
 
-def send_admin_20h00_template(to_e164: str, summary_text: str) -> Tuple[int, Dict[str, Any]]:
-    comps = [{"type": "body", "parameters": [{"type": "text", "text": summary_text}]}]
-    return send_whatsapp_template(to_e164, TPL_ADMIN_20H00, comps)
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience: choose plain text vs. template based on config
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def send_next_hour_template(to_e164: str, hhmm: str) -> Tuple[int, Dict[str, Any]]:
-    comps = [{"type": "body", "parameters": [{"type": "text", "text": hhmm}]}]
-    return send_whatsapp_template(to_e164, TPL_NEXT_HOUR, comps)
-
-
-def send_tomorrow_template(to_e164: str, hhmm: str) -> Tuple[int, Dict[str, Any]]:
-    comps = [{"type": "body", "parameters": [{"type": "text", "text": hhmm}]}]
-    return send_whatsapp_template(to_e164, TPL_TOMORROW, comps)
-
-
-def send_admin_cancel_all_template(to_e164: str, reason_text: str) -> Tuple[int, Dict[str, Any]]:
-    comps = [{"type": "body", "parameters": [{"type": "text", "text": reason_text}]}]
-    return send_whatsapp_template(to_e164, TPL_ADMIN_CANCEL_ALL, comps)
-
-
-def send_admin_update_template(to_e164: str, free_text: str) -> Tuple[int, Dict[str, Any]]:
-    comps = [{"type": "body", "parameters": [{"type": "text", "text": free_text}]}]
-    return send_whatsapp_template(to_e164, TPL_ADMIN_UPDATE, comps)
+def send_admin_text_or_template(
+    to: str,
+    fallback_text: str,
+    template_name: Optional[str] = None,
+    template_components: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[int, Any]:
+    """
+    If USE_TEMPLATES is True and `template_name` is provided, send a template;
+    otherwise send plain text.
+    """
+    if USE_TEMPLATES and template_name:
+        return send_whatsapp_template(to, template_name, template_components)
+    return send_whatsapp_text(to, fallback_text)
