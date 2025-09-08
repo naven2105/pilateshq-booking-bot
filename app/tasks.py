@@ -1,245 +1,148 @@
 # app/tasks.py
 from __future__ import annotations
-
 import logging
-from datetime import datetime
-from flask import request
 from sqlalchemy import text
-
+from flask import request
 from .db import get_session
 from .utils import normalize_wa, send_whatsapp_text
 from .config import NADINE_WA, TZ_NAME
+from . import crud
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Row builders with names included (no WINDOW keyword conflicts).
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ───────────────────────────
-# SQL helpers (Africa/Johannesburg local)
-# ───────────────────────────
-
-def _rows_today_upcoming(include_names: bool = True) -> list[dict]:
+def _rows_today(upcoming_only: bool, include_names: bool = True):
     """
-    All of *today's* sessions that are still upcoming (>= now local).
+    Return today's sessions (optionally upcoming only), with aggregated client names.
     """
-    with get_session() as s:
-        sql = text(f"""
-            WITH now_local AS (
-                SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-            ),
-            upcoming AS (
-                SELECT s.id, s.session_date, s.start_time,
-                       s.capacity, s.booked_count, s.status, COALESCE(s.notes,'') AS notes
-                FROM sessions s, now_local
-                WHERE s.session_date = (now_local.ts)::date
-                  AND s.start_time  >= (now_local.ts)::time
-            )
-            SELECT
-                u.*,
-                COALESCE((
-                    SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                    FROM (
-                        SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                        FROM bookings b2
-                        JOIN clients  c2 ON c2.id = b2.client_id
-                        WHERE b2.session_id = u.id
-                          AND b2.status = 'confirmed'
-                    ) d
-                ), '') AS names
-            FROM upcoming u
-            ORDER BY u.session_date, u.start_time
-        """)
-        rows = [dict(r) for r in s.execute(sql, {"tz": TZ_NAME}).mappings().all()]
-        if not include_names:
-            for r in rows:
-                r["names"] = ""
-        return rows
-
-
-def _rows_today_full_day(include_names: bool = True) -> list[dict]:
-    """
-    All of *today's* sessions (full day in local time).
-    """
-    with get_session() as s:
-        sql = text(f"""
-            WITH now_local AS (
-                SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-            )
-            SELECT
-                s.id, s.session_date, s.start_time,
-                s.capacity, s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
-                COALESCE((
-                    SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                    FROM (
-                        SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                        FROM bookings b2
-                        JOIN clients  c2 ON c2.id = b2.client_id
-                        WHERE b2.session_id = s.id
-                          AND b2.status = 'confirmed'
-                    ) d
-                ), '') AS names
+    base = f"""
+        WITH now_local AS (
+            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
+        ),
+        pool AS (
+            SELECT s.id, s.session_date, s.start_time, s.capacity,
+                   s.booked_count, s.status, COALESCE(s.notes,'') AS notes
             FROM sessions s, now_local
             WHERE s.session_date = (now_local.ts)::date
-            ORDER BY s.session_date, s.start_time
-        """)
-        rows = [dict(r) for r in s.execute(sql, {"tz": TZ_NAME}).mappings().all()]
-        if not include_names:
-            for r in rows:
-                r["names"] = ""
-        return rows
-
-
-def _row_next_upcoming(include_names: bool = True) -> dict | None:
-    """
-    The next session >= now (local), today or later.
-    """
-    with get_session() as s:
-        sql = text(f"""
-            WITH now_local AS (
-                SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-            )
-            SELECT
-                s.id, s.session_date, s.start_time,
-                s.capacity, s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
-                COALESCE((
-                    SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                    FROM (
-                        SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                        FROM bookings b2
-                        JOIN clients  c2 ON c2.id = b2.client_id
-                        WHERE b2.session_id = s.id
-                          AND b2.status = 'confirmed'
-                    ) d
-                ), '') AS names
-            FROM sessions s, now_local
-            WHERE (s.session_date + s.start_time) >= now_local.ts
-            ORDER BY s.session_date, s.start_time
-            LIMIT 1
-        """)
-        row = s.execute(sql, {"tz": TZ_NAME}).mappings().first()
-        if not row:
-            return None
-        d = dict(row)
-        if not include_names:
-            d["names"] = ""
-        return d
-
-
-def _rows_tomorrow_full_day(include_names: bool = True) -> list[dict]:
-    """
-    All of *tomorrow's* sessions (local date).
+            {"AND s.start_time >= (now_local.ts)::time" if upcoming_only else ""}
+        )
+        SELECT
+            p.*,
+            COALESCE((
+                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
+                FROM (
+                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
+                    FROM bookings b2
+                    JOIN clients  c2 ON c2.id = b2.client_id
+                    WHERE b2.session_id = p.id AND b2.status = 'confirmed'
+                ) d
+            ), '') AS names
+        FROM pool p
+        ORDER BY p.session_date, p.start_time
     """
     with get_session() as s:
-        sql = text(f"""
-            WITH now_local AS (
-                SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-            )
-            SELECT
-                s.id, s.session_date, s.start_time,
-                s.capacity, s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
-                COALESCE((
-                    SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                    FROM (
-                        SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                        FROM bookings b2
-                        JOIN clients  c2 ON c2.id = b2.client_id
-                        WHERE b2.session_id = s.id
-                          AND b2.status = 'confirmed'
-                    ) d
-                ), '') AS names
-            FROM sessions s, now_local
-            WHERE s.session_date = ((now_local.ts)::date + INTERVAL '1 day')::date
-            ORDER BY s.session_date, s.start_time
-        """)
-        rows = [dict(r) for r in s.execute(sql, {"tz": TZ_NAME}).mappings().all()]
-        if not include_names:
-            for r in rows:
-                r["names"] = ""
-        return rows
+        return [dict(r) for r in s.execute(text(base), {"tz": TZ_NAME}).mappings().all()]
 
+def _rows_next_hour():
+    """
+    Sessions starting within the next hour (local TZ), with names.
+    """
+    sql = """
+        WITH now_local AS (
+            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
+        ),
+        bounds AS (
+            SELECT date_trunc('hour', ts) AS h, date_trunc('hour', ts) + INTERVAL '1 hour' AS h_plus
+            FROM now_local
+        )
+        SELECT
+            s.id, s.session_date, s.start_time, s.capacity, s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
+            COALESCE((
+                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
+                FROM (
+                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
+                    FROM bookings b2
+                    JOIN clients  c2 ON c2.id = b2.client_id
+                    WHERE b2.session_id = s.id AND b2.status = 'confirmed'
+                ) d
+            ), '') AS names
+        FROM sessions s, bounds
+        WHERE (s.session_date + s.start_time) >= bounds.h
+          AND (s.session_date + s.start_time) <  bounds.h_plus
+        ORDER BY s.start_time
+    """
+    with get_session() as s:
+        return [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
-# ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Formatting
-# ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _status_emoji(r: dict) -> str:
-    full = (str(r.get("status", "")).lower() == "full") or (r.get("booked_count", 0) >= r.get("capacity", 0))
-    return "🔒 full" if full else "✅ open"
-
-def _fmt_names(r: dict) -> str:
-    names = (r.get("names") or "").strip()
-    return names if names else "(no bookings)"
-
-def _fmt_rows(rows: list[dict]) -> str:
+def _fmt_rows_with_names(rows):
     if not rows:
         return "— none —"
     out = []
     for r in rows:
-        hhmm = str(r["start_time"])[:5]
-        out.append(f"• {hhmm} – {_fmt_names(r)}  ({_status_emoji(r)})")
+        full = (str(r["status"]).lower() == "full") or (r["booked_count"] >= r["capacity"])
+        status = "🔒 full" if full else "✅ open"
+        names = (r.get("names") or "").strip()
+        names_part = " (no bookings)" if not names else f" — {names}"
+        out.append(f"• {str(r['start_time'])[:5]}{names_part}  ({status})")
     return "\n".join(out)
 
-def _fmt_today_block(upcoming_only: bool, include_names: bool = True) -> str:
-    rows = _rows_today_upcoming(include_names=include_names) if upcoming_only else _rows_today_full_day(include_names=include_names)
-    if upcoming_only:
-        header = f"🗓 Today’s sessions (upcoming: {len(rows)})"
-    else:
-        header = f"🗓 Today’s sessions (full day: {len(rows)})"
-    return f"{header}\n{_fmt_rows(rows)}"
+def _fmt_today_block(upcoming_only: bool, include_names: bool = True):
+    items = _rows_today(upcoming_only=upcoming_only, include_names=include_names)
+    header = "🗓 Today’s sessions (upcoming)" if upcoming_only else "🗓 Today’s sessions (full day)"
+    return f"{header}\n{_fmt_rows_with_names(items)}"
 
-def _fmt_one_line(r: dict, prefix: str) -> str:
-    if not r:
-        return f"{prefix}: none."
-    hhmm = str(r["start_time"])[:5]
-    # If the next upcoming is not today, include the date
-    return f"{prefix}: {r['session_date']} {hhmm} – {_fmt_names(r)}  ({_status_emoji(r)})"
-
-
-# ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Routes
-# ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def register_tasks(app):
     @app.post("/tasks/admin-notify")
     def admin_notify():
         """
-        Hourly admin summary + next upcoming.
-        - At ~04:00 UTC (≈ 06:00 SAST) show full-day; other hours: upcoming-only.
-        - Always show “Next upcoming” (today or later).
-        - If daily=1: send a 20:00-style recap of *tomorrow* (with names).
+        Hourly admin summary (06:00–18:00 SAST via CRON).
+        • 04:00 UTC pass (≈06:00 SAST) sends FULL DAY; other hours send UPCOMING.
+        • Always appends “Next hour”.
+        • Inserts (idempotently) an 'hourly' inbox row bucketed by hour.
         """
         try:
             src = request.args.get("src", "unknown")
-            daily = request.args.get("daily", "0") == "1"
-            logging.info(f"[admin-notify] src={src} daily={daily}")
+            logging.info(f"[admin-notify] src={src}")
 
-            to = normalize_wa(NADINE_WA)
-            if not to:
-                logging.warning("[admin-notify] NADINE_WA not configured; skipping send.")
-                return "ok", 200
-
-            if daily:
-                # 20:00 recap → tomorrow (with names)
-                rows = _rows_tomorrow_full_day(include_names=True)
-                header = f"🗓 Tomorrow’s sessions ({len(rows)})"
-                msg = f"{header}\n{_fmt_rows(rows)}"
-                send_whatsapp_text(to, msg)
-                logging.info("[TASKS] admin-notify (daily) sent")
-                return "ok", 200
-
-            # Determine UTC hour via DB to avoid container TZ surprises
             with get_session() as s:
                 now_utc_hour = s.execute(text("SELECT EXTRACT(HOUR FROM now())::int AS h")).mappings().first()["h"]
+                # bucket like '2025-09-07-13'
+                bucket = s.execute(
+                    text("SELECT to_char((now() AT TIME ZONE :tz), 'YYYY-MM-DD-HH') AS b"),
+                    {"tz": TZ_NAME}
+                ).mappings().first()["b"]
 
-            body_today = _fmt_today_block(
-                upcoming_only=False if now_utc_hour == 4 else True,
-                include_names=True,
+            body_today = _fmt_today_block(upcoming_only=False if now_utc_hour == 4 else True, include_names=True)
+            nxt = _rows_next_hour()
+            nh_text = "🕒 Next hour:\n" + _fmt_rows_with_names(nxt) if nxt else "🕒 Next hour: no upcoming session."
+            msg = f"{body_today}\n\n{nh_text}"
+
+            # Send to admin (if configured)
+            to = normalize_wa(NADINE_WA)
+            if to:
+                send_whatsapp_text(to, msg)
+
+            # Inbox: idempotent hourly entry
+            crud.inbox_upsert(
+                kind="hourly",
+                title="Hourly update",
+                body=msg,
+                bucket=bucket,
+                source="cron",
+                session_id=None,
+                client_id=None,
+                status="open",
             )
-
-            nxt = _row_next_upcoming(include_names=True)
-            nxt_line = _fmt_one_line(nxt, "🕒 Next upcoming")
-
-            msg = f"{body_today}\n\n{nxt_line}"
-
-            send_whatsapp_text(to, msg)
-            logging.info("[TASKS] admin-notify sent")
+            logging.info("[TASKS] admin-notify sent + inbox")
             return "ok", 200
 
         except Exception:
@@ -249,16 +152,70 @@ def register_tasks(app):
     @app.post("/tasks/run-reminders")
     def run_reminders():
         """
-        Client reminders for the next upcoming *hourly* window were used before,
-        but we now keep this endpoint for compatibility and possible client pings.
-        For now it only logs; admin notifications are handled by /tasks/admin-notify.
+        - daily=0 (default): client next-hour reminders (if any).
+        - daily=1: admin 20:00 daily recap (today), also records a 'daily' inbox row bucketed by date.
         """
         try:
             src = request.args.get("src", "unknown")
+            daily = request.args.get("daily", "0") == "1"
             logging.info(f"[run-reminders] src={src}")
-            # No-op (or keep your previous client reminder code if you still use it)
-            logging.info("[TASKS] run-reminders noop")
-            return "ok", 200
+
+            if daily:
+                # Build today's full-day recap with names.
+                today_all = _rows_today(upcoming_only=False, include_names=True)
+                body = _fmt_rows_with_names(today_all)
+                header = "🗓 Today’s sessions (full day)"
+                msg = f"{header}\n{body}"
+
+                to = normalize_wa(NADINE_WA)
+                if to:
+                    send_whatsapp_text(to, msg)
+
+                # bucket by date 'YYYY-MM-DD'
+                with get_session() as s:
+                    bucket = s.execute(
+                        text("SELECT to_char((now() AT TIME ZONE :tz), 'YYYY-MM-DD') AS b"),
+                        {"tz": TZ_NAME}
+                    ).mappings().first()["b"]
+
+                crud.inbox_upsert(
+                    kind="daily",
+                    title="Daily recap (20:00)",
+                    body=msg,
+                    bucket=bucket,
+                    source="cron",
+                )
+                logging.info("[TASKS] run-reminders daily recap + inbox")
+                return "ok sent=0", 200
+
+            # Hourly client reminders (unchanged here; you can keep templates if needed)
+            rows = _rows_next_hour()
+            sent = 0
+            if not rows:
+                logging.info(f"[TASKS] run-reminders sent={sent} [run-reminders] src={src}")
+                return f"ok sent={sent}", 200
+
+            with get_session() as s:
+                for sess in rows:
+                    attendees = s.execute(text("""
+                        SELECT c.wa_number AS wa
+                        FROM bookings b
+                        JOIN clients  c ON c.id = b.client_id
+                        WHERE b.session_id = :sid AND b.status = 'confirmed'
+                    """), {"sid": sess["id"]}).mappings().all()
+                    if not attendees:
+                        continue
+                    hhmm = str(sess["start_time"])[:5]
+                    for a in attendees:
+                        send_whatsapp_text(
+                            normalize_wa(a["wa"]),
+                            f"⏰ Reminder: Your Pilates session starts at {hhmm} today. Reply CANCEL if you cannot attend."
+                        )
+                        sent += 1
+
+            logging.info(f"[TASKS] run-reminders sent={sent} [run-reminders] src={src}")
+            return f"ok sent={sent}", 200
+
         except Exception:
             logging.exception("run-reminders failed")
             return "error", 500

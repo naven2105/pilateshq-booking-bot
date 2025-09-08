@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Optional, Tuple
 
-from flask import request, jsonify
+from flask import request
 
 from .config import ADMIN_NUMBERS, VERIFY_TOKEN
 from .utils import normalize_wa, send_whatsapp_text
@@ -13,7 +13,7 @@ from .crud import client_exists_by_wa, upsert_public_client
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers – Public/Lead Experience
+# Public (Lead / FAQ) helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 PUBLIC_MENU = (
@@ -65,22 +65,22 @@ def _intent_and_payload(text: str) -> Tuple[str, Optional[str]]:
     if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
         return "menu", None
 
-    # Try smart keyword matching
-    if "price" in t or "cost" in t or "fee" in t:
+    # Keyword matching
+    if any(k in t for k in ["price", "cost", "fee"]):
         return "pricing", None
-    if "address" in t or "parking" in t or "where" in t or "located" in t:
+    if any(k in t for k in ["address", "parking", "where", "located", "location"]):
         return "address", None
-    if "schedule" in t or "time" in t or "open" in t or "hour" in t:
+    if any(k in t for k in ["schedule", "time", "open", "hour", "hours"]):
         return "schedule", None
-    if "group" in t or "size" in t:
+    if any(k in t for k in ["group", "size"]):
         return "group_sizes", None
-    if "equip" in t or "reformer" in t or "chair" in t or "mat" in t:
+    if any(k in t for k in ["equip", "reformer", "chair", "mat"]):
         return "equipment", None
-    if "start" in t or "assessment" in t or "begin" in t:
+    if any(k in t for k in ["start", "assessment", "begin"]):
         return "how_to_start", None
-    if "book" in t or "reserve" in t:
+    if any(k in t for k in ["book", "reserve"]):
         return "book_request", None
-    if "contact" in t or "call" in t or "email" in t or "whatsapp" in t:
+    if any(k in t for k in ["contact", "call", "email", "whatsapp"]):
         return "contact", None
 
     # Fallback: show menu
@@ -151,30 +151,28 @@ def _handle_public_message(wa: str, body: str) -> None:
     try:
         exists = client_exists_by_wa(wa)
         if not exists:
-            # Create a light lead record; name can be set later
-            upsert_public_client(wa, None)
+            upsert_public_client(wa, None)  # create light lead record
     except Exception:
         logging.exception("Lead upsert failed (non-fatal)")
 
     intent, _ = _intent_and_payload(body)
 
-    # For “book request”, also ping admins via the normal admin channel
+    # “Book” also notifies admins
     if intent == "book_request":
         response = _faq_response(intent) + "\n\n" + _public_menu()
         send_whatsapp_text(wa, response)
-        # Let admin flow know (simple signal message)
         try:
             for admin in ADMIN_NUMBERS:
                 send_whatsapp_text(
                     normalize_wa(admin),
                     f"📩 *New booking request* from {wa}\n"
-                    f"Message: {body.strip() or '(no extra details)'}"
+                    f"Message: {(body or '').strip() or '(no extra details)'}"
                 )
         except Exception:
             logging.exception("Failed to notify admins about a booking request")
         return
 
-    # Normal FAQ reply
+    # Normal FAQ reply (always append the menu)
     if intent == "menu":
         send_whatsapp_text(wa, "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu())
     else:
@@ -190,13 +188,18 @@ def register_routes(app):
     Mounts:
       GET  /webhook  – Meta verification (hub.mode=subscribe; hub.verify_token; hub.challenge)
       POST /webhook  – WhatsApp Cloud API inbound
+      GET  /health   – health check (unique endpoint name to avoid collisions)
       GET  /         – simple OK
     """
-    @app.get("/")
+    @app.get("/", endpoint="root_ok")
     def root():
         return "ok", 200
 
-    @app.get("/webhook")
+    @app.get("/health", endpoint="health_router")
+    def health():
+        return "ok", 200
+
+    @app.get("/webhook", endpoint="webhook_verify")
     def webhook_verify():
         # Meta’s verification handshake
         mode = request.args.get("hub.mode")
@@ -207,20 +210,19 @@ def register_routes(app):
             return challenge, 200
         return "forbidden", 403
 
-    @app.post("/webhook")
+    @app.post("/webhook", endpoint="webhook_receive")
     def webhook():
         try:
             data = request.get_json(force=True, silent=True) or {}
+
             # WhatsApp payload structure (Cloud API):
             # entry[0].changes[0].value.messages[0]
-            entry = (data.get("entry") or [])
+            entry = data.get("entry") or []
             if not entry:
                 return "ok", 200
-
-            changes = (entry[0].get("changes") or [])
+            changes = entry[0].get("changes") or []
             if not changes:
                 return "ok", 200
-
             value = changes[0].get("value") or {}
             msgs = value.get("messages") or []
             if not msgs:
@@ -231,7 +233,7 @@ def register_routes(app):
             from_wa = normalize_wa(from_wa_raw)
             msg_type = msg.get("type")
 
-            # Pull text body (supports text and interactive replies)
+            # Extract body from text / interactive
             body = ""
             if msg_type == "text":
                 body = (msg.get("text") or {}).get("body", "") or ""
@@ -244,22 +246,17 @@ def register_routes(app):
                 else:
                     body = ""
             else:
-                # Other types (image, sticker, etc.) → prompt with menu
+                # Non-text types → treat as empty (we’ll send menu)
                 body = ""
 
-            # Route: admin vs public
+            # Admin vs Public
             if from_wa in ADMIN_NUMBERS:
-                # Keep admin handler signature consistent with your admin.py
+                # Prefer the (wa, reply_id, body) signature for richer commands
                 try:
-                    handle_admin_action(from_wa, msg.get("id"))
+                    handle_admin_action(from_wa, msg.get("id"), body)
                 except TypeError:
-                    # If your admin.py expects (wa, reply_id, body), try this:
-                    try:
-                        handle_admin_action(from_wa, msg.get("id"), body)
-                    except Exception:
-                        logging.exception("admin handler failed")
-                except Exception:
-                    logging.exception("admin handler failed")
+                    # Fallback to legacy (wa, reply_id)
+                    handle_admin_action(from_wa, msg.get("id"))
             else:
                 _handle_public_message(from_wa, body)
 
