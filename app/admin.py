@@ -1,133 +1,85 @@
 # app/admin.py
+
 from __future__ import annotations
-
-import re
 import logging
-from typing import Optional
+from sqlalchemy import text
 
-from .utils import send_whatsapp_text, normalize_wa
-from . import crud
+from .utils import send_whatsapp_text
+from .db import get_session
+from .config import TZ_NAME
+# import the same helpers your cron uses
+from .tasks import _fmt_today_block, _rows_next_hour
 
-INBOX_HELP = (
-    "📥 *Admin Inbox commands*\n"
-    "• INBOX — show latest admin items\n"
-    "• VIEW <id> — view a single inbox item\n"
-    "• CLOSE <id> — mark an inbox item closed"
-)
-
-
-def _fmt_inbox_summary() -> str:
-    """Compact summary: counts by kind + last few entries per kind."""
-    counts = {}
-    try:
-        counts = crud.inbox_counts_by_kind()
-    except Exception:
-        logging.exception("inbox_counts_by_kind failed")
-
-    # Always include the four primary kinds for a consistent header
-    kinds = ["proposal", "query", "hourly", "daily"]
-    hdr = "📥 *Admin Inbox*  |  " + "  ".join(
-        f"{k.capitalize()}({int(counts.get(k, 0))})" for k in kinds
-    )
-
-    lines = [hdr, ""]
-    try:
-        recent = crud.inbox_recent(limit_per_kind=5)
-        for k in kinds:
-            items = (recent or {}).get(k, [])
-            if not items:
-                continue
-            lines.append(f"— *{k.upper()}* —")
-            for it in items:
-                # Example line: #123 • Hourly update  [open]
-                title = it.get("title") or "(no title)"
-                status = it.get("status") or "open"
-                lines.append(f"#{it['id']} • {title}  [{status}]")
-            lines.append("")  # spacer
-    except Exception:
-        logging.exception("inbox_recent failed")
-        lines.append("_(Recent items unavailable right now.)_")
-        lines.append("")
-
-    lines.append(INBOX_HELP)
-    return "\n".join(lines)
-
-
-def _fmt_inbox_item(id_: int) -> str:
-    """Full single item view with metadata and body."""
-    try:
-        it = crud.inbox_get(id_)
-    except Exception:
-        logging.exception("inbox_get failed")
-        it = None
-
-    if not it:
-        return f"Item #{id_} not found."
-
-    lines = [
-        f"#{it['id']} • *{it['kind'].upper()}*  [{it['status']}]",
-        f"*Title:* {it.get('title') or '(no title)'}",
-        f"*Source:* {it.get('source') or 'system'}    *Bucket:* {it.get('bucket') or '-'}",
-        f"*Created:* {it.get('created_at')}",
-        "",
-        it.get("body") or "(no body)",
-        "",
-        f"Actions: CLOSE {id_}"
-    ]
-    return "\n".join(lines)
-
-
-def _handle_text_command(to_wa: str, text: str) -> None:
+def _admin_hourly_text() -> str:
     """
-    Parse and execute INBOX / VIEW / CLOSE.
+    Build the same hourly message as /tasks/admin-notify (upcoming + next hour).
+    We don’t bother with the 04:00 full-day branch when sent manually.
     """
-    t = (text or "").strip()
+    body_today = _fmt_today_block(upcoming_only=True, include_names=True)
+    nxt = _rows_next_hour()
+    if nxt:
+        lines = []
+        for r in nxt:
+            names = (r.get("names") or "").strip()
+            nm = names if names else "(no bookings)"
+            status = (r.get("status") or "").lower()
+            is_full = (status == "full") or (r.get("booked_count", 0) >= r.get("capacity", 0))
+            badge = "🔒 full" if is_full else "✅ open"
+            lines.append(f"• {str(r['start_time'])[:5]} – {nm}  ({badge})")
+        nxt_block = "🕒 Next hour:\n" + "\n".join(lines)
+    else:
+        nxt_block = "🕒 Next hour: no upcoming session"
 
-    # INBOX (exact match, case-insensitive) or HELP
-    if re.fullmatch(r"(inbox|help)", t, flags=re.IGNORECASE):
-        send_whatsapp_text(to_wa, _fmt_inbox_summary())
+    return f"{body_today}\n\n{nxt_block}"
+
+def _is_after_20_sast() -> bool:
+    """
+    Return True if current SA-local time is >= 20:00 (no more hourlies after recap).
+    """
+    with get_session() as s:
+        # Evaluate in DB to stay in sync with SQL usage elsewhere
+        row = s.execute(text(f"SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz)::time AS t"),
+                        {"tz": TZ_NAME}).mappings().first()
+        t = str(row["t"])[:5]  # 'HH:MM'
+        return t >= "20:00"
+
+def handle_admin_action(wa: str, reply_id: str | None = None, body: str | None = None) -> None:
+    """
+    Minimal command router for admins.
+    Accepts plain text commands like 'hourly', 'recap', 'help'.
+    """
+    txt = (body or "").strip().lower()
+
+    # QUICK HELP
+    if txt in {"help", "menu"}:
+        send_whatsapp_text(wa,
+            "🔧 Admin commands:\n"
+            "• hourly – show today’s upcoming + next-hour\n"
+            "• recap – show full-day recap (like 20:00)\n"
+        )
         return
 
-    # VIEW <id>
-    m = re.match(r"^view\s+(\d+)$", t, flags=re.IGNORECASE)
-    if m:
-        send_whatsapp_text(to_wa, _fmt_inbox_item(int(m.group(1))))
-        return
-
-    # CLOSE <id>
-    m = re.match(r"^close\s+(\d+)$", t, flags=re.IGNORECASE)
-    if m:
+    # HOURLY: block hourlies after 20:00 SAST (your rule)
+    if txt == "hourly":
+        if _is_after_20_sast():
+            send_whatsapp_text(wa, "It’s after 20:00 SAST—no further hourly updates today ✅")
+            return
         try:
-            crud.inbox_mark_closed(int(m.group(1)))
-            send_whatsapp_text(to_wa, f"Item #{m.group(1)} marked closed.")
+            send_whatsapp_text(wa, _admin_hourly_text())
         except Exception:
-            logging.exception("inbox_mark_closed failed")
-            send_whatsapp_text(to_wa, "Sorry — couldn’t close that item right now.")
+            logging.exception("admin hourly build failed")
+            send_whatsapp_text(wa, "Sorry—failed to build hourly update.")
         return
 
-    # Fallback help
-    send_whatsapp_text(to_wa, f"Unknown admin command.\n\n{INBOX_HELP}")
-
-
-def handle_admin_action(sender_wa: str, reply_id: Optional[str] = None, text: Optional[str] = None) -> None:
-    """
-    Entry point used by router.py.
-
-    Your router sometimes invokes:
-      handle_admin_action(wa, msg_id)
-    and as a fallback:
-      handle_admin_action(wa, msg_id, body)
-
-    We normalize the sender number and:
-      • If text is present → parse commands.
-      • If no text → show the INBOX summary to keep things useful.
-    """
-    to = normalize_wa(sender_wa)
-
-    # When an interactive button/list reply arrives, router may pass the chosen title as `text`.
-    if text and text.strip():
-        _handle_text_command(to, text.strip())
+    # RECAP: a manual “20:00-style” full-day view
+    if txt == "recap":
+        try:
+            msg = _fmt_today_block(upcoming_only=False, include_names=True)
+            send_whatsapp_text(wa, msg)
+        except Exception:
+            logging.exception("admin recap build failed")
+            send_whatsapp_text(wa, "Sorry—failed to build daily recap.")
         return
 
-    # No text available — default to showing the inbox summary (nice UX).
-    send_whatsapp_text(to, _fmt_inbox_summary())
+    # FALLBACK
+    send_whatsapp_text(wa, "Unknown admin message. Type *help* for commands.")
