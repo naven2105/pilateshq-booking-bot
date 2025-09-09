@@ -179,10 +179,9 @@ def register_tasks(app):
                     ).mappings().first()["b"]
 
                 crud.inbox_upsert(
-                    kind="daily",
-                    title="Daily recap (20:00)",
-                    body=msg,
-                    bucket=bucket,
+                    kind="recap",
+                    title="20:00 recap",
+                    body=body,
                     source="cron",
                 )
                 logging.info("[TASKS] run-reminders daily recap + inbox")
