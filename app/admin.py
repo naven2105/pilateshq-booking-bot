@@ -2,230 +2,247 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, List, Dict
+from typing import Optional, Dict, Literal, List, Tuple
 
-from .utils import (
-    send_whatsapp_text,
-    send_whatsapp_buttons,
-    normalize_wa,
-)
-from .config import TZ_NAME
+from .utils import send_whatsapp_text
 from .crud import (
-    inbox_counts,
-    sessions_today_with_names,
-    sessions_next_hour_with_names,
-    list_clients,
+    find_clients_by_prefix,
+    find_one_client,
+    client_upcoming_bookings,
+    client_recent_history,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Button payload IDs (keep short, stable)
+# Ephemeral admin context
 # ──────────────────────────────────────────────────────────────────────────────
-BTN_MAIN_INBOX     = "ADMIN_INBOX"
-BTN_MAIN_CLIENTS   = "ADMIN_CLIENTS"
-BTN_MAIN_SESSIONS  = "ADMIN_SESSIONS"
 
-BTN_INBOX_OPEN     = "INBOX_OPEN"
-BTN_INBOX_MARKREAD = "INBOX_MARKREAD"
-BTN_BACK_HOME      = "BACK_HOME"
+AdminMode = Literal["idle", "client_search"]
 
-BTN_CLIENTS_LIST   = "CLIENTS_LIST"
-BTN_CLIENTS_SEARCH = "CLIENTS_SEARCH"   # (future)
-BTN_CLIENTS_BACK   = BTN_BACK_HOME
+_ADMIN_CTX: Dict[str, AdminMode] = {}   # key = admin wa, value = mode
 
-BTN_SES_HOURLY     = "SES_HOURLY"
-BTN_SES_TODAY      = "SES_TODAY"
-BTN_SES_RECAP      = "SES_RECAP"
-BTN_SES_BACK       = BTN_BACK_HOME
+
+def _set_mode(wa: str, mode: AdminMode) -> None:
+    _ADMIN_CTX[wa] = mode
+
+
+def _get_mode(wa: str) -> AdminMode:
+    return _ADMIN_CTX.get(wa, "idle")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Menus
+# Admin Menu Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def _format_badges() -> str:
-    counts = inbox_counts()
-    unread = counts.get("unread", 0)
-    act    = counts.get("action_required", 0)
-    parts: List[str] = []
-    if unread:
-        parts.append(f"🔔 Unread: {unread}")
-    if act:
-        parts.append(f"❗ Action: {act}")
-    return ("  •  " + "  |  ".join(parts)) if parts else ""
+
+def _admin_menu_text() -> str:
+    return (
+        "🛠 *Admin Menu*\n"
+        "• Inbox – type *inbox*\n"
+        "• Clients – type *clients* (search & view)\n"
+        "• Sessions – type *sessions*\n"
+        "• Hourly – type *hourly*\n"
+        "• Recap – type *recap*\n"
+        "• Menu – type *menu*\n"
+    )
 
 
-def show_admin_home(wa: str) -> None:
-    """Main admin menu with 3 buttons."""
-    title = "🛠️ Admin menu" + _format_badges()
-    # At most 3 reply buttons
-    buttons = [
-        {"id": BTN_MAIN_INBOX,    "title": "Inbox"},
-        {"id": BTN_MAIN_CLIENTS,  "title": "Clients"},
-        {"id": BTN_MAIN_SESSIONS, "title": "Sessions"},
-    ]
-    send_whatsapp_buttons(wa, title, buttons)
-
-
-def show_inbox_menu(wa: str) -> None:
-    title = "🗂 Inbox"
-    buttons = [
-        {"id": BTN_INBOX_OPEN,     "title": "Open items"},
-        {"id": BTN_INBOX_MARKREAD, "title": "Mark all read"},
-        {"id": BTN_BACK_HOME,      "title": "Back"},
-    ]
-    send_whatsapp_buttons(wa, title, buttons)
-
-
-def show_clients_menu(wa: str) -> None:
-    title = "👥 Clients"
-    buttons = [
-        {"id": BTN_CLIENTS_LIST,  "title": "List 10"},
-        {"id": BTN_CLIENTS_SEARCH,"title": "Search (soon)"},
-        {"id": BTN_CLIENTS_BACK,  "title": "Back"},
-    ]
-    send_whatsapp_buttons(wa, title, buttons)
-
-
-def show_sessions_menu(wa: str) -> None:
-    title = "🗓 Sessions"
-    buttons = [
-        {"id": BTN_SES_HOURLY, "title": "Hourly now"},
-        {"id": BTN_SES_TODAY,  "title": "Today (names)"},
-        {"id": BTN_SES_RECAP,  "title": "20:00 recap"},
-    ]
-    send_whatsapp_buttons(wa, title, buttons)
+def _clients_help_text() -> str:
+    return (
+        "👤 *Client Search*\n"
+        "• Type *≥3 letters* of the client’s *name* (e.g., `nad`, `tha`).\n"
+        "• Or type WA number prefix (e.g., `2777`).\n"
+        "• To open a profile: `view <name>`, `view <wa>`, or `view #<id>`\n"
+        "• Type *menu* to go back."
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Content builders
+# Utilities
 # ──────────────────────────────────────────────────────────────────────────────
-def _fmt_rows(rows: List[Dict]) -> str:
+
+def _parse_view_command(text: str) -> Optional[str]:
+    """
+    Accepts:
+      - 'view something'
+      - 'v something'
+    Returns the string after the command, trimmed, or None.
+    """
+    t = (text or "").strip()
+    low = t.lower()
+    if low.startswith("view "):
+        return t[5:].strip()
+    if low.startswith("v "):
+        return t[2:].strip()
+    if low == "view" or low == "v":
+        return ""  # user typed view without arg
+    return None
+
+
+def _format_client_hits(rows: List[dict]) -> str:
     if not rows:
-        return "— none —"
-    out = []
+        return "No matches found. Try different letters (min 3)."
+
+    lines = ["🔎 *Matches*"]
     for r in rows:
-        start = str(r["start_time"])[:5]
-        names = (r.get("names") or "").strip()
-        if names:
-            out.append(f"• {start} – {names}  ({'🔒 full' if str(r['status']).lower()=='full' else '✅ open'})")
-        else:
-            out.append(f"• {start} – (no bookings)  ({'🔒 full' if str(r['status']).lower()=='full' else '✅ open'})")
+        name = (r.get("name") or "").strip() or "—"
+        wa = r.get("wa_number") or "—"
+        plan = (r.get("plan") or "—").strip() or "—"
+        credits = r.get("credits")
+        cid = r.get("id")
+        lines.append(f"• #{cid}  {name}  ({wa})  – plan: {plan}, credits: {credits}")
+    lines.append("\nTip: `view #<id>` to open a profile.")
+    return "\n".join(lines)
+
+
+def _fmt_bookings(rows: List[dict], title: str) -> str:
+    if not rows:
+        return f"{title}\n— none —"
+    out = [title]
+    for r in rows:
+        dt = r.get("local_dt", "")  # 'YYYY-MM-DD HH:MM'
+        status = r.get("status", "")
+        out.append(f"• {dt}  ({status})")
     return "\n".join(out)
 
 
-def _send_hourly_now(wa: str) -> None:
-    nxt = sessions_next_hour_with_names(TZ_NAME)
-    if nxt:
-        body = "🕒 Next hour:\n" + _fmt_rows(nxt)
-    else:
-        body = "🕒 Next hour: no upcoming session."
-    send_whatsapp_text(wa, body)
-    # Return to menu for discoverability
-    show_sessions_menu(wa)
+def _format_client_profile(client: dict) -> str:
+    name = (client.get("name") or "").strip() or "—"
+    wa = client.get("wa_number") or "—"
+    plan = (client.get("plan") or "—").strip() or "—"
+    credits = client.get("credits")
+    cid = client.get("id")
 
+    header = f"👤 *Client #{cid}*\n{name}  ({wa})\nPlan: {plan} | Credits: {credits}"
 
-def _send_today_names(wa: str) -> None:
-    rows = sessions_today_with_names(TZ_NAME, upcoming_only=True)
-    header = "🗓 Today’s sessions (upcoming)"
-    body = f"{header}\n{_fmt_rows(rows)}"
-    send_whatsapp_text(wa, body)
-    show_sessions_menu(wa)
+    # Fetch upcoming + a tiny history
+    upcoming = client_upcoming_bookings(cid, limit=6)
+    recent   = client_recent_history(cid, limit=3)
 
-
-def _send_recap(wa: str) -> None:
-    rows = sessions_today_with_names(TZ_NAME, upcoming_only=False)
-    header = "🗓 Today’s sessions (full day)"
-    body = f"{header}\n{_fmt_rows(rows)}"
-    send_whatsapp_text(wa, body)
-    show_sessions_menu(wa)
-
-
-def _send_inbox_open(wa: str) -> None:
-    # Minimal placeholder list (extend later with real SELECT)
-    counts = inbox_counts()
-    unread = counts.get("unread", 0)
-    act    = counts.get("action_required", 0)
-    send_whatsapp_text(wa, f"🗂 Inbox\nUnread: {unread}\nAction required: {act}\n\n(Full list view coming next.)")
-    show_inbox_menu(wa)
-
-
-def _mark_all_read(wa: str) -> None:
-    # Minimal placeholder; implement a real UPDATE when you’re ready.
-    send_whatsapp_text(wa, "✅ Marked all as read. (Note: wire the UPDATE when ready.)")
-    show_inbox_menu(wa)
-
-
-def _send_clients_list(wa: str) -> None:
-    rows = list_clients(limit=10, offset=0)
-    if not rows:
-        send_whatsapp_text(wa, "No clients found.")
-        show_clients_menu(wa)
-        return
-    lines = []
-    for r in rows:
-        nm = (r.get("name") or "").strip() or "(no name)"
-        wn = r.get("wa_number") or ""
-        lines.append(f"• {nm} – {wn}")
-    send_whatsapp_text(wa, "👥 Clients (first 10):\n" + "\n".join(lines))
-    show_clients_menu(wa)
+    body = [
+        header,
+        _fmt_bookings(upcoming, "🗓 *Upcoming*"),
+        _fmt_bookings(recent, "📜 *Recent*"),
+        "\nQuick actions (type):",
+        "• `message #ID <text>` – send WhatsApp",
+        "• `cancel #ID <YYYY-MM-DD HH:MM>` – request cancellation",
+        "• `menu` – back to Admin Menu",
+    ]
+    return "\n".join(body)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entry point from router
+# Main entry
 # ──────────────────────────────────────────────────────────────────────────────
-def handle_admin_action(
-    wa: str,
-    reply_id: Optional[str] = None,
-    body: Optional[str] = None,
-    btn_id: Optional[str] = None,
-) -> None:
+
+def handle_admin_action(admin_wa: str, reply_id: Optional[str] = None,
+                        body: str = "", btn_id: Optional[str] = None) -> None:
     """
-    Unified admin dispatcher.
-    - Prioritises button payload id (btn_id) if present.
-    - Falls back to simple text commands: inbox, clients, sessions, hourly, recap, help.
-    - Always returns the user to a button menu after an action.
+    Simplified admin handler:
+    - 'menu' → menu
+    - 'clients' → client search mode
+    - In client search mode:
+        • ≥3 chars → search
+        • 'view <wa|name|#id>' → open profile
     """
-    wa = normalize_wa(wa)
-    cmd = (body or "").strip().lower()
+    try:
+        text = (body or "").strip()
+        tlow = text.lower()
 
-    # 1) Button-first routing
-    if btn_id:
-        if btn_id == BTN_MAIN_INBOX:    return show_inbox_menu(wa)
-        if btn_id == BTN_MAIN_CLIENTS:  return show_clients_menu(wa)
-        if btn_id == BTN_MAIN_SESSIONS: return show_sessions_menu(wa)
+        # Button ids (if you wire WA interactive buttons later)
+        if btn_id:
+            if btn_id == "adm_menu":
+                _set_mode(admin_wa, "idle")
+                send_whatsapp_text(admin_wa, _admin_menu_text())
+                return
+            if btn_id == "adm_clients":
+                _set_mode(admin_wa, "client_search")
+                send_whatsapp_text(admin_wa, _clients_help_text())
+                return
 
-        if btn_id == BTN_INBOX_OPEN:     return _send_inbox_open(wa)
-        if btn_id == BTN_INBOX_MARKREAD: return _mark_all_read(wa)
-        if btn_id == BTN_BACK_HOME:      return show_admin_home(wa)
+        # Global keywords
+        if tlow in {"menu", "help", "hi", "hello", "admin"}:
+            _set_mode(admin_wa, "idle")
+            send_whatsapp_text(admin_wa, _admin_menu_text())
+            return
 
-        if btn_id == BTN_CLIENTS_LIST:   return _send_clients_list(wa)
-        if btn_id == BTN_CLIENTS_SEARCH: return send_whatsapp_text(wa, "🔎 Search coming soon…") or show_clients_menu(wa)
+        if tlow == "clients":
+            _set_mode(admin_wa, "client_search")
+            send_whatsapp_text(admin_wa, _clients_help_text())
+            return
 
-        if btn_id == BTN_SES_HOURLY: return _send_hourly_now(wa)
-        if btn_id == BTN_SES_TODAY:  return _send_today_names(wa)
-        if btn_id == BTN_SES_RECAP:  return _send_recap(wa)
+        mode = _get_mode(admin_wa)
 
-    # 2) Text fallback routing
-    if cmd in {"admin", "menu", "help"}:
-        return show_admin_home(wa)
+        # ── Client search mode
+        if mode == "client_search":
+            # Handle 'view …'
+            view_arg = _parse_view_command(text)
+            if view_arg is not None:
+                q = (view_arg or "").strip()
+                if not q:
+                    send_whatsapp_text(
+                        admin_wa,
+                        "Usage:\n• `view #109`\n• `view 2777…`\n• `view Nadine`\n\n" + _clients_help_text()
+                    )
+                    return
 
-    if cmd in {"inbox"}:
-        return show_inbox_menu(wa)
+                # Resolve one client
+                client = find_one_client(q)
+                if not client:
+                    send_whatsapp_text(admin_wa, "No client matched that query.\n\n" + _clients_help_text())
+                    return
 
-    if cmd in {"clients", "client"}:
-        return show_clients_menu(wa)
+                send_whatsapp_text(admin_wa, _format_client_profile(client) + "\n\n" + _clients_help_text())
+                return
 
-    if cmd in {"sessions", "session"}:
-        return show_sessions_menu(wa)
+            # Exit / back
+            if tlow in {"exit", "quit", "back"}:
+                _set_mode(admin_wa, "idle")
+                send_whatsapp_text(admin_wa, "Exited client search.\n\n" + _admin_menu_text())
+                return
 
-    if cmd in {"hourly"}:
-        return _send_hourly_now(wa)
+            # Prefix search
+            q = text.strip()
+            if len(q) >= 3:
+                rows = find_clients_by_prefix(q, limit=10)
+                send_whatsapp_text(admin_wa, _format_client_hits(rows) + "\n\n" + _clients_help_text())
+                return
 
-    if cmd in {"today", "names", "upcoming"}:
-        return _send_today_names(wa)
+            send_whatsapp_text(admin_wa, "Please type at least *3 characters*.\n\n" + _clients_help_text())
+            return
 
-    if cmd in {"recap", "20:00", "2000", "tonight"}:
-        return _send_recap(wa)
+        # Other admin stubs
+        if tlow == "hourly":
+            send_whatsapp_text(
+                admin_wa,
+                "Hourly summary will continue to arrive each hour automatically.\n\n" + _admin_menu_text()
+            )
+            return
 
-    # Unknown → show home
-    send_whatsapp_text(wa, "I didn’t recognise that. Here’s the admin menu:")
-    show_admin_home(wa)
+        if tlow == "recap":
+            send_whatsapp_text(
+                admin_wa,
+                "The 20:00 daily recap will be sent automatically.\n\n" + _admin_menu_text()
+            )
+            return
+
+        if tlow == "inbox":
+            send_whatsapp_text(
+                admin_wa,
+                "Inbox coming soon: you'll see unread/actionable items here.\n\n" + _admin_menu_text()
+            )
+            return
+
+        if tlow == "sessions":
+            send_whatsapp_text(
+                admin_wa,
+                "Sessions quick view coming soon.\n\n" + _admin_menu_text()
+            )
+            return
+
+        # Fallback
+        if mode == "client_search":
+            send_whatsapp_text(admin_wa, _clients_help_text())
+        else:
+            send_whatsapp_text(admin_wa, "Unknown admin message.\n\n" + _admin_menu_text())
+
+    except Exception:
+        logging.exception("handle_admin_action failed")
