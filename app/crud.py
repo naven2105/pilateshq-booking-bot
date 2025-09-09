@@ -8,6 +8,8 @@ from sqlalchemy import text
 from .db import get_session
 from .utils import normalize_wa
 
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Existence + create/ensure lead client
 # ──────────────────────────────────────────────────────────────────────────────
@@ -56,47 +58,48 @@ def upsert_public_client(wa_number: str, name: Optional[str]) -> dict:
 
 def inbox_upsert(
     *,
-    kind: str,                 # 'booking_request' | 'query' | 'hourly' | 'recap' | 'system'
+    kind: str,
     title: str,
     body: str,
-    client_id: Optional[int] = None,
-    session_id: Optional[int] = None,
-    source: str = "system",    # 'whatsapp' | 'cron' | 'system'
-    status: str = "open",      # 'open' | 'in_progress' | 'closed'
+    source: str = "system",
+    status: str = "open",
     is_unread: bool = True,
     action_required: bool = False,
-    bucket: Optional[str] = None,   # e.g., '2025-09-08-05' for hourly dedupe
-) -> Optional[int]:
-    """
-    Insert an admin_inbox item with a stable digest so repeats are ignored.
-    Returns new id if inserted; None if deduped by digest.
-    Requires columns: is_unread, action_required, bucket, digest.
-    """
+    bucket: str | None = None,
+    session_id: int | None = None,
+    client_id: int | None = None,
+):
+    # Accept legacy/aliases
+    alias_map = {"daily": "recap"}
+    kind = alias_map.get(kind, kind)
+
     allowed = {"booking_request", "query", "hourly", "recap", "system"}
     if kind not in allowed:
         raise ValueError(f"Unsupported inbox kind: {kind}")
 
-    dg_src = f"{kind}|{title}|{body}|{client_id or ''}|{session_id or ''}|{source}|{status}|{bucket or ''}"
-    digest = sha256(dg_src.encode("utf-8")).hexdigest()
+    # Idempotency on (kind, title, body, bucket)
+    digest = sha256(f"{kind}|{title}|{body}|{bucket or ''}".encode("utf-8")).hexdigest()
+
+    sql = text("""
+        INSERT INTO admin_inbox
+          (kind, title, body, session_id, client_id, source, status,
+           is_unread, action_required, bucket, digest)
+        VALUES
+          (:k,   :t,    :b,   :sid,       :cid,       :src,   :st,
+           :ur,      :ar,             :bk,    :dg)
+        ON CONFLICT (digest) DO NOTHING
+        RETURNING id
+    """)
 
     with get_session() as s:
-        row = s.execute(text("""
-            INSERT INTO admin_inbox
-              (kind, title, body, session_id, client_id, source, status,
-               is_unread, action_required, bucket, digest)
-            VALUES
-              (:k,   :t,    :b,   :sid,       :cid,       :src,   :st,
-               :iu,       :ar,            :bk,    :dg)
-            ON CONFLICT (digest) DO NOTHING
-            RETURNING id
-        """), {
+        row = s.execute(sql, {
             "k": kind, "t": title, "b": body,
             "sid": session_id, "cid": client_id,
             "src": source, "st": status,
-            "iu": bool(is_unread), "ar": bool(action_required),
+            "ur": bool(is_unread), "ar": bool(action_required),
             "bk": bucket, "dg": digest,
         }).mappings().first()
-        return (row and row["id"]) or None
+        return (row or {}).get("id")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Optional search helpers (used by admin search / menus)

@@ -133,14 +133,14 @@ def register_tasks(app):
 
             # Inbox: idempotent hourly entry
             crud.inbox_upsert(
-                kind="hourly",
-                title="Hourly update",
-                body=msg,
-                bucket=bucket,
+                kind="recap",              # ← not "daily"
+                title="20:00 recap",
+                body=body,
                 source="cron",
-                session_id=None,
-                client_id=None,
                 status="open",
+                is_unread=True,
+                action_required=False,
+                bucket=bucket, 
             )
             logging.info("[TASKS] admin-notify sent + inbox")
             return "ok", 200
