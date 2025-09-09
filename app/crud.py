@@ -1,194 +1,242 @@
-# app/crud.py
+#app/crud.py
+
 from __future__ import annotations
-import hashlib, json
-from typing import Optional, List, Dict, Any
+
+from hashlib import sha256
+from typing import Optional
+
 from sqlalchemy import text
 from .db import get_session
 from .utils import normalize_wa
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Clients / Bookings basics already used elsewhere
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _digest(kind: str, title: str, body: str,
-            session_id: Optional[int], client_id: Optional[int],
-            bucket: str) -> str:
-    payload = {"k": kind, "t": title, "b": body, "s": session_id, "c": client_id, "bk": bucket}
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Clients / Sessions / Bookings (existing & used across the app)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict[str, Any]]:
+def client_exists_by_wa(wa_number: str) -> bool:
     wa = normalize_wa(wa_number)
     with get_session() as s:
-        row = s.execute(text("""
-            WITH now_local AS (
-                SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg') AS ts
-            )
-            SELECT b.id AS booking_id,
-                   s.id AS session_id,
-                   s.session_date,
-                   s.start_time,
-                   c.id AS client_id,
-                   c.name,
-                   c.wa_number
-            FROM bookings b
-            JOIN sessions s ON s.id = b.session_id
-            JOIN clients  c ON c.id = b.client_id
-            , now_local
-            WHERE c.wa_number = :wa
-              AND b.status = 'confirmed'
-              AND (s.session_date + s.start_time) > now_local.ts
-            ORDER BY s.session_date, s.start_time
-            LIMIT 1
-        """), {"wa": wa}).mappings().first()
-        return dict(row) if row else None
+        row = s.execute(text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"), {"wa": wa}).first()
+        return bool(row)
 
-def list_clients(limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
+def upsert_public_client(wa_number: str, name: Optional[str]) -> dict:
+    """
+    Create/update a lightweight client record for a public lead (plan stays NULL).
+    If you enforce NOT NULL plan in schema, this will try to set 'lead'.
+    """
+    wa_norm = normalize_wa(wa_number)
+    with get_session() as s:
+        # Try to insert into clients. If your schema requires plan NOT NULL, set 'lead'.
+        row = s.execute(
+            text("""
+                INSERT INTO clients (name, wa_number, credits, plan)
+                VALUES (COALESCE(NULLIF(:name,''), NULL), :wa, 0, COALESCE((SELECT 'lead'::text), NULL))
+                ON CONFLICT (wa_number)
+                DO UPDATE SET
+                    name = COALESCE(NULLIF(EXCLUDED.name, ''), clients.name)
+                RETURNING id, name, wa_number
+            """),
+            {"name": (name or "").strip(), "wa": wa_norm},
+        ).mappings().first()
+        return dict(row) if row else {"id": None, "name": name, "wa_number": wa_norm}
+
+def list_clients(limit: int = 10, offset: int = 0) -> list[dict]:
     with get_session() as s:
         rows = s.execute(
             text("""
-                SELECT
-                    id,
-                    COALESCE(name, '')       AS name,
-                    COALESCE(wa_number, '')  AS wa_number,
-                    COALESCE(plan, '')       AS plan,
-                    COALESCE(credits, 0)     AS credits
+                SELECT id, COALESCE(name,'') AS name, COALESCE(wa_number,'') AS wa_number,
+                       COALESCE(plan,'') AS plan, COALESCE(credits,0) AS credits
                 FROM clients
-                ORDER BY COALESCE(name, ''), id
+                ORDER BY COALESCE(name,''), id
                 LIMIT :lim OFFSET :off
             """),
             {"lim": int(limit), "off": int(offset)},
         ).mappings().all()
         return [dict(r) for r in rows]
 
-def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
-    q = (q or "").strip()
-    if not q:
-        return list_clients(limit=limit, offset=offset)
-    with get_session() as s:
-        rows = s.execute(
-            text("""
-                SELECT
-                    id,
-                    COALESCE(name, '')       AS name,
-                    COALESCE(wa_number, '')  AS wa_number,
-                    COALESCE(plan, '')       AS plan,
-                    COALESCE(credits, 0)     AS credits
-                FROM clients
-                WHERE LOWER(COALESCE(name, '')) LIKE LOWER(:needle)
-                ORDER BY COALESCE(name, ''), id
-                LIMIT :lim OFFSET :off
-            """),
-            {"needle": f"%{q}%", "lim": int(limit), "off": int(offset)},
-        ).mappings().all()
-        return [dict(r) for r in rows]
-
-def upsert_public_client(wa_number: str, name: Optional[str]) -> Dict[str, Any]:
-    """
-    Create or update a lightweight client row when a public user talks to us.
-    Ensures name is never NULL (fallback 'Guest ####').
-    """
-    wa_norm = normalize_wa(wa_number)
-    # fallback display name like "Guest 4607"
-    tail = wa_norm[-4:] if wa_norm and len(wa_norm) >= 4 else "0000"
-    placeholder = f"Guest {tail}"
-    safe_name = (name or "").strip()
-
-    with get_session() as s:
-        row = s.execute(
-            text("""
-                INSERT INTO clients (name, wa_number, credits, plan)
-                VALUES (COALESCE(NULLIF(:name,''), :placeholder), :wa, 0, '')
-                ON CONFLICT (wa_number)
-                DO UPDATE SET
-                    name = COALESCE(NULLIF(EXCLUDED.name,''), clients.name)
-                RETURNING id, name, wa_number
-            """),
-            {"name": safe_name, "placeholder": placeholder, "wa": wa_norm},
-        ).mappings().first()
-        return dict(row)
-
-def client_exists_by_wa(wa_number: str) -> bool:
-    with get_session() as s:
-        row = s.execute(text("""
-            SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1
-        """), {"wa": normalize_wa(wa_number)}).first()
-        return bool(row)
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Admin Inbox
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
-def inbox_upsert(kind: str, title: str, body: str,
-                 bucket: str,
-                 source: str = "system",
-                 session_id: Optional[int] = None,
-                 client_id: Optional[int] = None,
-                 status: str = "open") -> Optional[int]:
+def _digest_for(kind: str, title: str, body: str, bucket: str | None) -> str:
+    raw = f"{kind}|{title}|{body}|{bucket or ''}"
+    return sha256(raw.encode("utf-8")).hexdigest()
+
+def inbox_ensure_columns():
     """
-    Idempotent insert using digest(bucketed). Returns the existing/new id, or None on no-op.
+    Best-effort add columns if the table predates these fields.
+    Safe to run often.
     """
-    dg = _digest(kind, title, body, session_id, client_id, bucket)
+    with get_session() as s:
+        s.execute(text("ALTER TABLE admin_inbox ADD COLUMN IF NOT EXISTS is_unread BOOLEAN NOT NULL DEFAULT TRUE"))
+        s.execute(text("ALTER TABLE admin_inbox ADD COLUMN IF NOT EXISTS action_required BOOLEAN NOT NULL DEFAULT FALSE"))
+
+def inbox_upsert(
+    kind: str,
+    title: str,
+    body: str,
+    session_id: int | None = None,
+    client_id: int | None = None,
+    source: str = "system",
+    status: str = "open",
+    bucket: str | None = None,
+    action_required: bool = False,
+    digest: str | None = None,
+) -> int | None:
+    inbox_ensure_columns()
+    if not digest:
+        digest = _digest_for(kind, title, body, bucket)
     with get_session() as s:
         row = s.execute(
             text("""
-                INSERT INTO admin_inbox (kind, title, body, session_id, client_id, source, status, bucket, digest)
-                VALUES (:k, :t, :b, :sid, :cid, :src, :st, :bk, :dg)
+                INSERT INTO admin_inbox
+                  (kind, title, body, session_id, client_id, source, status, is_unread, action_required, bucket, digest)
+                VALUES
+                  (:k,   :t,    :b,   :sid,       :cid,       :src,   :st,    TRUE,      :ar,             :bk,    :dg)
                 ON CONFLICT (digest) DO NOTHING
                 RETURNING id
             """),
             {"k": kind, "t": title, "b": body, "sid": session_id, "cid": client_id,
-             "src": source, "st": status, "bk": bucket, "dg": dg}
+             "src": source, "st": status, "ar": bool(action_required), "bk": bucket, "dg": digest}
         ).mappings().first()
         return row["id"] if row else None
 
-def inbox_recent(limit_per_kind: int = 5) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Return last N items per kind (hourly, daily, query, proposal), newest first.
-    """
-    kinds = ["proposal", "query", "hourly", "daily"]
-    out: Dict[str, List[Dict[str, Any]]] = {}
+def inbox_list(
+    status: str | None = None,
+    unread_only: bool | None = None,
+    action_required: bool | None = None,
+    limit: int = 20,
+    offset: int = 0,
+):
     with get_session() as s:
-        for k in kinds:
-            rows = s.execute(
-                text("""
-                    SELECT id, kind, title, body, session_id, client_id, source, status, bucket, created_at
-                    FROM admin_inbox
-                    WHERE kind = :k
-                    ORDER BY created_at DESC
-                    LIMIT :lim
-                """),
-                {"k": k, "lim": int(limit_per_kind)}
-            ).mappings().all()
-            out[k] = [dict(r) for r in rows]
-    return out
+        clauses = []
+        params = {"lim": int(limit), "off": int(offset)}
+        if status:
+            clauses.append("status = :st")
+            params["st"] = status
+        if unread_only is True:
+            clauses.append("is_unread = TRUE")
+        if action_required is True:
+            clauses.append("action_required = TRUE")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = s.execute(
+            text(f"""
+                SELECT id, kind, title, body, session_id, client_id, source, status,
+                       is_unread, action_required, bucket, created_at
+                FROM admin_inbox
+                {where}
+                ORDER BY created_at DESC
+                LIMIT :lim OFFSET :off
+            """),
+            params
+        ).mappings().all()
+        return [dict(r) for r in rows]
 
-def inbox_counts_by_kind() -> Dict[str, int]:
+def inbox_get(inbox_id: int) -> Optional[dict]:
     with get_session() as s:
-        rows = s.execute(text("""
-            SELECT kind, COUNT(*) AS n
+        r = s.execute(text("""
+            SELECT id, kind, title, body, session_id, client_id, source, status,
+                   is_unread, action_required, bucket, created_at
+            FROM admin_inbox WHERE id=:id
+        """), {"id": inbox_id}).mappings().first()
+        return dict(r) if r else None
+
+def inbox_counts():
+    with get_session() as s:
+        row = s.execute(text("""
+            SELECT
+              COUNT(*) FILTER (WHERE status='open')           AS open_cnt,
+              COUNT(*) FILTER (WHERE is_unread)               AS unread_cnt,
+              COUNT(*) FILTER (WHERE action_required)         AS action_cnt,
+              COUNT(*)                                        AS total_cnt
             FROM admin_inbox
-            GROUP BY kind
-        """)).mappings().all()
-    return {r["kind"]: int(r["n"]) for r in rows}
+        """)).mappings().first()
+        return dict(row)
 
-def inbox_get(id_: int) -> Optional[Dict[str, Any]]:
+def inbox_mark_read(inbox_id: int):
+    with get_session() as s:
+        s.execute(text("UPDATE admin_inbox SET is_unread=FALSE WHERE id=:id"), {"id": inbox_id})
+
+def inbox_mark_unread(inbox_id: int):
+    with get_session() as s:
+        s.execute(text("UPDATE admin_inbox SET is_unread=TRUE WHERE id=:id"), {"id": inbox_id})
+
+def inbox_resolve(inbox_id: int, close_status: str = "closed"):
+    with get_session() as s:
+        s.execute(text("UPDATE admin_inbox SET status=:st, is_unread=FALSE WHERE id=:id"),
+                  {"id": inbox_id, "st": close_status})
+
+def inbox_set_action(inbox_id: int, needs_action: bool):
+    with get_session() as s:
+        s.execute(text("UPDATE admin_inbox SET action_required=:ar WHERE id=:id"),
+                  {"id": inbox_id, "ar": bool(needs_action)})
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Leads (lightweight). If table `leads` exists, we store there; otherwise we
+# still log to admin_inbox and admin can “accept” to make a real client.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def lead_insert(wa_number: str, name: Optional[str], note: Optional[str]) -> None:
+    """
+    Try to insert into leads(wa_number, name, note). If table doesn't exist,
+    ignore gracefully (the inbox item still tracks the lead).
+    """
+    wa = normalize_wa(wa_number)
+    try:
+        with get_session() as s:
+            s.execute(
+                text("""
+                    INSERT INTO leads (wa_number, name, note, created_at)
+                    VALUES (:wa, NULLIF(:name,''), :note, now())
+                    ON CONFLICT (wa_number) DO UPDATE
+                      SET name = COALESCE(NULLIF(EXCLUDED.name,''), leads.name),
+                          note = COALESCE(EXCLUDED.note, leads.note)
+                """),
+                {"wa": wa, "name": (name or "").strip(), "note": (note or "")[:500]}
+            )
+    except Exception:
+        # If the table doesn't exist or fails, we don't block
+        pass
+
+def create_client_from_wa(wa_number: str, name: str) -> int | None:
+    wa = normalize_wa(wa_number)
     with get_session() as s:
         row = s.execute(
             text("""
-                SELECT id, kind, title, body, session_id, client_id, source, status, bucket, created_at
-                FROM admin_inbox
-                WHERE id = :i
+                INSERT INTO clients (name, wa_number, credits, plan)
+                VALUES (:name, :wa, 0, COALESCE((SELECT 'lead'::text), NULL))
+                ON CONFLICT (wa_number)
+                DO UPDATE SET
+                    name = COALESCE(NULLIF(EXCLUDED.name,''), clients.name)
+                RETURNING id
             """),
-            {"i": int(id_)}
+            {"name": name.strip(), "wa": wa}
         ).mappings().first()
-        return dict(row) if row else None
+        return row["id"] if row else None
 
-def inbox_mark_closed(id_: int) -> None:
-    with get_session() as s:
-        s.execute(text("""
-            UPDATE admin_inbox SET status = 'closed' WHERE id = :i
-        """), {"i": int(id_)})
+def lead_accept_from_inbox(inbox_id: int, name: str) -> tuple[bool, str]:
+    r = inbox_get(inbox_id)
+    if not r:
+        return False, f"Item #{inbox_id} not found."
+    if r["kind"] not in {"booking_request", "query"}:
+        return False, f"Item #{inbox_id} is not a lead-type item."
+
+    # Try to extract WA from body “From 27…”
+    import re
+    m = re.search(r"From\s+(\+?\d{6,15})", r["body"])
+    wa = m.group(1) if m else None
+    if not wa:
+        return False, "Could not find a phone number in this item. Please create client manually."
+
+    cid = create_client_from_wa(wa, name=name)
+    if not cid:
+        return False, "Failed to create/update client."
+    inbox_resolve(inbox_id, close_status="closed")
+    return True, f"Lead accepted. Client created/updated for {wa} as “{name}”."
+
+def lead_decline_from_inbox(inbox_id: int) -> tuple[bool, str]:
+    r = inbox_get(inbox_id)
+    if not r:
+        return False, f"Item #{inbox_id} not found."
+    inbox_resolve(inbox_id, close_status="closed")
+    return True, f"Lead item #{inbox_id} declined/closed."
