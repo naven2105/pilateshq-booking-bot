@@ -1,10 +1,8 @@
 # app/router.py
-
-from .crud import lead_set_expectation, lead_pop_expectation, lead_peek_expectation
-from .crud import inbox_upsert, find_client_by_wa, upsert_public_client
-
+# app/router.py
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Optional, Tuple
 
@@ -13,7 +11,15 @@ from flask import request
 from .config import ADMIN_NUMBERS, VERIFY_TOKEN
 from .utils import normalize_wa, send_whatsapp_text
 from .admin import handle_admin_action
-from . import crud
+from .crud import (
+    client_exists_by_wa,
+    find_client_by_wa,
+    upsert_public_client,
+    inbox_upsert,
+    lead_set_expectation,
+    lead_peek_expectation,
+    lead_pop_expectation,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public (lead/FAQ) flow
