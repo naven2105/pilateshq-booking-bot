@@ -126,7 +126,6 @@ def find_clients_by_prefix(q: str, limit: int = 10, offset: int = 0, min_len: in
 
     # Build two needles: for name and for wa_number (strip '+' for comparison)
     name_prefix = f"{q}%"
-    # For wa_number, allow matching both raw and with '+' trimmed.
     wa_prefix = q.lstrip('+')
     wa_prefix_needle = f"{wa_prefix}%"
 
@@ -154,7 +153,7 @@ def find_clients_by_prefix(q: str, limit: int = 10, offset: int = 0, min_len: in
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Leads / bookings helper
+# Booking helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
@@ -186,6 +185,35 @@ def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
     with get_session() as s:
         row = s.execute(sql, {"wa": wa}).mappings().first()
         return dict(row) if row else None
+
+
+def client_upcoming_bookings(client_id: int, limit: int = 20) -> List[Dict]:
+    """
+    All upcoming confirmed bookings for a client (from 'now' in SAST), soonest first.
+    Returns rows with: booking_id, session_id, session_date, start_time, status.
+    """
+    sql = text("""
+        WITH now_local AS (
+            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg') AS ts
+        )
+        SELECT
+            b.id AS booking_id,
+            s.id AS session_id,
+            s.session_date,
+            s.start_time,
+            b.status
+        FROM bookings b
+        JOIN sessions s ON s.id = b.session_id
+        , now_local
+        WHERE b.client_id = :cid
+          AND b.status = 'confirmed'
+          AND (s.session_date + s.start_time) >= now_local.ts
+        ORDER BY s.session_date, s.start_time
+        LIMIT :lim
+    """)
+    with get_session() as s:
+        rows = s.execute(sql, {"cid": int(client_id), "lim": int(limit)}).mappings().all()
+        return [dict(r) for r in rows]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
