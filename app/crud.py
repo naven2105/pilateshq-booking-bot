@@ -51,7 +51,8 @@ def find_one_client(client_id: int) -> Optional[Dict]:
 def upsert_public_client(wa_number: str, name: Optional[str]) -> Dict:
     """
     Ensure a client row exists for this WA number.
-    If name is empty/None, store a lightweight placeholder ("Guest 4607") to satisfy NOT NULL schemas.
+    If name is empty/None, store a lightweight placeholder ("Guest 4607") and set plan='lead'
+    to satisfy NOT NULL schemas and mark as lead.
     On conflict, only update name if a non-empty name is provided.
     Returns {id, name, wa_number}.
     """
@@ -90,6 +91,9 @@ def list_clients(limit: int = 10, offset: int = 0) -> List[Dict]:
 
 
 def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> List[Dict]:
+    """
+    Case-insensitive substring match on name.
+    """
     q = (q or "").strip()
     if not q:
         return list_clients(limit=limit, offset=offset)
@@ -110,8 +114,47 @@ def find_clients_by_name(q: str, limit: int = 10, offset: int = 0) -> List[Dict]
         return [dict(r) for r in rows]
 
 
+def find_clients_by_prefix(q: str, limit: int = 10, offset: int = 0, min_len: int = 3) -> List[Dict]:
+    """
+    Prefix search used by admin quick search.
+    - Requires at least `min_len` characters (defaults to 3).
+    - Matches on name prefix OR normalized wa_number prefix (without +).
+    """
+    q = (q or "").strip()
+    if len(q) < int(min_len):
+        return []
+
+    # Build two needles: for name and for wa_number (strip '+' for comparison)
+    name_prefix = f"{q}%"
+    # For wa_number, allow matching both raw and with '+' trimmed.
+    wa_prefix = q.lstrip('+')
+    wa_prefix_needle = f"{wa_prefix}%"
+
+    sql = text("""
+        SELECT id,
+               COALESCE(name,'')      AS name,
+               COALESCE(wa_number,'') AS wa_number,
+               COALESCE(plan,'')      AS plan,
+               COALESCE(credits,0)    AS credits
+        FROM clients
+        WHERE
+            LOWER(COALESCE(name,'')) LIKE LOWER(:namepref)
+            OR REPLACE(COALESCE(wa_number,''), '+', '') LIKE :wapref
+        ORDER BY COALESCE(name,''), id
+        LIMIT :lim OFFSET :off
+    """)
+    with get_session() as s:
+        rows = s.execute(sql, {
+            "namepref": name_prefix,
+            "wapref": wa_prefix_needle,
+            "lim": int(limit),
+            "off": int(offset),
+        }).mappings().all()
+        return [dict(r) for r in rows]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Leads (optional helpers)
+# Leads / bookings helper
 # ──────────────────────────────────────────────────────────────────────────────
 
 def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
