@@ -2,9 +2,129 @@
 from __future__ import annotations
 
 from typing import List, Optional
+from hashlib import sha256
+
 from sqlalchemy import text
 
 from .db import get_session
+from .utils import normalize_wa
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lead / client existence & upsert
+# ──────────────────────────────────────────────────────────────────────────────
+
+def client_exists_by_wa(wa_number: str) -> bool:
+    """
+    Returns True if a client row exists with the normalized WA number.
+    """
+    wa = normalize_wa(wa_number)
+    if not wa:
+        return False
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"),
+            {"wa": wa},
+        ).first()
+        return bool(row)
+
+
+def upsert_public_client(wa_number: str, name: Optional[str]) -> dict:
+    """
+    Ensure a lead-style client exists.
+    - Normalizes the WA number.
+    - Sets a friendly default name if none provided (e.g., 'Guest 4607').
+    - Uses plan='lead' and credits=0 to satisfy NOT NULL constraints.
+    - On conflict, updates the name if we now have a non-empty one.
+    Returns: {id, name, wa_number}
+    """
+    wa = normalize_wa(wa_number)
+    if not wa:
+        raise ValueError("Invalid WhatsApp number")
+
+    safe_name = (name or "").strip()
+    if not safe_name:
+        # Make a simple placeholder like 'Guest 4607'
+        tail4 = wa[-4:] if len(wa) >= 4 else wa
+        safe_name = f"Guest {tail4}"
+
+    with get_session() as s:
+        row = s.execute(
+            text(
+                """
+                INSERT INTO clients (name, wa_number, credits, plan)
+                VALUES (:name, :wa, 0, 'lead')
+                ON CONFLICT (wa_number)
+                DO UPDATE SET
+                    name = COALESCE(NULLIF(EXCLUDED.name, ''), clients.name)
+                RETURNING id, name, wa_number
+                """
+            ),
+            {"name": safe_name, "wa": wa},
+        ).mappings().first()
+        return dict(row)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Admin inbox writer (idempotent)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def inbox_upsert(
+    *,
+    kind: str,                # 'booking_request' | 'query' | 'hourly' | 'recap' | 'system'
+    title: str,
+    body: str,
+    client_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+    source: str = "system",   # 'whatsapp' | 'cron' | 'system'
+    status: str = "open",     # 'open' | 'in_progress' | 'closed'
+    is_unread: bool = True,
+    action_required: bool = False,
+    bucket: Optional[str] = None,   # for dedupe windows (e.g., hourly)
+) -> Optional[int]:
+    """
+    Insert (or ignore) an admin_inbox row with a stable digest for idempotency.
+    Returns the new id if inserted, else None if it already existed.
+    NOTE: Your DB must include columns: is_unread, action_required, bucket, digest.
+    """
+    # Keep kind within your CHECK constraint set
+    allowed_kinds = {"booking_request", "query", "hourly", "recap", "system"}
+    if kind not in allowed_kinds:
+        raise ValueError(f"Unsupported inbox kind: {kind}")
+
+    # Build a deterministic digest over the salient fields
+    dg_src = f"{kind}|{title}|{body}|{client_id or ''}|{session_id or ''}|{source}|{status}|{bucket or ''}"
+    digest = sha256(dg_src.encode("utf-8")).hexdigest()
+
+    with get_session() as s:
+        row = s.execute(
+            text(
+                """
+                INSERT INTO admin_inbox
+                  (kind, title, body, session_id, client_id, source, status,
+                   is_unread, action_required, bucket, digest)
+                VALUES
+                  (:k,   :t,    :b,   :sid,       :cid,       :src,   :st,
+                   :iu,        :ar,             :bk,    :dg)
+                ON CONFLICT (digest) DO NOTHING
+                RETURNING id
+                """
+            ),
+            {
+                "k": kind,
+                "t": title,
+                "b": body,
+                "sid": session_id,
+                "cid": client_id,
+                "src": source,
+                "st": status,
+                "iu": bool(is_unread),
+                "ar": bool(action_required),
+                "bk": bucket,
+                "dg": digest,
+            },
+        ).mappings().first()
+        return (row and row["id"]) or None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
