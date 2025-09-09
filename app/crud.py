@@ -34,9 +34,6 @@ def find_client_by_wa(wa_number: str) -> Optional[Dict]:
 
 
 def find_one_client(client_id: int) -> Optional[Dict]:
-    """
-    Return a single client by id (or None).
-    """
     sql = text("""
         SELECT id, name, wa_number, plan, credits
         FROM clients
@@ -51,8 +48,7 @@ def find_one_client(client_id: int) -> Optional[Dict]:
 def upsert_public_client(wa_number: str, name: Optional[str]) -> Dict:
     """
     Ensure a client row exists for this WA number.
-    If name is empty/None, store a lightweight placeholder ("Guest 4607") and set plan='lead'
-    to satisfy NOT NULL schemas and mark as lead.
+    If name is empty/None, save a placeholder ("Guest 4607") and set plan='lead'.
     On conflict, only update name if a non-empty name is provided.
     Returns {id, name, wa_number}.
     """
@@ -124,7 +120,6 @@ def find_clients_by_prefix(q: str, limit: int = 10, offset: int = 0, min_len: in
     if len(q) < int(min_len):
         return []
 
-    # Build two needles: for name and for wa_number (strip '+' for comparison)
     name_prefix = f"{q}%"
     wa_prefix = q.lstrip('+')
     wa_prefix_needle = f"{wa_prefix}%"
@@ -190,7 +185,7 @@ def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[Dict]:
 def client_upcoming_bookings(client_id: int, limit: int = 20) -> List[Dict]:
     """
     All upcoming confirmed bookings for a client (from 'now' in SAST), soonest first.
-    Returns rows with: booking_id, session_id, session_date, start_time, status.
+    Returns: booking_id, session_id, session_date, start_time, status.
     """
     sql = text("""
         WITH now_local AS (
@@ -213,6 +208,39 @@ def client_upcoming_bookings(client_id: int, limit: int = 20) -> List[Dict]:
     """)
     with get_session() as s:
         rows = s.execute(sql, {"cid": int(client_id), "lim": int(limit)}).mappings().all()
+        return [dict(r) for r in rows]
+
+
+def client_recent_history(client_id: int, days: int = 60, limit: int = 30) -> List[Dict]:
+    """
+    Recent booking history (any status) for a client over the last `days`, newest first.
+    Uses session date/time for ordering (no dependency on created_at).
+    Returns: booking_id, session_id, session_date, start_time, status.
+    """
+    sql = text("""
+        WITH cutoff AS (
+            SELECT ((now() AT TIME ZONE 'Africa/Johannesburg')::date - :days * INTERVAL '1 day') AS dt
+        )
+        SELECT
+            b.id AS booking_id,
+            s.id AS session_id,
+            s.session_date,
+            s.start_time,
+            b.status
+        FROM bookings b
+        JOIN sessions s ON s.id = b.session_id
+        , cutoff
+        WHERE b.client_id = :cid
+          AND s.session_date >= cutoff.dt
+        ORDER BY s.session_date DESC, s.start_time DESC, b.id DESC
+        LIMIT :lim
+    """)
+    with get_session() as s:
+        rows = s.execute(sql, {
+            "cid": int(client_id),
+            "days": int(days),
+            "lim": int(limit),
+        }).mappings().all()
         return [dict(r) for r in rows]
 
 
