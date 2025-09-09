@@ -133,7 +133,7 @@ def register_tasks(app):
 
             # Inbox: idempotent hourly entry
             crud.inbox_upsert(
-                kind="recap",              # ← not "daily"
+                kind="recap",              
                 title="20:00 recap",
                 body=body,
                 source="cron",
