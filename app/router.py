@@ -128,7 +128,7 @@ def _handle_public_message(wa: str, body: str) -> None:
     # Ensure (or create) lead client record
     try:
         if not client_exists_by_wa(wa):
-            upsert_public_client(wa, None)  # creates with plan='lead' and a “Guest ####” name
+            upsert_public_client(wa, None)  # creates a 'lead' record safely
     except Exception:
         logging.exception("Lead upsert failed (non-fatal)")
 
@@ -140,7 +140,6 @@ def _handle_public_message(wa: str, body: str) -> None:
         send_whatsapp_text(wa, response)
 
         try:
-            # Write to inbox with idempotency digest
             digest = hashlib.sha256(f"{wa}|{body}".encode("utf-8")).hexdigest()
             inbox_upsert(
                 kind="booking_request",
@@ -152,13 +151,12 @@ def _handle_public_message(wa: str, body: str) -> None:
                 action_required=True,
                 digest=digest,
             )
-            # Also ping each admin with a short alert
             for admin in ADMIN_NUMBERS:
                 send_whatsapp_text(
                     normalize_wa(admin),
                     f"📩 *New booking request* from {wa}\n"
                     f"Message: {body.strip() or '(no extra details)'}\n"
-                    f"(Open Inbox in admin menu to action.)"
+                    f"(Open *Admin → Inbox* to action.)"
                 )
         except Exception:
             logging.exception("Failed to write booking request to inbox / notify admins")
@@ -181,15 +179,17 @@ def register_routes(app):
       GET  /webhook  – Meta verification
       POST /webhook  – WhatsApp inbound
       GET  /         – simple OK
-      GET  /health   – liveness probe
+      GET  /health   – liveness probe (registered only if missing)
     """
     @app.get("/")
     def root():
         return "ok", 200
 
-    @app.get("/health")
-    def health():
-        return "ok", 200
+    # Register /health only if not already added elsewhere
+    if "health_router" not in app.view_functions:
+        @app.get("/health", endpoint="health_router")
+        def health_router():
+            return "ok", 200
 
     @app.get("/webhook")
     def webhook_verify():
@@ -238,13 +238,11 @@ def register_routes(app):
             else:
                 body = ""
 
-            # Route admin vs public
             if from_wa in ADMIN_NUMBERS:
                 # Button-first admin flow
                 try:
                     handle_admin_action(from_wa, msg.get("id"), body, btn_id)
                 except TypeError:
-                    # Backward-compat signature
                     try:
                         handle_admin_action(from_wa, msg.get("id"), body)
                     except Exception:
