@@ -1,4 +1,6 @@
 # app/router.py
+from .crud import lead_set_expectation, lead_pop_expectation, lead_peek_expectation
+from .crud import inbox_upsert, find_client_by_wa, upsert_public_client
 
 from __future__ import annotations
 
@@ -135,43 +137,131 @@ def _faq_response(intent: str) -> str:
     return "Thanks! How can we help today?"
 
 def _handle_public_message(wa: str, body: str) -> None:
-    # Ensure/create a lightweight client record
-    try:
-        if not crud.client_exists_by_wa(wa):
-            crud.upsert_public_client(wa, None)
-    except Exception:
-        logging.exception("Lead upsert failed (non-fatal)")
+    """
+    Lead/FAQ flow with a lightweight name-capture gate for booking requests.
+    - If user says 'book' and we don't have their name, ask for name once.
+    - Next inbound becomes their name -> save -> write inbox booking_request.
+    - Always show menu after replying.
+    """
+    text_in = (body or "").strip()
+    lower = text_in.lower()
 
-    intent, _ = _intent_and_payload(body)
-
-    # “book” → ping admin + inbox + optional leads table
-    if intent == "book_request":
-        response = _faq_response(intent) + "\n\n" + _public_menu()
-        send_whatsapp_text(wa, response)
-
-        # Optional: store into leads table if present; always in Inbox
+    # If we previously asked for name, capture it now
+    expecting = lead_peek_expectation(wa)
+    if expecting == "name" and text_in:
+        # Accept short or long names; trim and cap length a bit
+        name = text_in[:80].strip()
+        if len(name) < 2:
+            send_whatsapp_text(wa, "Please send your *full name* (at least 2 characters).")
+            return
         try:
-            crud.lead_insert(wa, None, note=body or "")
+            upsert_public_client(wa, name)
         except Exception:
-            pass
+            logging.exception("Failed to save lead name")
+        # clear the expectation
+        lead_pop_expectation(wa)
 
+        # Now log the booking request to the admin inbox
         try:
             title = "New booking request"
-            inbox_body = f"From {wa}\nMessage: {body.strip() or '(no details)'}"
-            crud.inbox_upsert(kind="booking_request", title=title, body=inbox_body,
-                              client_id=None, session_id=None, source="whatsapp",
-                              status="open", action_required=True)
+            inbox_body = f"From {name} ({wa})\nMessage: (requested to book)"
+            inbox_upsert(
+                kind="booking_request",
+                title=title,
+                body=inbox_body,
+                client_id=None,
+                session_id=None,
+                source="whatsapp",
+                status="open",
+                is_unread=True,
+                action_required=True,
+            )
+            # notify admins
+            for admin in ADMIN_NUMBERS:
+                send_whatsapp_text(
+                    normalize_wa(admin),
+                    f"📩 *New booking request* from {name} ({wa})"
+                )
         except Exception:
             logging.exception("Failed to write booking request to inbox")
 
-        # Also nudge admins directly if you want (kept lean here)
+        send_whatsapp_text(
+            wa,
+            "✅ Thanks, we’ve sent your request to the studio. "
+            "An instructor will follow up shortly.\n\n" + _public_menu()
+        )
         return
 
-    # Normal FAQ reply
+    # Normal intent routing
+    intent, _ = _intent_and_payload(text_in)
+
+    # “book” clicked/typed: ensure we have a name
+    if intent == "book_request":
+        # Check if we already have a name on file
+        client = None
+        try:
+            client = find_client_by_wa(wa)
+        except Exception:
+            logging.exception("find_client_by_wa failed")
+
+        has_name = bool(client and client.get("name"))
+        if not has_name:
+            # Save a shell lead if needed and ask for name
+            try:
+                if not client:
+                    upsert_public_client(wa, None)
+            except Exception:
+                logging.exception("lead shell upsert failed")
+
+            lead_set_expectation(wa, "name")
+            send_whatsapp_text(
+                wa,
+                "Great! Before we book, what’s your *full name*?\n"
+                "Reply with your name (e.g., *Nadine Jacobs*)."
+            )
+            return
+
+        # We have a name already → log request immediately
+        try:
+            nm = client["name"]
+            title = "New booking request"
+            inbox_body = f"From {nm} ({wa})\nMessage: (requested to book)"
+            inbox_upsert(
+                kind="booking_request",
+                title=title,
+                body=inbox_body,
+                client_id=client["id"],
+                session_id=None,
+                source="whatsapp",
+                status="open",
+                is_unread=True,
+                action_required=True,
+            )
+            for admin in ADMIN_NUMBERS:
+                send_whatsapp_text(
+                    normalize_wa(admin),
+                    f"📩 *New booking request* from {nm} ({wa})"
+                )
+        except Exception:
+            logging.exception("Failed to write booking request to inbox")
+
+        send_whatsapp_text(
+            wa,
+            _faq_response(intent) + "\n\n" + _public_menu()
+        )
+        return
+
+    # All other FAQ/menu replies (your existing logic)
     if intent == "menu":
-        send_whatsapp_text(wa, "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu())
+        send_whatsapp_text(
+            wa,
+            "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu()
+        )
     else:
-        send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
+        send_whatsapp_text(
+            wa,
+            _faq_response(intent) + "\n\n" + _public_menu()
+        )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask wiring

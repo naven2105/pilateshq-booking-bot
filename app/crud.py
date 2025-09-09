@@ -9,6 +9,45 @@ from sqlalchemy import text
 from .db import get_session
 from .utils import normalize_wa
 
+# --- Lead state (expecting name) ---------------------------------------------
+def lead_set_expectation(wa: str, expecting: str = "name") -> None:
+    with get_session() as s:
+        s.execute(
+            text("""
+                INSERT INTO lead_states (wa_number, expecting)
+                VALUES (:wa, :ex)
+                ON CONFLICT (wa_number) DO UPDATE
+                  SET expecting = EXCLUDED.expecting,
+                      last_prompt_at = now()
+            """),
+            {"wa": wa, "ex": expecting},
+        )
+        s.commit()
+
+def lead_pop_expectation(wa: str) -> str | None:
+    """
+    Return the current expectation and clear it, or None.
+    """
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT expecting FROM lead_states WHERE wa_number = :wa"),
+            {"wa": wa},
+        ).mappings().first()
+        if not row:
+            return None
+        s.execute(text("DELETE FROM lead_states WHERE wa_number = :wa"), {"wa": wa})
+        s.commit()
+        return row["expecting"]
+
+def lead_peek_expectation(wa: str) -> str | None:
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT expecting FROM lead_states WHERE wa_number = :wa"),
+            {"wa": wa},
+        ).mappings().first()
+        return row["expecting"] if row else None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Clients / Bookings basics already used elsewhere
 # ──────────────────────────────────────────────────────────────────────────────
