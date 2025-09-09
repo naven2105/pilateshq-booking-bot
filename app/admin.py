@@ -2,180 +2,230 @@
 from __future__ import annotations
 
 import logging
-import re
-from typing import Optional
+from typing import Optional, List, Dict
 
-from .utils import send_whatsapp_text
-from . import crud
-
-ADMIN_HELP = (
-    "🛠 *Admin Menu*\n"
-    "• inbox — list latest items\n"
-    "• inbox unread — only unread\n"
-    "• inbox action — needs action\n"
-    "• inbox open — open items\n"
-    "• inbox #123 — view item 123\n"
-    "• read 123 | unread 123 | resolve 123\n"
-    "• hourly — show current upcoming\n"
-    "• recap — show today (full day)\n"
-    "• today — show today (upcoming)\n"
-    "• view clients — quick list\n"
-    "• accept 123 name=Jane Doe — approve a lead (from inbox item #)\n"
-    "• decline 123 — close a lead item\n"
+from .utils import (
+    send_whatsapp_text,
+    send_whatsapp_buttons,
+    normalize_wa,
+)
+from .config import TZ_NAME
+from .crud import (
+    inbox_counts,
+    sessions_today_with_names,
+    sessions_next_hour_with_names,
+    list_clients,
 )
 
-def _fmt_inbox_list(rows: list[dict]) -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+# Button payload IDs (keep short, stable)
+# ──────────────────────────────────────────────────────────────────────────────
+BTN_MAIN_INBOX     = "ADMIN_INBOX"
+BTN_MAIN_CLIENTS   = "ADMIN_CLIENTS"
+BTN_MAIN_SESSIONS  = "ADMIN_SESSIONS"
+
+BTN_INBOX_OPEN     = "INBOX_OPEN"
+BTN_INBOX_MARKREAD = "INBOX_MARKREAD"
+BTN_BACK_HOME      = "BACK_HOME"
+
+BTN_CLIENTS_LIST   = "CLIENTS_LIST"
+BTN_CLIENTS_SEARCH = "CLIENTS_SEARCH"   # (future)
+BTN_CLIENTS_BACK   = BTN_BACK_HOME
+
+BTN_SES_HOURLY     = "SES_HOURLY"
+BTN_SES_TODAY      = "SES_TODAY"
+BTN_SES_RECAP      = "SES_RECAP"
+BTN_SES_BACK       = BTN_BACK_HOME
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Menus
+# ──────────────────────────────────────────────────────────────────────────────
+def _format_badges() -> str:
+    counts = inbox_counts()
+    unread = counts.get("unread", 0)
+    act    = counts.get("action_required", 0)
+    parts: List[str] = []
+    if unread:
+        parts.append(f"🔔 Unread: {unread}")
+    if act:
+        parts.append(f"❗ Action: {act}")
+    return ("  •  " + "  |  ".join(parts)) if parts else ""
+
+
+def show_admin_home(wa: str) -> None:
+    """Main admin menu with 3 buttons."""
+    title = "🛠️ Admin menu" + _format_badges()
+    # At most 3 reply buttons
+    buttons = [
+        {"id": BTN_MAIN_INBOX,    "title": "Inbox"},
+        {"id": BTN_MAIN_CLIENTS,  "title": "Clients"},
+        {"id": BTN_MAIN_SESSIONS, "title": "Sessions"},
+    ]
+    send_whatsapp_buttons(wa, title, buttons)
+
+
+def show_inbox_menu(wa: str) -> None:
+    title = "🗂 Inbox"
+    buttons = [
+        {"id": BTN_INBOX_OPEN,     "title": "Open items"},
+        {"id": BTN_INBOX_MARKREAD, "title": "Mark all read"},
+        {"id": BTN_BACK_HOME,      "title": "Back"},
+    ]
+    send_whatsapp_buttons(wa, title, buttons)
+
+
+def show_clients_menu(wa: str) -> None:
+    title = "👥 Clients"
+    buttons = [
+        {"id": BTN_CLIENTS_LIST,  "title": "List 10"},
+        {"id": BTN_CLIENTS_SEARCH,"title": "Search (soon)"},
+        {"id": BTN_CLIENTS_BACK,  "title": "Back"},
+    ]
+    send_whatsapp_buttons(wa, title, buttons)
+
+
+def show_sessions_menu(wa: str) -> None:
+    title = "🗓 Sessions"
+    buttons = [
+        {"id": BTN_SES_HOURLY, "title": "Hourly now"},
+        {"id": BTN_SES_TODAY,  "title": "Today (names)"},
+        {"id": BTN_SES_RECAP,  "title": "20:00 recap"},
+    ]
+    send_whatsapp_buttons(wa, title, buttons)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Content builders
+# ──────────────────────────────────────────────────────────────────────────────
+def _fmt_rows(rows: List[Dict]) -> str:
     if not rows:
-        return "📥 Inbox is empty."
+        return "— none —"
     out = []
-    for r in rows[:10]:
-        badge = []
-        if r.get("is_unread"): badge.append("unread")
-        if r.get("action_required"): badge.append("action")
-        if r.get("status") and r["status"] != "open": badge.append(r["status"])
-        tags = f" ({', '.join(badge)})" if badge else ""
-        out.append(f"#{r['id']} — {r['kind']} — {r['title']}{tags}")
-    out.append("\nTry: *inbox unread*, *inbox action*, *inbox open*, or *inbox #123*")
+    for r in rows:
+        start = str(r["start_time"])[:5]
+        names = (r.get("names") or "").strip()
+        if names:
+            out.append(f"• {start} – {names}  ({'🔒 full' if str(r['status']).lower()=='full' else '✅ open'})")
+        else:
+            out.append(f"• {start} – (no bookings)  ({'🔒 full' if str(r['status']).lower()=='full' else '✅ open'})")
     return "\n".join(out)
 
-def _fmt_inbox_item(r: dict) -> str:
-    badge = []
-    if r.get("is_unread"): badge.append("unread")
-    if r.get("action_required"): badge.append("action")
-    if r.get("status") and r["status"] != "open": badge.append(r["status"])
-    tag = f" ({', '.join(badge)})" if badge else ""
-    lines = [
-        f"📄 *Inbox item #{r['id']}*{tag}",
-        f"*Kind:* {r['kind']}",
-        f"*Title:* {r['title']}",
-        f"*Body:*\n{r['body']}",
-    ]
-    if r.get("source"): lines.append(f"*Source:* {r['source']}")
-    if r.get("created_at"): lines.append(f"*Created:* {r['created_at']}")
-    lines.append("\nActions: read 123 | unread 123 | resolve 123")
-    return "\n".join(lines)
 
-def _admin_inbox_command(wa: str, text: str) -> bool:
-    t = (text or "").strip().lower()
+def _send_hourly_now(wa: str) -> None:
+    nxt = sessions_next_hour_with_names(TZ_NAME)
+    if nxt:
+        body = "🕒 Next hour:\n" + _fmt_rows(nxt)
+    else:
+        body = "🕒 Next hour: no upcoming session."
+    send_whatsapp_text(wa, body)
+    # Return to menu for discoverability
+    show_sessions_menu(wa)
 
-    # Top-level lists
-    if t in {"inbox", "inbox list"}:
-        cnt = crud.inbox_counts()
-        rows = crud.inbox_list(limit=10)
-        header = (
-            f"📥 *Inbox*\n"
-            f"open:{cnt['open_cnt']} • unread:{cnt['unread_cnt']} • action:{cnt['action_cnt']} • total:{cnt['total_cnt']}\n"
-        )
-        send_whatsapp_text(wa, header + _fmt_inbox_list(rows))
-        return True
 
-    if t == "inbox unread":
-        rows = crud.inbox_list(unread_only=True, limit=10)
-        send_whatsapp_text(wa, _fmt_inbox_list(rows))
-        return True
+def _send_today_names(wa: str) -> None:
+    rows = sessions_today_with_names(TZ_NAME, upcoming_only=True)
+    header = "🗓 Today’s sessions (upcoming)"
+    body = f"{header}\n{_fmt_rows(rows)}"
+    send_whatsapp_text(wa, body)
+    show_sessions_menu(wa)
 
-    if t == "inbox action":
-        rows = crud.inbox_list(action_required=True, limit=10)
-        send_whatsapp_text(wa, _fmt_inbox_list(rows))
-        return True
 
-    if t == "inbox open":
-        rows = crud.inbox_list(status="open", limit=10)
-        send_whatsapp_text(wa, _fmt_inbox_list(rows))
-        return True
+def _send_recap(wa: str) -> None:
+    rows = sessions_today_with_names(TZ_NAME, upcoming_only=False)
+    header = "🗓 Today’s sessions (full day)"
+    body = f"{header}\n{_fmt_rows(rows)}"
+    send_whatsapp_text(wa, body)
+    show_sessions_menu(wa)
 
-    # View a single item
-    m = re.match(r"inbox\s*#?(\d+)\s*$", t)
-    if m:
-        iid = int(m.group(1))
-        detail = crud.inbox_get(iid)
-        if not detail:
-            send_whatsapp_text(wa, f"Item #{iid} not found.")
-        else:
-            send_whatsapp_text(wa, _fmt_inbox_item(detail))
-        return True
 
-    # Update flags
-    m = re.match(r"(read|unread|resolve)\s+(\d+)", t)
-    if m:
-        cmd, sid = m.group(1), int(m.group(2))
-        if cmd == "read":
-            crud.inbox_mark_read(sid)
-            send_whatsapp_text(wa, f"Marked #{sid} as read.")
-        elif cmd == "unread":
-            crud.inbox_mark_unread(sid)
-            send_whatsapp_text(wa, f"Marked #{sid} as unread.")
-        else:
-            crud.inbox_resolve(sid)
-            send_whatsapp_text(wa, f"Resolved #{sid}.")
-        return True
+def _send_inbox_open(wa: str) -> None:
+    # Minimal placeholder list (extend later with real SELECT)
+    counts = inbox_counts()
+    unread = counts.get("unread", 0)
+    act    = counts.get("action_required", 0)
+    send_whatsapp_text(wa, f"🗂 Inbox\nUnread: {unread}\nAction required: {act}\n\n(Full list view coming next.)")
+    show_inbox_menu(wa)
 
-    # Lead acceptance / decline from inbox item
-    m = re.match(r"accept\s+(\d+)\s+name=(.+)$", t)
-    if m:
-        iid = int(m.group(1))
-        name = m.group(2).strip()
-        ok, msg = crud.lead_accept_from_inbox(iid, name)
-        send_whatsapp_text(wa, msg)
-        return True
 
-    m = re.match(r"decline\s+(\d+)\s*$", t)
-    if m:
-        iid = int(m.group(1))
-        ok, msg = crud.lead_decline_from_inbox(iid)
-        send_whatsapp_text(wa, msg)
-        return True
+def _mark_all_read(wa: str) -> None:
+    # Minimal placeholder; implement a real UPDATE when you’re ready.
+    send_whatsapp_text(wa, "✅ Marked all as read. (Note: wire the UPDATE when ready.)")
+    show_inbox_menu(wa)
 
-    return False
 
-def _admin_other_commands(wa: str, text: str) -> bool:
+def _send_clients_list(wa: str) -> None:
+    rows = list_clients(limit=10, offset=0)
+    if not rows:
+        send_whatsapp_text(wa, "No clients found.")
+        show_clients_menu(wa)
+        return
+    lines = []
+    for r in rows:
+        nm = (r.get("name") or "").strip() or "(no name)"
+        wn = r.get("wa_number") or ""
+        lines.append(f"• {nm} – {wn}")
+    send_whatsapp_text(wa, "👥 Clients (first 10):\n" + "\n".join(lines))
+    show_clients_menu(wa)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point from router
+# ──────────────────────────────────────────────────────────────────────────────
+def handle_admin_action(
+    wa: str,
+    reply_id: Optional[str] = None,
+    body: Optional[str] = None,
+    btn_id: Optional[str] = None,
+) -> None:
     """
-    Slots for your existing admin functions (hourly/today/recap/view clients etc.)
-    Return True if handled, else False → we'll show help.
+    Unified admin dispatcher.
+    - Prioritises button payload id (btn_id) if present.
+    - Falls back to simple text commands: inbox, clients, sessions, hourly, recap, help.
+    - Always returns the user to a button menu after an action.
     """
-    t = (text or "").strip().lower()
-    if t == "hourly":
-        # delegate to your existing /tasks endpoint or local function if present
-        send_whatsapp_text(wa, "Requesting hourly… (tip: you can also use curl /tasks/admin-notify)")
-        return True
-    if t == "recap":
-        send_whatsapp_text(wa, "Requesting 20:00 recap…")
-        return True
-    if t == "today":
-        send_whatsapp_text(wa, "Requesting today (upcoming)…")
-        return True
-    if t == "view clients":
-        # Minimal quick list; you can expand to a paginated picker
-        rows = crud.list_clients(limit=10, offset=0)
-        if not rows:
-            send_whatsapp_text(wa, "No clients found.")
-            return True
-        lines = ["👥 *Clients (top 10)*"]
-        for r in rows:
-            nm = (r.get("name") or "(no name)").strip()
-            wa_num = r.get("wa_number") or ""
-            lines.append(f"• {nm} — {wa_num}")
-        send_whatsapp_text(wa, "\n".join(lines))
-        return True
-    return False
+    wa = normalize_wa(wa)
+    cmd = (body or "").strip().lower()
 
-def handle_admin_action(wa: str, reply_id: str | None, body: str | None = None):
-    """
-    Main admin entry. We ALWAYS finish by showing the admin menu so the
-    available commands are discoverable.
-    """
-    text = (body or "").strip()
-    try:
-        # 1) Inbox commands first
-        if _admin_inbox_command(wa, text):
-            send_whatsapp_text(wa, ADMIN_HELP)
-            return
-        # 2) Other admin commands (hourly/today/recap/etc.)
-        if _admin_other_commands(wa, text):
-            send_whatsapp_text(wa, ADMIN_HELP)
-            return
-        # 3) Anything else → show help
-        send_whatsapp_text(wa, "💬 Admin here. What would you like to do?\n\n" + ADMIN_HELP)
-    except Exception:
-        logging.exception("admin handler failed")
-        send_whatsapp_text(wa, "Admin command failed.\n\n" + ADMIN_HELP)
+    # 1) Button-first routing
+    if btn_id:
+        if btn_id == BTN_MAIN_INBOX:    return show_inbox_menu(wa)
+        if btn_id == BTN_MAIN_CLIENTS:  return show_clients_menu(wa)
+        if btn_id == BTN_MAIN_SESSIONS: return show_sessions_menu(wa)
+
+        if btn_id == BTN_INBOX_OPEN:     return _send_inbox_open(wa)
+        if btn_id == BTN_INBOX_MARKREAD: return _mark_all_read(wa)
+        if btn_id == BTN_BACK_HOME:      return show_admin_home(wa)
+
+        if btn_id == BTN_CLIENTS_LIST:   return _send_clients_list(wa)
+        if btn_id == BTN_CLIENTS_SEARCH: return send_whatsapp_text(wa, "🔎 Search coming soon…") or show_clients_menu(wa)
+
+        if btn_id == BTN_SES_HOURLY: return _send_hourly_now(wa)
+        if btn_id == BTN_SES_TODAY:  return _send_today_names(wa)
+        if btn_id == BTN_SES_RECAP:  return _send_recap(wa)
+
+    # 2) Text fallback routing
+    if cmd in {"admin", "menu", "help"}:
+        return show_admin_home(wa)
+
+    if cmd in {"inbox"}:
+        return show_inbox_menu(wa)
+
+    if cmd in {"clients", "client"}:
+        return show_clients_menu(wa)
+
+    if cmd in {"sessions", "session"}:
+        return show_sessions_menu(wa)
+
+    if cmd in {"hourly"}:
+        return _send_hourly_now(wa)
+
+    if cmd in {"today", "names", "upcoming"}:
+        return _send_today_names(wa)
+
+    if cmd in {"recap", "20:00", "2000", "tonight"}:
+        return _send_recap(wa)
+
+    # Unknown → show home
+    send_whatsapp_text(wa, "I didn’t recognise that. Here’s the admin menu:")
+    show_admin_home(wa)
