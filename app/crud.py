@@ -6,8 +6,9 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import os
+import re
 
-# If you already have these helpers, import them; else stub normalize_wa here.
+# Try to import the project's normalizer
 try:
     from .utils import normalize_wa
 except Exception:
@@ -19,9 +20,35 @@ except Exception:
             return "27" + wa[1:]
         return wa
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg://user:pass@localhost:5432/app")
+# ──────────────────────────────────────────────────────────────────────────────
+# Database URL normalization
+# ──────────────────────────────────────────────────────────────────────────────
+# Prefer Psycopg v3 driver. If DATABASE_URL is plain 'postgresql://' or '+psycopg2',
+# rewrite it to 'postgresql+psycopg://'.
+RAW_DB_URL = os.environ.get("DATABASE_URL", "").strip()
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+def _normalize_db_url(url: str) -> str:
+    if not url:
+        # Local dev fallback (SQLite memory) to avoid boot failures without DB
+        return "sqlite+pysqlite:///:memory:"
+    # If already psycopg v3 driver, keep it
+    if url.startswith("postgresql+psycopg://"):
+        return url
+    # Convert 'postgresql://' or 'postgres://' or 'postgresql+psycopg2://' → psycopg v3
+    url = re.sub(r"^postgres://", "postgresql://", url)  # legacy heroku-style
+    url = re.sub(r"^postgresql\+psycopg2://", "postgresql+psycopg://", url)
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
+
+DATABASE_URL = _normalize_db_url(RAW_DB_URL)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    # For SQLite memory fallback, disable thread check
+    connect_args=({"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}),
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 @contextmanager
@@ -39,15 +66,14 @@ def session_scope():
 # ──────────────────────────────────────────────────────────────────────────────
 # Clients
 # ──────────────────────────────────────────────────────────────────────────────
-
 def client_exists_by_wa(wa: str) -> bool:
     """
     Return True if a client exists for this WA number.
-    We compare against both normalized '27...' and '+27...' forms WITHOUT doing SQL concatenation,
-    avoiding Postgres text/varchar ambiguity.
+    Compare normalized '27...' and '+27...' WITHOUT SQL concatenation
+    to avoid Postgres text/varchar ambiguity.
     """
-    wa_norm = normalize_wa(wa)                   # e.g., "2783..."
-    wa_plus = f"+{wa_norm}"                      # e.g., "+2783..."
+    wa_norm = normalize_wa(wa)
+    wa_plus = f"+{wa_norm}"
     with session_scope() as s:
         row = s.execute(
             text("""
@@ -63,11 +89,11 @@ def client_exists_by_wa(wa: str) -> bool:
 def upsert_public_client(wa: str, name: Optional[str]) -> Dict[str, Any]:
     """
     Idempotent insert/update of a 'lead' client. Always stores normalized WA.
-    If a '+...' record exists, we update it to normalized form.
+    If a '+...' record exists, update it to normalized form.
     """
     wa_norm = normalize_wa(wa)
     with session_scope() as s:
-        # Try fetch any existing row by either form
+        # Fetch if exists under either form
         row = s.execute(
             text("""
                 SELECT id, wa_number, name
@@ -79,7 +105,6 @@ def upsert_public_client(wa: str, name: Optional[str]) -> Dict[str, Any]:
         ).mappings().first()
 
         if row:
-            # Update to normalized number + optional name
             s.execute(
                 text("""
                     UPDATE clients
@@ -91,7 +116,6 @@ def upsert_public_client(wa: str, name: Optional[str]) -> Dict[str, Any]:
             )
             return {"id": row["id"], "wa_number": wa_norm, "name": name or row.get("name")}
         else:
-            # Insert new lead
             ins = s.execute(
                 text("""
                     INSERT INTO clients (wa_number, name, role)
@@ -105,7 +129,6 @@ def upsert_public_client(wa: str, name: Optional[str]) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Admin inbox (minimal)
 # ──────────────────────────────────────────────────────────────────────────────
-
 def inbox_upsert(
     *,
     kind: str,
