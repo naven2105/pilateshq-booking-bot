@@ -40,35 +40,31 @@ def _normalize(text: str) -> str:
 def _intent_and_payload(text: str) -> Tuple[str, Optional[str]]:
     t = _normalize(text)
 
-    if t in {"1", "pricing", "price", "prices"}:
-        return "pricing", None
-    if t in {"2", "address", "parking", "where", "location"}:
-        return "address", None
-    if t in {"3", "schedule", "hours", "opening", "times"}:
-        return "schedule", None
-    if t in {"4", "group", "group sizes", "class size"}:
-        return "group_sizes", None
-    if t in {"5", "equipment", "machines", "reformer"}:
-        return "equipment", None
-    if t in {"6", "start", "how to start", "assessment"}:
-        return "how_to_start", None
-    if t in {"7", "book", "booking", "request"}:
-        return "book_request", None
-    if t in {"8", "contact", "phone", "email"}:
-        return "contact", None
+    # Direct picks
+    if t in {"1", "pricing", "price", "prices"}:                       return "pricing", None
+    if t in {"2", "address", "parking", "where", "location"}:          return "address", None
+    if t in {"3", "schedule", "hours", "opening", "times"}:            return "schedule", None
+    if t in {"4", "group", "group sizes", "class size"}:               return "group_sizes", None
+    if t in {"5", "equipment", "machines", "reformer"}:                return "equipment", None
+    if t in {"6", "start", "how to start", "assessment"}:              return "how_to_start", None
+    if t in {"7", "book", "booking", "request"}:                       return "book_request", None
+    if t in {"8", "contact", "phone", "email"}:                        return "contact", None
 
+    # Greetings → show menu
     if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
         return "menu", None
 
-    if "price" in t or "cost" in t or "fee" in t:              return "pricing", None
-    if "address" in t or "parking" in t or "where" in t:        return "address", None
-    if "schedule" in t or "time" in t or "open" in t:           return "schedule", None
-    if "group" in t or "size" in t:                             return "group_sizes", None
-    if "equip" in t or "reformer" in t or "chair" in t:         return "equipment", None
-    if "start" in t or "assessment" in t or "begin" in t:       return "how_to_start", None
-    if "book" in t or "reserve" in t:                           return "book_request", None
-    if "contact" in t or "call" in t or "email" in t:           return "contact", None
+    # Fuzzy keywords
+    if "price" in t or "cost" in t or "fee" in t:                       return "pricing", None
+    if "address" in t or "parking" in t or "where" in t or "located" in t:  return "address", None
+    if "schedule" in t or "time" in t or "open" in t or "hour" in t:    return "schedule", None
+    if "group" in t or "size" in t:                                     return "group_sizes", None
+    if "equip" in t or "reformer" in t or "chair" in t or "mat" in t:   return "equipment", None
+    if "start" in t or "assessment" in t or "begin" in t:               return "how_to_start", None
+    if "book" in t or "reserve" in t:                                   return "book_request", None
+    if "contact" in t or "call" in t or "email" in t or "whatsapp" in t:return "contact", None
 
+    # Fallback: show menu
     return "menu", None
 
 def _faq_response(intent: str) -> str:
@@ -122,9 +118,16 @@ def _faq_response(intent: str) -> str:
             "We’ve forwarded your request to the studio. An instructor will confirm time and next steps.\n"
             "If you have preferred days/times, reply with them now."
         )
+    # Default
     return "Thanks! How can we help today?"
 
 def _handle_public_message(wa: str, body: str) -> None:
+    """
+    Lead/FAQ flow:
+    - Ensure the number exists in clients table as a lead (name optional).
+    - Answer common questions.
+    - Always append the menu to keep the conversation discoverable.
+    """
     # Ensure (or create) lead client record
     try:
         if not client_exists_by_wa(wa):
@@ -135,10 +138,10 @@ def _handle_public_message(wa: str, body: str) -> None:
     intent, _ = _intent_and_payload(body)
 
     if intent == "book_request":
-        # notify admins + write to admin_inbox
-        response = _faq_response(intent) + "\n\n" + _public_menu()
-        send_whatsapp_text(wa, response)
+        # Answer the user…
+        send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
 
+        # …and log + notify admins (idempotent)
         try:
             digest = hashlib.sha256(f"{wa}|{body}".encode("utf-8")).hexdigest()
             inbox_upsert(
@@ -176,8 +179,8 @@ def _handle_public_message(wa: str, body: str) -> None:
 def register_routes(app):
     """
     Mounts:
-      GET  /webhook  – Meta verification
-      POST /webhook  – WhatsApp inbound
+      GET  /webhook  – Meta verification (hub.mode=subscribe; hub.verify_token; hub.challenge)
+      POST /webhook  – WhatsApp Cloud API inbound
       GET  /         – simple OK
       GET  /health   – liveness probe (registered only if missing)
     """
@@ -185,7 +188,7 @@ def register_routes(app):
     def root():
         return "ok", 200
 
-    # Register /health only if not already added elsewhere
+    # Avoid endpoint collision if another module also registers /health
     if "health_router" not in app.view_functions:
         @app.get("/health", endpoint="health_router")
         def health_router():
@@ -193,9 +196,11 @@ def register_routes(app):
 
     @app.get("/webhook")
     def webhook_verify():
+        # Meta’s verification handshake
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
+
         if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
             return challenge, 200
         return "forbidden", 403
@@ -204,9 +209,12 @@ def register_routes(app):
     def webhook():
         try:
             data = request.get_json(force=True, silent=True) or {}
+            # WhatsApp payload structure (Cloud API):
+            # entry[0].changes[0].value.messages[0]
             entry = (data.get("entry") or [])
             if not entry:
                 return "ok", 200
+
             changes = (entry[0].get("changes") or [])
             if not changes:
                 return "ok", 200
@@ -217,7 +225,8 @@ def register_routes(app):
                 return "ok", 200
 
             msg = msgs[0]
-            from_wa = normalize_wa(msg.get("from") or "")
+            from_wa_raw = msg.get("from") or ""
+            from_wa = normalize_wa(from_wa_raw)
             msg_type = msg.get("type")
 
             # Extract text or interactive reply title + id
@@ -235,16 +244,20 @@ def register_routes(app):
                     lr = inter.get("list_reply") or {}
                     body = lr.get("title", "") or ""
                     btn_id = lr.get("id") or None
+                else:
+                    body = ""
             else:
+                # Other types (image, sticker, etc.) → treat as empty and show menu/admin home
                 body = ""
 
+            # Route: admin vs public
             if from_wa in ADMIN_NUMBERS:
-                # Button-first admin flow
+                # Prefer 4-arg admin handler; gracefully fall back to 3 args if your admin.py doesn't yet accept btn_id
                 try:
-                    handle_admin_action(from_wa, msg.get("id"), body, btn_id)
+                    handle_admin_action(from_wa, msg.get("id"), body, btn_id)  # new signature
                 except TypeError:
                     try:
-                        handle_admin_action(from_wa, msg.get("id"), body)
+                        handle_admin_action(from_wa, msg.get("id"), body)      # legacy signature
                     except Exception:
                         logging.exception("admin handler failed")
                 except Exception:
