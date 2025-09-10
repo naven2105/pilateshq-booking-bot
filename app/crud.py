@@ -7,231 +7,190 @@ from typing import Optional, List, Dict
 from sqlalchemy import text
 from .db import get_session
 from .utils import normalize_wa
+from .config import TZ_NAME
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Leads / Clients
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Clients
+# ──────────────────────────────────────────────────────────────────────────────
 
 def client_exists_by_wa(wa_number: str) -> bool:
+    """
+    True if a client row exists for this WhatsApp number.
+    We check both '2773…' and '+2773…' forms to be robust.
+    """
     wa = normalize_wa(wa_number)
     with get_session() as s:
         row = s.execute(
-            text("SELECT 1 FROM clients WHERE wa_number = :wa LIMIT 1"),
-            {"wa": wa if wa.startswith("+") else f"+{wa}"}
+            text("""
+                SELECT 1
+                FROM clients
+                WHERE wa_number IN (:wa, '+' || :wa)
+                LIMIT 1
+            """),
+            {"wa": wa},
         ).first()
-        return row is not None
+        return bool(row)
 
 
-def upsert_public_client(wa_number: str, name: Optional[str]) -> dict:
+def upsert_public_client(wa_number: str, name: Optional[str]) -> Dict:
     """
-    Ensure a lead/client exists. If name is provided (non-empty), set/keep it.
-    Uses plan NULL or default if your schema requires NOT NULL for plan, adjust below.
+    Ensure a 'lead' client exists. Will not overwrite an existing name with empty.
+    Uses plan='lead' as a safe non-null default.
     """
-    wa_norm = normalize_wa(wa_number)
-    nm = (name or "").strip()
+    wa = normalize_wa(wa_number)
+    # Fallback name if none was provided
+    fallback = None
+    if not name or not name.strip():
+        # e.g. 'Guest 4607' from the last 4 digits
+        tail = wa[-4:] if wa else "0000"
+        fallback = f"Guest {tail}"
 
-    # If your clients.plan is NOT NULL, you can default it here instead of NULL.
     with get_session() as s:
         row = s.execute(
             text("""
                 INSERT INTO clients (name, wa_number, credits, plan)
-                VALUES (COALESCE(NULLIF(:name,''), CONCAT('Guest ', RIGHT(:wan, 4))), :wan, 0, COALESCE(NULL, plan) )
+                VALUES (COALESCE(NULLIF(:nm, ''), :fallback), :wa, 0, 'lead')
                 ON CONFLICT (wa_number)
                 DO UPDATE SET
-                    name = COALESCE(NULLIF(EXCLUDED.name,''), clients.name)
-                RETURNING id, COALESCE(name,'') AS name, COALESCE(wa_number,'') AS wa_number
+                    name = COALESCE(NULLIF(EXCLUDED.name, ''), clients.name)
+                RETURNING id, name, wa_number
             """),
-            {"name": nm, "wan": wa_norm if wa_norm.startswith("+") else f"+{wa_norm}"},
+            {"nm": (name or "").strip(), "fallback": fallback, "wa": wa},
         ).mappings().first()
-        return dict(row)
+        return dict(row) if row else {}
 
 
-def find_clients_by_prefix(prefix: str, limit: int = 10) -> List[dict]:
-    p = (prefix or "").strip()
-    if not p:
+def find_clients_by_prefix(prefix: str, limit: int = 10, offset: int = 0) -> List[Dict]:
+    """
+    Case-insensitive prefix search on name OR on wa_number (prefix).
+    """
+    q = (prefix or "").strip()
+    if not q:
         return []
+
     with get_session() as s:
         rows = s.execute(
             text("""
-                SELECT id, COALESCE(name,'') AS name, COALESCE(wa_number,'') AS wa_number
+                SELECT
+                    id,
+                    COALESCE(name, '')      AS name,
+                    COALESCE(wa_number, '') AS wa_number,
+                    COALESCE(plan, '')      AS plan,
+                    COALESCE(credits, 0)    AS credits
                 FROM clients
-                WHERE LOWER(COALESCE(name,'')) LIKE LOWER(:pfx) || '%'
-                ORDER BY COALESCE(name,''), id
-                LIMIT :lim
-            """),
-            {"pfx": p, "lim": int(limit)},
-        ).mappings().all()
-        return [dict(r) for r in rows]
-
-
-def list_clients(limit: int = 10, offset: int = 0) -> List[dict]:
-    with get_session() as s:
-        rows = s.execute(
-            text("""
-                SELECT id, COALESCE(name,'') AS name, COALESCE(wa_number,'') AS wa_number
-                FROM clients
-                ORDER BY COALESCE(name,''), id
+                WHERE
+                    LOWER(COALESCE(name, '')) LIKE LOWER(:name_pref)
+                    OR REPLACE(wa_number, '+', '') LIKE REPLACE(:wa_pref, '+', '')
+                ORDER BY COALESCE(name, ''), id
                 LIMIT :lim OFFSET :off
             """),
-            {"lim": int(limit), "off": int(offset)},
+            {"name_pref": f"{q}%", "wa_pref": f"{q}%", "lim": int(limit), "off": int(offset)},
         ).mappings().all()
         return [dict(r) for r in rows]
 
 
-def find_one_client(q: str):
+def find_one_client(identifier: str) -> Optional[Dict]:
     """
-    Best-effort resolver:
-      - If q is numeric => treat as ID
-      - Else if q looks like a phone => normalize and match wa_number
-      - Else => name prefix search
-    Returns:
-      - dict(client) if exactly one match
-      - {"_multi": [clients...]} if multiple
-      - None if none
+    Flexible fetch:
+      - If numeric => treat as client id
+      - Else, try by exact wa_number (normalized), then by exact name (case-insensitive)
+    Returns minimal fields.
     """
-    q = (q or "").strip()
-    if not q:
+    ident = (identifier or "").strip()
+    if not ident:
         return None
 
-    # ID path
-    if q.isdigit():
-        with get_session() as s:
+    with get_session() as s:
+        # Try by integer id
+        try:
+            cid = int(ident)
             row = s.execute(
                 text("""
-                    SELECT id, COALESCE(name,'') AS name, COALESCE(wa_number,'') AS wa_number
-                    FROM clients WHERE id = :cid
-                """),
-                {"cid": int(q)},
-            ).mappings().first()
-            return dict(row) if row else None
-
-    # Phone path
-    wa_norm = normalize_wa(q)
-    if wa_norm:
-        with get_session() as s:
-            rows = s.execute(
-                text("""
-                    SELECT id, COALESCE(name,'') AS name, COALESCE(wa_number,'') AS wa_number
+                    SELECT id, name, wa_number, COALESCE(credits,0) AS credits, COALESCE(plan,'') AS plan
                     FROM clients
-                    WHERE wa_number IN (:w_plus, :w_raw)
+                    WHERE id = :cid
+                    LIMIT 1
                 """),
-                {
-                    "w_plus": wa_norm if wa_norm.startswith("+") else f"+{wa_norm}",
-                    "w_raw": wa_norm,
-                },
-            ).mappings().all()
-            if len(rows) == 1:
-                return dict(rows[0])
-            if len(rows) > 1:
-                return {"_multi": [dict(r) for r in rows]}
+                {"cid": cid},
+            ).mappings().first()
+            if row:
+                return dict(row)
+        except ValueError:
+            pass
 
-    # Name prefix
-    matches = find_clients_by_prefix(q, limit=10)
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        return {"_multi": matches}
-    return None
+        # Try by WA
+        wa = normalize_wa(ident)
+        row = s.execute(
+            text("""
+                SELECT id, name, wa_number, COALESCE(credits,0) AS credits, COALESCE(plan,'') AS plan
+                FROM clients
+                WHERE wa_number IN (:wa, '+' || :wa)
+                LIMIT 1
+            """),
+            {"wa": wa},
+        ).mappings().first()
+        if row:
+            return dict(row)
+
+        # Try by exact name (case-insensitive)
+        row = s.execute(
+            text("""
+                SELECT id, name, wa_number, COALESCE(credits,0) AS credits, COALESCE(plan,'') AS plan
+                FROM clients
+                WHERE LOWER(COALESCE(name,'')) = LOWER(:nm)
+                ORDER BY id
+                LIMIT 1
+            """),
+            {"nm": ident},
+        ).mappings().first()
+        return dict(row) if row else None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sessions with Names (used by admin/tasks)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def sessions_today_with_names(tz_name: str, upcoming_only: bool = True) -> List[dict]:
+# Optional helpers (not currently used by the simplified admin, but harmless)
+def client_upcoming_bookings(client_id: int, limit: int = 10) -> List[Dict]:
     """
-    Returns today's sessions (optionally upcoming only) with aggregated confirmed client names.
+    Upcoming confirmed bookings for a client.
     """
-    sql = f"""
-        WITH now_local AS (
-            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-        ),
-        pool AS (
-            SELECT s.id, s.session_date, s.start_time, s.capacity,
-                   s.booked_count, s.status, COALESCE(s.notes,'') AS notes
-            FROM sessions s, now_local
-            WHERE s.session_date = (now_local.ts)::date
-            {"AND s.start_time >= (now_local.ts)::time" if upcoming_only else ""}
-        )
-        SELECT
-            p.*,
-            COALESCE((
-                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                FROM (
-                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                    FROM bookings b2
-                    JOIN clients  c2 ON c2.id = b2.client_id
-                    WHERE b2.session_id = p.id AND b2.status = 'confirmed'
-                ) d
-            ), '') AS names
-        FROM pool p
-        ORDER BY p.session_date, p.start_time
-    """
-    with get_session() as s:
-        rows = s.execute(text(sql), {"tz": tz_name}).mappings().all()
-        return [dict(r) for r in rows]
-
-
-def sessions_next_hour_with_names(tz_name: str) -> List[dict]:
-    sql = """
-        WITH now_local AS (
-            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-        ),
-        bounds AS (
-            SELECT date_trunc('hour', ts) AS h, date_trunc('hour', ts) + INTERVAL '1 hour' AS h_plus
-            FROM now_local
-        )
-        SELECT
-            s.id, s.session_date, s.start_time, s.capacity, s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
-            COALESCE((
-                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                FROM (
-                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                    FROM bookings b2
-                    JOIN clients  c2 ON c2.id = b2.client_id
-                    WHERE b2.session_id = s.id AND b2.status = 'confirmed'
-                ) d
-            ), '') AS names
-        FROM sessions s, bounds
-        WHERE (s.session_date + s.start_time) >= bounds.h
-          AND (s.session_date + s.start_time) <  bounds.h_plus
-        ORDER BY s.start_time
-    """
-    with get_session() as s:
-        rows = s.execute(text(sql), {"tz": tz_name}).mappings().all()
-        return [dict(r) for r in rows]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Client activity (optional helpers)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def client_upcoming_bookings(client_id: int, tz_name: str) -> List[dict]:
     with get_session() as s:
         rows = s.execute(
-            text("""
+            text(f"""
                 WITH now_local AS (
                     SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
                 )
-                SELECT s.session_date, s.start_time, b.status
+                SELECT
+                    b.id AS booking_id,
+                    s.id AS session_id,
+                    s.session_date,
+                    s.start_time,
+                    b.status
                 FROM bookings b
                 JOIN sessions s ON s.id = b.session_id
                 , now_local
                 WHERE b.client_id = :cid
+                  AND b.status = 'confirmed'
                   AND (s.session_date + s.start_time) >= now_local.ts
                 ORDER BY s.session_date, s.start_time
+                LIMIT :lim
             """),
-            {"cid": int(client_id), "tz": tz_name},
+            {"cid": int(client_id), "lim": int(limit), "tz": TZ_NAME},
         ).mappings().all()
         return [dict(r) for r in rows]
 
 
-def client_recent_history(client_id: int, limit: int = 10) -> List[dict]:
+def client_recent_history(client_id: int, limit: int = 10) -> List[Dict]:
+    """
+    Most recent bookings (any status) for a client, newest first.
+    """
     with get_session() as s:
         rows = s.execute(
             text("""
-                SELECT s.session_date, s.start_time, b.status
+                SELECT
+                    b.id AS booking_id,
+                    s.id AS session_id,
+                    s.session_date,
+                    s.start_time,
+                    b.status
                 FROM bookings b
                 JOIN sessions s ON s.id = b.session_id
                 WHERE b.client_id = :cid
@@ -243,71 +202,74 @@ def client_recent_history(client_id: int, limit: int = 10) -> List[dict]:
         return [dict(r) for r in rows]
 
 
-def find_next_upcoming_booking_by_wa(wa_number: str) -> Optional[dict]:
-    wa = normalize_wa(wa_number)
+# ──────────────────────────────────────────────────────────────────────────────
+# Sessions (names aggregated)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def sessions_today_names() -> List[Dict]:
+    """
+    Return today's sessions (full day) with aggregated DISTINCT confirmed client names.
+    """
     with get_session() as s:
-        row = s.execute(text("""
-            WITH now_local AS (
-                SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Johannesburg') AS ts
-            )
-            SELECT b.id AS booking_id,
-                   s.id AS session_id,
-                   s.session_date,
-                   s.start_time,
-                   c.id AS client_id,
-                   c.name,
-                   c.wa_number
-            FROM bookings b
-            JOIN sessions s ON s.id = b.session_id
-            JOIN clients  c ON c.id = b.client_id
-            , now_local
-            WHERE c.wa_number IN (:wa_plus, :wa_raw)
-              AND b.status = 'confirmed'
-              AND (s.session_date + s.start_time) > now_local.ts
-            ORDER BY s.session_date, s.start_time
-            LIMIT 1
-        """), {"wa_plus": wa if wa.startswith("+") else f"+{wa}", "wa_raw": wa}).mappings().first()
-        return dict(row) if row else None
+        rows = s.execute(
+            text("""
+                WITH now_local AS (
+                    SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
+                ),
+                pool AS (
+                    SELECT s.id, s.session_date, s.start_time, s.capacity,
+                           s.booked_count, s.status, COALESCE(s.notes,'') AS notes
+                    FROM sessions s, now_local
+                    WHERE s.session_date = (now_local.ts)::date
+                )
+                SELECT
+                    p.*,
+                    COALESCE((
+                        SELECT STRING_AGG(nm, ', ' ORDER BY nm)
+                        FROM (
+                            SELECT DISTINCT COALESCE(c2.name, '') AS nm
+                            FROM bookings b2
+                            JOIN clients  c2 ON c2.id = b2.client_id
+                            WHERE b2.session_id = p.id AND b2.status = 'confirmed'
+                        ) d
+                    ), '') AS names
+                FROM pool p
+                ORDER BY p.session_date, p.start_time
+            """),
+            {"tz": TZ_NAME},
+        ).mappings().all()
+        return [dict(r) for r in rows]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Admin Inbox
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
-_ALLOWED_INBOX_KINDS = {"hourly", "recap", "booking_request", "query", "system", "daily"}  # allow 'daily' too
+_ALLOWED_KINDS = {"booking_request", "query", "hourly", "recap", "system"}
 
-
-def inbox_upsert(
-    *,
-    kind: str,
-    title: str,
-    body: str,
-    session_id: Optional[int] = None,
-    client_id: Optional[int] = None,
-    source: str = "system",
-    status: str = "open",
-    is_unread: bool = True,
-    action_required: bool = False,
-    bucket: Optional[str] = None,
-    digest: Optional[str] = None,
-) -> Optional[int]:
+def inbox_upsert(*,
+                 kind: str,
+                 title: str,
+                 body: str,
+                 source: str = "system",
+                 status: str = "open",
+                 is_unread: bool = True,
+                 action_required: bool = False,
+                 bucket: Optional[str] = None,
+                 digest: Optional[str] = None,
+                 session_id: Optional[int] = None,
+                 client_id: Optional[int] = None) -> Optional[int]:
     """
-    Insert an inbox row idempotently (by digest). If digest not provided, derive from fields.
+    Insert an admin_inbox row idempotently via digest.
+    Allowed kinds: booking_request | query | hourly | recap | system
     """
-    if kind not in _ALLOWED_INBOX_KINDS:
+    if kind not in _ALLOWED_KINDS:
         raise ValueError(f"Unsupported inbox kind: {kind}")
 
     if not digest:
-        h = hashlib.sha256()
-        h.update((kind or "").encode())
-        h.update((title or "").encode())
-        h.update((body or "").encode())
-        h.update((bucket or "").encode())
-        if session_id:
-            h.update(f"sid:{session_id}".encode())
-        if client_id:
-            h.update(f"cid:{client_id}".encode())
-        digest = h.hexdigest()
+        # Stable hash over main fields (bucket participates if present)
+        base = f"{kind}|{title}|{body}|{source}|{status}|{bucket or ''}|{session_id or ''}|{client_id or ''}"
+        digest = hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     with get_session() as s:
         row = s.execute(
@@ -315,60 +277,36 @@ def inbox_upsert(
                 INSERT INTO admin_inbox
                   (kind, title, body, session_id, client_id, source, status, is_unread, action_required, bucket, digest)
                 VALUES
-                  (:k,   :t,    :b,   :sid,       :cid,       :src,   :st,       :iu,       :ar,              :bk,    :dg)
+                  (:k,   :t,    :b,   :sid,       :cid,       :src,   :st,       :ur,       :ar,             :bk,    :dg)
                 ON CONFLICT (digest) DO NOTHING
                 RETURNING id
             """),
-            {"k": kind, "t": title, "b": body, "sid": session_id, "cid": client_id,
-             "src": source, "st": status, "iu": bool(is_unread), "ar": bool(action_required),
-             "bk": bucket, "dg": digest},
+            {
+                "k": kind, "t": title, "b": body,
+                "sid": session_id, "cid": client_id,
+                "src": source, "st": status,
+                "ur": bool(is_unread), "ar": bool(action_required),
+                "bk": bucket, "dg": digest
+            },
         ).mappings().first()
-        return (row or {}).get("id")
+        return int(row["id"]) if row and "id" in row else None
 
 
-def inbox_counts() -> dict:
+def inbox_counts() -> Dict[str, int]:
+    """
+    Quick counts for Admin home.
+    """
     with get_session() as s:
-        row = s.execute(
-            text("""
-                SELECT
-                  SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END)::int AS open_count,
-                  SUM(CASE WHEN is_unread THEN 1 ELSE 0 END)::int       AS unread_count,
-                  SUM(CASE WHEN action_required THEN 1 ELSE 0 END)::int AS action_count
-                FROM admin_inbox
-            """)
-        ).mappings().first()
-        return dict(row) if row else {"open_count": 0, "unread_count": 0, "action_count": 0}
+        unread = s.execute(
+            text("SELECT COUNT(*) AS n FROM admin_inbox WHERE is_unread = TRUE")
+        ).mappings().first()["n"]
 
+        open_ = s.execute(
+            text("SELECT COUNT(*) AS n FROM admin_inbox WHERE status = 'open'")
+        ).mappings().first()["n"]
 
-def inbox_recent(kind: Optional[str] = None, limit: int = 5) -> List[dict]:
-    with get_session() as s:
-        if kind:
-            rows = s.execute(
-                text("""
-                    SELECT id, kind, title, body, status, is_unread, action_required, created_at
-                    FROM admin_inbox
-                    WHERE kind = :k
-                    ORDER BY created_at DESC
-                    LIMIT :lim
-                """),
-                {"k": kind, "lim": int(limit)},
-            ).mappings().all()
-        else:
-            rows = s.execute(
-                text("""
-                    SELECT id, kind, title, body, status, is_unread, action_required, created_at
-                    FROM admin_inbox
-                    ORDER BY created_at DESC
-                    LIMIT :lim
-                """),
-                {"lim": int(limit)},
-            ).mappings().all()
-        return [dict(r) for r in rows]
+        action = s.execute(
+            text("SELECT COUNT(*) AS n FROM admin_inbox WHERE action_required = TRUE AND status <> 'closed'")
+        ).mappings().first()["n"]
 
-
-def inbox_mark_read(inbox_id: int) -> None:
-    with get_session() as s:
-        s.execute(
-            text("UPDATE admin_inbox SET is_unread = FALSE WHERE id = :iid"),
-            {"iid": int(inbox_id)},
-        )
+    return {"unread": int(unread or 0), "open": int(open_ or 0), "action": int(action or 0)}
