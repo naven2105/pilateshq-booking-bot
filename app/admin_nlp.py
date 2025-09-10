@@ -1,11 +1,19 @@
 # app/admin_nlp.py
 """
 Lightweight natural-language parsing for admin shortcuts.
-Converts phrases like:
-  - "Book Mary on 2025-09-01 08:00"
-  - "Book Peter every Monday 8am for 4 weeks"
-  - "John is no show today"
-into structured intents for admin.py to execute.
+Now supports:
+  - Single-day bookings:
+      "Book Mary on 2025-09-01 08:00 single"
+  - Recurring single day:
+      "Book Mary every Tuesday 09h00 duo"
+  - Recurring multi-day (mixed slot types):
+      "Book Mary and John every Tuesday 09h00 and Thursday 10h00 single"
+      "Book Sarah every Mon 07:30 duo and Wed 09:00 single"
+Behavior:
+  - If two names are given after 'Book', first is primary client; second is treated as duo partner by default.
+  - Each segment may include an explicit slot type: single | 1-1 | solo | duo | couple.
+  - If a partner is present and no explicit type is given for a segment, that segment defaults to 'duo'.
+  - If no partner and no explicit type, defaults to 'single'.
 """
 
 import re
@@ -21,6 +29,9 @@ MONTHS = {
     "oct":10,"october":10,"nov":11,"november":11,"dec":12,"december":12
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Time parsing
+# ──────────────────────────────────────────────────────────────────────────────
 def parse_time_word(t: str) -> str | None:
     """
     Accepts times like '8', '8:30', '8am', '20:00', or '08h30' and returns 'HH:MM'.
@@ -43,38 +54,135 @@ def parse_time_word(t: str) -> str | None:
         return f"{int(m.group(1)):02d}:00"
     return None
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+_SLOT_SINGLE_WORDS = {"single","solo","1-1","1:1","one-to-one","one2one"}
+_SLOT_DUO_WORDS    = {"duo","couple","2-1","pair","partner"}
+
+def _norm_slot_type(raw: str | None, has_partner: bool) -> str:
+    if raw:
+        r = raw.strip().lower()
+        if r in _SLOT_SINGLE_WORDS: return "single"
+        if r in _SLOT_DUO_WORDS:    return "duo"
+    # default by presence of partner
+    return "duo" if has_partner else "single"
+
+def _weekday_from(s: str) -> int | None:
+    return WEEKDAYS.get(s.strip().lower())
+
+def _split_two_names(name_blob: str) -> tuple[str, str | None]:
+    """
+    Split "Mary and John" → ("Mary", "John").
+    If only one name, returns (name, None).
+    """
+    s = name_blob.strip()
+    m = re.match(r'(.+?)\s+(?:and|&)\s+(.+)$', s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return s, None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main parsers
+# ──────────────────────────────────────────────────────────────────────────────
 def parse_admin_command(text: str) -> dict | None:
     """
     Booking-related phrases.
     Returns a dict with keys 'intent' plus parameters or None if not matched.
+
+    Supported:
+      - book_single:  "Book Mary on 2025-09-01 08:00 [single|duo] [with John]"
+      - book_recurring: "Book Mary every Tuesday 09h00 [single|duo]"
+      - book_recurring_multi: "Book Mary and John every Tue 09h00 and Thu 10h00 [single|duo]"
     """
-    s = text.strip().lower()
-    m = re.search(r'^book\s+(.+?)\s+every\s+([a-z]+)\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)(?:\s+for\s+(\d+)\s+weeks?)?$', s)
-    if m:
-        name, wday, timestr, weeks = m.group(1), m.group(2), m.group(3), m.group(4)
-        if wday not in WEEKDAYS:
-            return None
-        hhmm = parse_time_word(timestr) or None
-        if not hhmm:
-            return None
-        return {"intent":"book_recurring","name":name.strip(),"weekday":WEEKDAYS[wday],"time":hhmm,"weeks":int(weeks or 4)}
+    s = text.strip()
 
-    m = re.search(r'^book\s+(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)$', s)
+    # 1) Single date booking (with optional type and partner)
+    m = re.match(r'(?i)^\s*book\s+(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)(?:\s+(single|solo|1-1|duo|couple))?(?:\s+(?:with)\s+(.+))?\s*$', s)
     if m:
-        name, dstr, timestr = m.group(1), m.group(2), m.group(3)
+        name_blob, dstr, timestr, type_word, partner = m.groups()
+        name, inferred_partner = _split_two_names(name_blob)
         hhmm = parse_time_word(timestr) or None
-        if not hhmm:
-            return None
-        return {"intent":"book_single","name":name.strip(),"date":dstr,"time":hhmm}
+        if not hhmm: return None
+        has_partner = bool(partner or inferred_partner)
+        slot_type = _norm_slot_type(type_word, has_partner)
+        return {
+            "intent":"book_single",
+            "name":name,
+            "date":dstr,
+            "time":hhmm,
+            "slot_type":slot_type,
+            "partner": (partner or inferred_partner)
+        }
 
-    m = re.search(r'^book\s+(.+?)\s+tomorrow\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)$', s)
+    # 2) Recurring (single day) — optional type, optional second name via "and X" in name_blob
+    m = re.match(r'(?i)^\s*book\s+(.+?)\s+every\s+([a-z]+)\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)(?:\s+(single|solo|1-1|duo|couple))?\s*$', s)
     if m:
-        name, timestr = m.group(1), m.group(2)
+        name_blob, wday, timestr, type_word = m.groups()
+        if _weekday_from(wday) is None: return None
+        name, partner = _split_two_names(name_blob)
+        hhmm = parse_time_word(timestr) or None
+        if not hhmm: return None
+        slot_type = _norm_slot_type(type_word, has_partner=bool(partner))
+        return {
+            "intent":"book_recurring",
+            "name":name,
+            "weekday":_weekday_from(wday),
+            "time":hhmm,
+            "slot_type":slot_type,
+            "partner": partner,
+            "until_cancelled": True
+        }
+
+    # 3) Recurring multi-day: "... every Tue 09h00 [single|duo] and Thu 10h00 [single|duo] ..."
+    m = re.match(r'(?i)^\s*book\s+(.+?)\s+every\s+(.+?)\s*$', s)
+    if m:
+        name_blob, rest = m.groups()
+        name, partner = _split_two_names(name_blob)
+
+        # Split segments by " and "
+        segments = re.split(r'(?i)\s+and\s+', rest.strip())
+        slots = []
+        for seg in segments:
+            # pattern: "<weekday> <time> [type]"
+            ms = re.match(r'(?i)^\s*([a-z]+)\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)(?:\s+(single|solo|1-1|duo|couple))?\s*$', seg.strip())
+            if not ms:
+                return None
+            wday, timestr, type_word = ms.groups()
+            wdi = _weekday_from(wday)
+            if wdi is None:
+                return None
+            hhmm = parse_time_word(timestr) or None
+            if not hhmm:
+                return None
+            slot_type = _norm_slot_type(type_word, has_partner=bool(partner))
+            # For duo type, partner is required; if not supplied, keep None (admin can fix)
+            slots.append({
+                "weekday": wdi,
+                "time": hhmm,
+                "slot_type": slot_type,
+                "partner": partner if slot_type == "duo" else None
+            })
+
+        if slots:
+            return {
+                "intent": "book_recurring_multi",
+                "name": name,
+                "slots": slots,               # list of {weekday,time,slot_type,partner?}
+                "until_cancelled": True
+            }
+
+    # 4) Tomorrow helper
+    m = re.match(r'(?i)^\s*book\s+(.+?)\s+tomorrow\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)(?:\s+(single|solo|1-1|duo|couple))?\s*$', s)
+    if m:
+        name_blob, timestr, type_word = m.groups()
+        name, partner = _split_two_names(name_blob)
         hhmm = parse_time_word(timestr) or None
         if not hhmm:
             return None
         tomorrow = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
-        return {"intent":"book_single","name":name.strip(),"date":tomorrow,"time":hhmm}
+        slot_type = _norm_slot_type(type_word, has_partner=bool(partner))
+        return {"intent":"book_single","name":name,"date":tomorrow,"time":hhmm,"slot_type":slot_type,"partner":partner}
 
     return None
 
