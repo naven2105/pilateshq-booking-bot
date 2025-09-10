@@ -54,13 +54,36 @@ def _welcome_buttons() -> list[dict]:
         {"title": "💳 Pricing & Specials","id": BTN_PRICE},
     ]
 
+def _safe_send_buttons(wa: str, body: str, buttons: list[dict]) -> None:
+    try:
+        logging.info("send_buttons → to=%s title=%s", wa, body.splitlines()[0] if body else body)
+        res = send_whatsapp_buttons(wa, body, buttons)
+        # If WA rejects interactive (bad token/URL), fall back to text
+        if not isinstance(res, dict) or res.get("error") or res.get("messaging_product") is None:
+            logging.error("interactive send failed or unexpected response; falling back to text: %s", res)
+            send_whatsapp_text(wa, body + "\n\nReply: Meet Nadine | Book | Pricing")
+    except Exception:
+        logging.exception("interactive send raised; falling back to text")
+        send_whatsapp_text(wa, body + "\n\nReply: Meet Nadine | Book | Pricing")
+
+def _safe_send_list(wa: str, body: str, button_text: str, section_title: str, rows: list[dict]) -> None:
+    try:
+        logging.info("send_list → to=%s title=%s", wa, body.splitlines()[0] if body else body)
+        res = send_whatsapp_list(wa, body, button_text, section_title, rows)
+        if not isinstance(res, dict) or res.get("error") or res.get("messaging_product") is None:
+            logging.error("list send failed or unexpected response; falling back to text: %s", res)
+            send_whatsapp_text(wa, body + "\n\n(If the list didn’t appear, just type: address / schedule / equipment / groups / start)")
+    except Exception:
+        logging.exception("list send raised; falling back to text")
+        send_whatsapp_text(wa, body + "\n\n(If the list didn’t appear, just type: address / schedule / equipment / groups / start)")
+
 def _send_brand_welcome(wa: str) -> None:
     body = (
         "✨ Welcome to *PilatesHQ*!\n"
         "We keep classes small, personal, and fun so you feel stronger after every session.\n\n"
         "Choose an option:"
     )
-    send_whatsapp_buttons(wa, body, _welcome_buttons())
+    _safe_send_buttons(wa, body, _welcome_buttons())
 
 # Meet Nadine content (kept fuller as agreed)
 MEET_NADINE = (
@@ -75,7 +98,7 @@ MEET_NADINE = (
 )
 
 def _send_meet_nadine(wa: str) -> None:
-    send_whatsapp_buttons(
+    _safe_send_buttons(
         wa,
         MEET_NADINE,
         [{"title": "🗓️ Book a Class", "id": BTN_BOOK}]
@@ -91,11 +114,11 @@ def _send_pricing(wa: str) -> None:
         "• 👤 Private 1-1 — R300\n\n"
         "✨ Small classes • Personal coaching • Guided by Nadine"
     )
-    send_whatsapp_buttons(wa, body, [{"title": "🗓️ Book Now", "id": BTN_BOOK_NOW}])
+    _safe_send_buttons(wa, body, [{"title": "🗓️ Book Now", "id": BTN_BOOK_NOW}])
 
 # Deep info (tucked behind list picker if ever needed)
 def _send_info_list(wa: str) -> None:
-    send_whatsapp_list(
+    _safe_send_list(
         wa,
         "Studio info — choose a topic:",
         "Open",
@@ -164,6 +187,7 @@ ASK_NAME = (
 def _ask_name(wa: str) -> None:
     s = _get_sess(wa)
     s["phase"] = "awaiting_name"
+    logging.info("public flow → ask_name to=%s", wa)
     send_whatsapp_text(wa, ASK_NAME)
 
 ASK_DETAILS_TEMPLATE = (
@@ -180,6 +204,7 @@ def _ask_details(wa: str, name: str) -> None:
     s = _get_sess(wa)
     s["phase"] = "awaiting_details"
     s["name"] = name
+    logging.info("public flow → ask_details to=%s name=%s", wa, name)
     send_whatsapp_text(wa, ASK_DETAILS_TEMPLATE.format(name=name))
 
 THANK_YOU_TEMPLATE = (
@@ -188,12 +213,10 @@ THANK_YOU_TEMPLATE = (
 )
 
 def _thank_and_handover(wa: str, name: str, raw_reply: str) -> None:
-    # Summarise for Nadine
     summary = _summarise_for_admin(wa, name, raw_reply)
     try:
-        # Notify Nadine directly
+        logging.info("handover → notify Nadine and inbox for wa=%s name=%s", wa, name)
         send_whatsapp_text(normalize_wa(NADINE_WA), summary)
-        # Also log to inbox for traceability
         digest = hashlib.sha256(f"{wa}|{name}|{raw_reply}".encode("utf-8")).hexdigest()
         inbox_upsert(
             kind="lead",
@@ -208,39 +231,28 @@ def _thank_and_handover(wa: str, name: str, raw_reply: str) -> None:
     except Exception:
         logging.exception("Failed to notify/admin-inbox lead")
 
-    # Thank the guest and reset
     send_whatsapp_text(wa, THANK_YOU_TEMPLATE.format(name=name))
     _reset_sess(wa)
 
 def _extract_name(text: str) -> Optional[str]:
-    # Accepts typical "Name Surname" lines; keep it simple
     t = (text or "").strip()
     if not t:
         return None
-    # 2–5 tokens, letters & basic punctuation
     parts = re.findall(r"[A-Za-z'’\-]+", t)
     if len(parts) >= 2:
         return " ".join(p.capitalize() for p in parts[:4])
-    # If only one token, still accept (fallback)
     if len(parts) == 1:
         return parts[0].capitalize()
     return None
 
 def _summarise_for_admin(wa: str, name: str, details: str) -> str:
-    """
-    Gentle heuristics to pull key signals from free text.
-    Missing items are flagged as 'not provided'/'not mentioned'.
-    """
     s = details.lower()
-
-    # Pilates experience
     exp = "not provided"
     if any(k in s for k in ["first time", "new to pilates", "never done", "beginner"]):
         exp = "First time"
     elif any(k in s for k in ["done pilates", "have pilates", "experienced", "previous pilates"]):
         exp = "Has done Pilates"
 
-    # Preference
     pref = "not provided"
     if "duo" in s or "partner" in s or "couple" in s:
         pref = "Duo with partner"
@@ -249,7 +261,6 @@ def _summarise_for_admin(wa: str, name: str, details: str) -> str:
     elif "private" in s or "1-1" in s or "1:1" in s or "single" in s:
         pref = "Private 1-1"
 
-    # Time window
     timew = "not provided"
     if "before 8" in s or "early" in s or "morning" in s:
         timew = "Early mornings"
@@ -260,14 +271,12 @@ def _summarise_for_admin(wa: str, name: str, details: str) -> str:
     if "evening" in s or "after 5" in s or "5-7" in s or "6pm" in s or "7pm" in s:
         timew = "Evenings (5–7pm)"
 
-    # Medical
     medical = "not mentioned"
     if any(k in s for k in ["injur", "surgery", "pain", "condition", "back", "knee", "shoulder", "doctor", "clearance"]):
         medical = "Mentioned (check clearance)"
     if any(k in s for k in ["no medical", "no issues", "none", "fit", "healthy"]):
         medical = "None"
 
-    # Referral
     ref = "not provided"
     if any(k in s for k in ["friend", "referr", "word of mouth"]):
         ref = "Friend/Referral"
@@ -297,51 +306,48 @@ def _summarise_for_admin(wa: str, name: str, details: str) -> str:
 # Public message handler
 # ──────────────────────────────────────────────────────────────────────────────
 def _handle_public_message(wa: str, body: str, btn_id: Optional[str]) -> None:
-    """
-    Brand-first, low-friction journey:
-      - Welcome → buttons (Meet / Book / Pricing)
-      - Book flow: ask full name → open prompt → handover to Nadine with summary
-      - Legacy FAQ still accessible via keywords
-    """
-    # Ensure (or create) lead client record
     try:
-        if not client_exists_by_wa(wa):
-            upsert_public_client(wa, None)
+        logging.info("public handler start → wa=%s btn_id=%s body_len=%d", wa, btn_id, len(body or ""))
+        # Ensure (or create) lead client record
+        try:
+            if not client_exists_by_wa(wa):
+                upsert_public_client(wa, None)
+        except Exception:
+            logging.exception("Lead upsert failed (non-fatal)")
+
+        # Button-first routing
+        if btn_id == BTN_MEET:
+            _send_meet_nadine(wa); return
+        if btn_id in {BTN_BOOK, BTN_BOOK_NOW}:
+            _ask_name(wa); return
+        if btn_id == BTN_PRICE:
+            _send_pricing(wa); return
+
+        # Session state for the 2-step lead flow
+        sess = _get_sess(wa)
+        t = (body or "").strip()
+
+        if sess.get("phase") == "awaiting_name":
+            name = _extract_name(t) or "(not provided)"
+            _ask_details(wa, name)
+            return
+
+        if sess.get("phase") == "awaiting_details":
+            name = sess.get("name") or "(not provided)"
+            _thank_and_handover(wa, name, t)
+            return
+
+        # If no active flow: greet, or answer keyword, then keep welcome visible
+        intent = _public_intent(body)
+        logging.info("public intent resolved → %s", intent)
+        if intent in {"welcome"}:
+            _send_brand_welcome(wa); return
+        else:
+            send_whatsapp_text(wa, _faq_text(intent))
+            _send_brand_welcome(wa)
+            return
     except Exception:
-        logging.exception("Lead upsert failed (non-fatal)")
-
-    # Button-first routing
-    if btn_id == BTN_MEET:
-        _send_meet_nadine(wa); return
-    if btn_id in {BTN_BOOK, BTN_BOOK_NOW}:
-        _ask_name(wa); return
-    if btn_id == BTN_PRICE:
-        _send_pricing(wa); return
-
-    # Session state for the 2-step lead flow
-    sess = _get_sess(wa)
-    t = (body or "").strip()
-
-    if sess.get("phase") == "awaiting_name":
-        name = _extract_name(t) or "(not provided)"
-        _ask_details(wa, name)
-        return
-
-    if sess.get("phase") == "awaiting_details":
-        name = sess.get("name") or "(not provided)"
-        # Thank & handover regardless of completeness (no interrogation)
-        _thank_and_handover(wa, name, t)
-        return
-
-    # If no active flow: greet, or answer keyword, then keep welcome visible
-    intent = _public_intent(body)
-    if intent in {"welcome"}:
-        _send_brand_welcome(wa); return
-    else:
-        # Respond to lightweight FAQs on demand, then offer core buttons again
-        send_whatsapp_text(wa, _faq_text(intent))
-        _send_brand_welcome(wa)
-        return
+        logging.exception("public handler failed")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask wiring
@@ -368,31 +374,37 @@ def register_routes(app):
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
+        logging.info("GET /webhook verify mode=%s", mode)
         if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
             return challenge, 200
         return "forbidden", 403
 
     @app.post("/webhook")
     def webhook():
+        logging.info("POST /webhook received")  # ← canary: proves Meta is calling us
         try:
             data = request.get_json(force=True, silent=True) or {}
             entry = (data.get("entry") or [])
             if not entry:
+                logging.info("no entry[] in payload")
                 return "ok", 200
 
             changes = (entry[0].get("changes") or [])
             if not changes:
+                logging.info("no changes[] in entry[0]")
                 return "ok", 200
 
             value = changes[0].get("value") or {}
             msgs = value.get("messages") or []
             if not msgs:
+                logging.info("no messages[] in value (may be status webhook)")
                 return "ok", 200
 
             msg = msgs[0]
             from_wa_raw = msg.get("from") or ""
             from_wa = normalize_wa(from_wa_raw)
             msg_type = msg.get("type")
+            logging.info("inbound message → from=%s type=%s", from_wa, msg_type)
 
             # Extract text or interactive reply
             body = ""
@@ -416,6 +428,7 @@ def register_routes(app):
 
             # Route: admin vs public
             if from_wa in ADMIN_NUMBERS:
+                logging.info("routing to admin handler for %s", from_wa)
                 try:
                     handle_admin_action(from_wa, msg.get("id"), body, btn_id)  # new signature
                 except TypeError:
@@ -426,6 +439,7 @@ def register_routes(app):
                 except Exception:
                     logging.exception("admin handler failed")
             else:
+                logging.info("routing to public handler for %s", from_wa)
                 _handle_public_message(from_wa, body, btn_id)
 
             return "ok", 200
