@@ -1,3 +1,4 @@
+# app/router.py
 from __future__ import annotations
 
 import hashlib
@@ -9,10 +10,15 @@ from flask import request
 from .config import ADMIN_NUMBERS, VERIFY_TOKEN
 from .utils import normalize_wa, send_whatsapp_text
 from .admin import handle_admin_action
-from .crud import client_exists_by_wa, upsert_public_client, inbox_upsert, record_lead_touch
+from .crud import (
+    client_exists_by_wa,
+    upsert_public_client,
+    inbox_upsert,
+    record_lead_touch,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers – Public/Lead Experience (legacy + comfort hook)
+# Public / Lead UX
 # ──────────────────────────────────────────────────────────────────────────────
 
 PUBLIC_MENU = (
@@ -48,7 +54,7 @@ def _intent_and_payload(text: str) -> Tuple[str, Optional[str]]:
     if t in {"7", "book", "booking", "request"}:                       return "book_request", None
     if t in {"8", "contact", "phone", "email"}:                        return "contact", None
 
-    # Greetings → show menu
+    # Greetings → show menu (or comfort for returning leads)
     if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
         return "menu", None
 
@@ -116,40 +122,48 @@ def _faq_response(intent: str) -> str:
             "We’ve forwarded your request to the studio. An instructor will confirm time and next steps.\n"
             "If you have preferred days/times, reply with them now."
         )
-    # Default
     return "Thanks! How can we help today?"
 
-# Comfort message for returning leads
-COMFORT_MSG = (
-    "💬 We’ve already shared your details with *Nadine*.\n"
-    "Would you like her to *call* or *WhatsApp* you now? If you prefer, you can also reply here with your ideal times."
-)
+def _first_name(name: Optional[str]) -> Optional[str]:
+    if not name: return None
+    n = name.strip()
+    if not n or n.lower() == "guest": return None
+    return n.split()[0][:24]
+
+def _send_returning_comfort(wa: str, name: Optional[str]) -> None:
+    first = _first_name(name)
+    if first:
+        msg = f"Hi {first} 👋\nWe’ve already shared your details with *Nadine* — she’ll be in touch shortly."
+    else:
+        msg = "Hi there 👋\nWe’ve already shared your details with *Nadine* — she’ll be in touch shortly."
+    send_whatsapp_text(wa, msg)
 
 def _handle_public_message(wa: str, body: str) -> None:
     """
-    Lead/FAQ flow + returning-lead comfort.
+    Lead/FAQ flow with returning-lead comfort:
     - Ensure a client row exists (idempotent).
-    - Upsert/refresh a lead row; detect if this is a returning lead.
-    - On greetings, returning leads get a brief reassurance, then we show the menu.
+    - Upsert/refresh a lead row; detect if returning and fetch best-known name.
+    - For greeting intents from returning leads → send ONLY the comfort message (no menu).
     """
-    # Ensure (or create) client record
+    # Ensure client row
     try:
         if not client_exists_by_wa(wa):
             upsert_public_client(wa, None)
     except Exception:
-        logging.exception("Lead upsert (clients) failed (non-fatal)")
+        logging.exception("clients upsert failed (non-fatal)")
 
-    # Record/refresh lead and detect returning
-    is_returning = False
+    # Upsert/refresh lead + detect returning; prefer known name if present
+    is_returning, lead_name = False, None
     try:
-        lead_info = record_lead_touch(wa, None)  # name could be injected later
+        lead_info = record_lead_touch(wa, None)  # name can be filled later
         is_returning = bool(lead_info.get("returning"))
+        lead_name = (lead_info.get("name") or None)
     except Exception:
-        logging.exception("Lead upsert (leads) failed (non-fatal)")
+        logging.exception("leads upsert failed (non-fatal)")
 
     intent, _ = _intent_and_payload(body)
 
-    # Booking request path (kept as-is)
+    # Booking request → normal flow + admin ping
     if intent == "book_request":
         send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
         try:
@@ -172,18 +186,19 @@ def _handle_public_message(wa: str, body: str) -> None:
                     f"(Open *Admin → Inbox* to action.)"
                 )
         except Exception:
-            logging.exception("Failed to write booking request to inbox / notify admins")
+            logging.exception("inbox write / admin notify failed")
         return
 
-    # Greeting/menu path with comfort hook
+    # Greeting/menu handling
     if intent == "menu":
         if is_returning:
-            send_whatsapp_text(wa, COMFORT_MSG + "\n\n" + _public_menu())
+            # Personalised reassurance ONLY (no menu for returning leads)
+            _send_returning_comfort(wa, lead_name)
         else:
             send_whatsapp_text(wa, "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu())
         return
 
-    # Normal FAQ reply for other intents
+    # Other intents → FAQ + menu
     send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
 
 # ──────────────────────────────────────────────────────────────────────────────
