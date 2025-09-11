@@ -1,298 +1,203 @@
-# app/router.py
 from __future__ import annotations
 
 import hashlib
 import logging
-import re
-import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 from flask import request
 
-from .config import ADMIN_NUMBERS, VERIFY_TOKEN, NADINE_WA
-from .utils import (
-    normalize_wa,
-    send_whatsapp_text,
-    send_whatsapp_buttons,
-    send_whatsapp_list,
-)
+from .config import ADMIN_NUMBERS, VERIFY_TOKEN
+from .utils import normalize_wa, send_whatsapp_text
 from .admin import handle_admin_action
-from .crud import client_exists_by_wa, upsert_public_client, inbox_upsert
+from .crud import client_exists_by_wa, upsert_public_client, inbox_upsert, record_lead_touch
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Minimal in-memory session (swap for Redis in prod)
+# Helpers – Public/Lead Experience (legacy + comfort hook)
 # ──────────────────────────────────────────────────────────────────────────────
-SESS: Dict[str, Dict[str, Any]] = {}   # {wa: {"phase": str, "name": str, "ts": int}}
-TTL = 60 * 30  # 30 minutes
 
-def _now() -> int:
-    return int(time.time())
-
-def _get_sess(wa: str) -> Dict[str, Any]:
-    # GC stale
-    stale = [k for k, v in SESS.items() if _now() - v.get("ts", 0) > TTL]
-    for k in stale:
-        del SESS[k]
-    s = SESS.get(wa, {"phase": "idle", "name": None, "ts": _now()})
-    s["ts"] = _now()
-    SESS[wa] = s
-    return s
-
-def _reset_sess(wa: str) -> None:
-    if wa in SESS:
-        del SESS[wa]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public UX: Brand-first welcome + short paths
-# ──────────────────────────────────────────────────────────────────────────────
-BTN_MEET     = "g_meet"
-BTN_BOOK     = "g_book"
-BTN_PRICE    = "g_price"
-BTN_BOOK_NOW = "g_book_now"
-
-def _welcome_buttons() -> list[dict]:
-    return [
-        {"title": "👩‍🏫 Meet Nadine",     "id": BTN_MEET},
-        {"title": "🗓️ Book a Class",      "id": BTN_BOOK},
-        {"title": "💳 Pricing & Specials", "id": BTN_PRICE},
-    ]
-
-def _safe_send_buttons(wa: str, body: str, buttons: list[dict]) -> None:
-    try:
-        logging.info("send_buttons → to=%s title=%s", wa, (body or "").splitlines()[0])
-        res = send_whatsapp_buttons(wa, body, buttons)
-        if not isinstance(res, dict) or res.get("error") or (res.get("messaging_product") is None and res.get("status_code") not in (200, 201)):
-            logging.error("interactive failed or unexpected response; will fallback. res=%s", res)
-            send_whatsapp_text(wa, body + "\n\nReply: Meet Nadine | Book | Pricing")
-    except Exception:
-        logging.exception("interactive send raised; falling back to text")
-        send_whatsapp_text(wa, body + "\n\nReply: Meet Nadine | Book | Pricing")
-
-def _safe_send_list(wa: str, body: str, button_text: str, section_title: str, rows: list[dict]) -> None:
-    try:
-        logging.info("send_list → to=%s title=%s", wa, (body or "").splitlines()[0])
-        res = send_whatsapp_list(wa, body, button_text, section_title, rows)
-        if not isinstance(res, dict) or res.get("error") or (res.get("messaging_product") is None and res.get("status_code") not in (200, 201)):
-            logging.error("list failed or unexpected response; will fallback. res=%s", res)
-            send_whatsapp_text(wa, body + "\n\nIf the list didn’t appear, type: address / schedule / equipment / groups / start")
-    except Exception:
-        logging.exception("list send raised; falling back to text")
-        send_whatsapp_text(wa, body + "\n\nIf the list didn’t appear, type: address / schedule / equipment / groups / start")
-
-def _send_brand_welcome(wa: str) -> None:
-    body = (
-        "✨ Welcome to *PilatesHQ*!\n"
-        "We keep classes small, personal, and fun so you feel stronger after every session.\n\n"
-        "Choose an option:"
-    )
-    _safe_send_buttons(wa, body, _welcome_buttons())
-
-MEET_NADINE = (
-    "👩‍🏫 *Meet Nadine*\n"
-    "Founder & Lead Instructor at *PilatesHQ*\n\n"
-    "Nadine is a certified Pilates instructor with a passion for helping people move better, "
-    "recover from injuries, and feel stronger in their daily lives. With years of experience in both "
-    "group classes and one-to-one sessions, she tailors Reformer Pilates to each person’s needs — "
-    "from core strength and posture to rehabilitation.\n\n"
-    "✨ Small classes • Personal coaching • Calm, encouraging style.\n\n"
-    "Ready to experience PilatesHQ with Nadine?"
+PUBLIC_MENU = (
+    "—\n"
+    "📋 *Menu*\n"
+    "1) Pricing\n"
+    "2) Address & parking\n"
+    "3) Schedule\n"
+    "4) Group sizes\n"
+    "5) Equipment\n"
+    "6) How to start\n"
+    "7) Book (send request)\n"
+    "8) Contact\n"
+    "Reply with a number or keyword (e.g., *pricing*, *address*, *book*)."
 )
 
-def _send_meet_nadine(wa: str) -> None:
-    _safe_send_buttons(wa, MEET_NADINE, [{"title": "🗓️ Book a Class", "id": BTN_BOOK}])
-
-def _send_pricing(wa: str) -> None:
-    body = (
-        "💳 *Pricing & Opening Special*\n"
-        "(now available)\n\n"
-        "• 👥 Group Class (max 6) — R180 per person\n"
-        "• 👩‍🤝‍👩 Duo Session — R250 per person\n"
-        "• 👤 Private 1-1 — R300\n\n"
-        "✨ Small classes • Personal coaching • Guided by Nadine"
-    )
-    _safe_send_buttons(wa, body, [{"title": "🗓️ Book Now", "id": BTN_BOOK_NOW}])
-
-def _faq_text(intent: str) -> str:
-    if intent == "pricing":
-        return ("💳 *Pricing & Specials*\n"
-                "• Group (max 6) — R180 pp\n"
-                "• Duo — R250 pp\n"
-                "• Private 1-1 — R300")
-    if intent == "address":
-        return "📍 *Address*\nPilatesHQ — 71 Grant Ave, Norwood, Johannesburg\nSafe off-street parking."
-    if intent == "schedule":
-        return "🗓️ *Schedule*\nWeekdays 06:00–18:00 • Saturday 08:00–10:00"
-    if intent == "group_sizes":
-        return "👥 *Group sizes*\nCapped at 6 for personal coaching. Duos and privates available."
-    if intent == "equipment":
-        return "🧰 *Equipment*\nReformers, Wall Units, Wunda Chairs, small props, and mats."
-    if intent == "how_to_start":
-        return "🚀 *How to start*\nMost begin with a 1:1 assessment. Reply *Book* to start a lead."
-    return "How can we help?"
+def _public_menu() -> str:
+    return PUBLIC_MENU
 
 def _normalize(text: str) -> str:
     return (text or "").strip().lower()
 
-def _public_intent(text: str) -> str:
+def _intent_and_payload(text: str) -> Tuple[str, Optional[str]]:
     t = _normalize(text)
-    if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening", "menu", "start"]):
-        return "welcome"
-    if "book" in t or "booking" in t:
-        return "book"
-    if "price" in t or "special" in t:
-        return "pricing"
-    if "address" in t or "parking" in t or "where" in t:
-        return "address"
-    if "schedule" in t or "hours" in t or "open" in t or "time" in t:
-        return "schedule"
-    if "group" in t and "size" in t:
-        return "group_sizes"
-    if "equip" in t or "reformer" in t or "chair" in t or "mat" in t:
-        return "equipment"
-    if "start" in t or "assessment" in t:
-        return "how_to_start"
-    return "welcome"
 
-# Lead capture: 2-step (Name → open prompt) and admin handover
-ASK_NAME = "👋 Great! Before we get started, could I have your *full name* so Nadine can greet you properly?"
+    # Direct picks
+    if t in {"1", "pricing", "price", "prices"}:                       return "pricing", None
+    if t in {"2", "address", "parking", "where", "location"}:          return "address", None
+    if t in {"3", "schedule", "hours", "opening", "times"}:            return "schedule", None
+    if t in {"4", "group", "group sizes", "class size"}:               return "group_sizes", None
+    if t in {"5", "equipment", "machines", "reformer"}:                return "equipment", None
+    if t in {"6", "start", "how to start", "assessment"}:              return "how_to_start", None
+    if t in {"7", "book", "booking", "request"}:                       return "book_request", None
+    if t in {"8", "contact", "phone", "email"}:                        return "contact", None
 
-def _ask_name(wa: str) -> None:
-    s = _get_sess(wa)
-    s["phase"] = "awaiting_name"
-    logging.info("public flow → ask_name to=%s", wa)
-    send_whatsapp_text(wa, ASK_NAME)
+    # Greetings → show menu
+    if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
+        return "menu", None
 
-ASK_DETAILS_TEMPLATE = (
-    "Lovely to meet you, *{name}*! 🌸\n"
-    "To help Nadine match you to the right class, could you share—in your own words—any of the following:\n"
-    "• If you’ve done Pilates before (or if this is your first time)\n"
-    "• Your preference (group, duo with partner, or private 1-1)\n"
-    "• Your ideal time window (early mornings, midday, afternoons 3–5pm, or evenings 5–7pm)\n"
-    "• Anything medical we should know (doctor’s clearance needed for pre-existing injuries)\n"
-    "• And if you heard about us via a friend, signboard, or Instagram ✨"
-)
+    # Fuzzy keywords
+    if "price" in t or "cost" in t or "fee" in t:                       return "pricing", None
+    if "address" in t or "parking" in t or "where" in t or "located" in t:  return "address", None
+    if "schedule" in t or "time" in t or "open" in t or "hour" in t:    return "schedule", None
+    if "group" in t or "size" in t:                                     return "group_sizes", None
+    if "equip" in t or "reformer" in t or "chair" in t or "mat" in t:   return "equipment", None
+    if "start" in t or "assessment" in t or "begin" in t:               return "how_to_start", None
+    if "book" in t or "reserve" in t:                                   return "book_request", None
+    if "contact" in t or "call" in t or "email" in t or "whatsapp" in t:return "contact", None
 
-def _ask_details(wa: str, name: str) -> None:
-    s = _get_sess(wa)
-    s["phase"] = "awaiting_details"
-    s["name"] = name
-    logging.info("public flow → ask_details to=%s name=%s", wa, name)
-    send_whatsapp_text(wa, ASK_DETAILS_TEMPLATE.format(name=name))
+    # Fallback: show menu
+    return "menu", None
 
-THANK_YOU_TEMPLATE = (
-    "✅ Thanks so much, *{name}*! Nadine will personally reach out to confirm your booking and guide you from here.\n"
-    "We’re excited to welcome you to PilatesHQ soon 🌸"
-)
-
-def _extract_name(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    parts = re.findall(r"[A-Za-z'’\-]+", t)
-    if len(parts) >= 2:
-        return " ".join(p.capitalize() for p in parts[:4])
-    if len(parts) == 1:
-        return parts[0].capitalize()
-    return None
-
-def _summarise_for_admin(wa: str, name: str, details: str) -> str:
-    s = (details or "").lower()
-    exp = "not provided"
-    if any(k in s for k in ["first time", "new to pilates", "never done", "beginner"]): exp = "First time"
-    elif any(k in s for k in ["done pilates", "have pilates", "experienced", "previous pilates"]): exp = "Has done Pilates"
-
-    pref = "not provided"
-    if "duo" in s or "partner" in s or "couple" in s: pref = "Duo with partner"
-    elif "group" in s or "class" in s:                pref = "Group"
-    elif any(k in s for k in ["private", "1-1", "1:1", "single"]): pref = "Private 1-1"
-
-    timew = "not provided"
-    if any(k in s for k in ["before 8", "early", "morning"]): timew = "Early mornings"
-    if any(k in s for k in ["midday", "lunch"]):               timew = "Midday"
-    if any(k in s for k in ["afternoon", "3-5", "3pm", "4pm", "5pm"]): timew = "Afternoons (3–5pm)"
-    if any(k in s for k in ["evening", "after 5", "5-7", "6pm", "7pm"]): timew = "Evenings (5–7pm)"
-
-    medical = "not mentioned"
-    if any(k in s for k in ["injur", "surgery", "pain", "condition", "back", "knee", "shoulder", "doctor", "clearance"]): medical = "Mentioned (check clearance)"
-    if any(k in s for k in ["no medical", "no issues", "none", "fit", "healthy"]):                                        medical = "None"
-
-    ref = "not provided"
-    if any(k in s for k in ["friend", "referr", "word of mouth"]): ref = "Friend/Referral"
-    elif "sign" in s or "signboard" in s:                          ref = "Signboard"
-    elif "instagram" in s or "insta" in s:                         ref = "Instagram"
-    elif "facebook" in s or "meta" in s:                           ref = "Facebook"
-    elif "google" in s or "search" in s:                           ref = "Google/Search"
-    elif "website" in s or "site" in s:                            ref = "Website"
-
-    return (
-        "📩 New Lead\n"
-        f"From: {wa}\n"
-        f"Name: {name or '(not provided)'}\n"
-        f"Pilates before: {exp}\n"
-        f"Preference: {pref}\n"
-        f"Time: {timew}\n"
-        f"Medical: {medical}\n"
-        f"Referral: {ref}"
-    )
-
-def _thank_and_handover(wa: str, name: str, raw_reply: str) -> None:
-    summary = _summarise_for_admin(wa, name, raw_reply)
-    try:
-        logging.info("handover → notify Nadine and inbox for wa=%s name=%s", wa, name)
-        send_whatsapp_text(normalize_wa(NADINE_WA), summary)
-        digest = hashlib.sha256(f"{wa}|{name}|{raw_reply}".encode("utf-8")).hexdigest()
-        inbox_upsert(
-            kind="lead",
-            title="New Lead",
-            body=summary,
-            source="whatsapp",
-            status="open",
-            is_unread=True,
-            action_required=True,
-            digest=digest,
+def _faq_response(intent: str) -> str:
+    if intent == "pricing":
+        return (
+            "💳 *Pricing*\n"
+            "• Group classes from *R180*\n"
+            "• 1:1 assessment recommended for newcomers\n"
+            "• Packages available – ask us for current specials"
         )
-    except Exception:
-        logging.exception("Failed to notify/admin-inbox lead")
-    send_whatsapp_text(wa, THANK_YOU_TEMPLATE.format(name=name))
-    _reset_sess(wa)
+    if intent == "address":
+        return (
+            "📍 *Address & Parking*\n"
+            "PilatesHQ — *71 Grant Ave, Norwood, Johannesburg*\n"
+            "Safe off-street parking available."
+        )
+    if intent == "schedule":
+        return (
+            "🗓️ *Schedule*\n"
+            "• Weekdays: 06:00–18:00\n"
+            "• Saturday: 08:00–10:00\n"
+            "Ask for today’s availability and we’ll suggest times."
+        )
+    if intent == "group_sizes":
+        return (
+            "👥 *Group sizes*\n"
+            "Group classes are capped at *6* so coaching stays personal.\n"
+            "We also offer duos and privates."
+        )
+    if intent == "equipment":
+        return (
+            "🧰 *Equipment*\n"
+            "Reformers, Wall Units, Wunda Chairs, small props, and mats.\n"
+            "All sessions are guided by certified instructors."
+        )
+    if intent == "how_to_start":
+        return (
+            "🚀 *How to start*\n"
+            "Most clients begin with a *1:1 assessment* so we can tailor your plan.\n"
+            "Reply *Book* and we’ll forward your request to the studio."
+        )
+    if intent == "contact":
+        return (
+            "☎️ *Contact*\n"
+            "Prefer to chat? Message us here anytime.\n"
+            "We’ll introduce you to an instructor to get started."
+        )
+    if intent == "book_request":
+        return (
+            "✅ *Booking request noted!*\n"
+            "We’ve forwarded your request to the studio. An instructor will confirm time and next steps.\n"
+            "If you have preferred days/times, reply with them now."
+        )
+    # Default
+    return "Thanks! How can we help today?"
 
-def _handle_public_message(wa: str, body: str, btn_id: Optional[str]) -> None:
+# Comfort message for returning leads
+COMFORT_MSG = (
+    "💬 We’ve already shared your details with *Nadine*.\n"
+    "Would you like her to *call* or *WhatsApp* you now? If you prefer, you can also reply here with your ideal times."
+)
+
+def _handle_public_message(wa: str, body: str) -> None:
+    """
+    Lead/FAQ flow + returning-lead comfort.
+    - Ensure a client row exists (idempotent).
+    - Upsert/refresh a lead row; detect if this is a returning lead.
+    - On greetings, returning leads get a brief reassurance, then we show the menu.
+    """
+    # Ensure (or create) client record
     try:
-        logging.info("public handler start → wa=%s btn_id=%s body_len=%d", wa, btn_id, len(body or ""))
-        try:
-            if not client_exists_by_wa(wa):
-                upsert_public_client(wa, None)
-        except Exception:
-            logging.exception("Lead upsert failed (non-fatal)")
-
-        if btn_id == BTN_MEET:          _send_meet_nadine(wa); return
-        if btn_id in {BTN_BOOK, BTN_BOOK_NOW}: _ask_name(wa); return
-        if btn_id == BTN_PRICE:         _send_pricing(wa); return
-
-        sess = _get_sess(wa)
-        t = (body or "").strip()
-
-        if sess.get("phase") == "awaiting_name":
-            name = _extract_name(t) or "(not provided)"
-            _ask_details(wa, name); return
-
-        if sess.get("phase") == "awaiting_details":
-            name = sess.get("name") or "(not provided)"
-            _thank_and_handover(wa, name, t); return
-
-        intent = _public_intent(body)
-        logging.info("public intent resolved → %s", intent)
-        if intent == "welcome":
-            _send_brand_welcome(wa); return
-        send_whatsapp_text(wa, _faq_text(intent))
-        _send_brand_welcome(wa)
+        if not client_exists_by_wa(wa):
+            upsert_public_client(wa, None)
     except Exception:
-        logging.exception("public handler failed")
+        logging.exception("Lead upsert (clients) failed (non-fatal)")
+
+    # Record/refresh lead and detect returning
+    is_returning = False
+    try:
+        lead_info = record_lead_touch(wa, None)  # name could be injected later
+        is_returning = bool(lead_info.get("returning"))
+    except Exception:
+        logging.exception("Lead upsert (leads) failed (non-fatal)")
+
+    intent, _ = _intent_and_payload(body)
+
+    # Booking request path (kept as-is)
+    if intent == "book_request":
+        send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
+        try:
+            digest = hashlib.sha256(f"{wa}|{body}".encode("utf-8")).hexdigest()
+            inbox_upsert(
+                kind="booking_request",
+                title="New booking request",
+                body=f"From {wa}\nMessage: {body.strip() or '(no extra details)'}",
+                source="whatsapp",
+                status="open",
+                is_unread=True,
+                action_required=True,
+                digest=digest,
+            )
+            for admin in ADMIN_NUMBERS:
+                send_whatsapp_text(
+                    normalize_wa(admin),
+                    f"📩 *New booking request* from {wa}\n"
+                    f"Message: {body.strip() or '(no extra details)'}\n"
+                    f"(Open *Admin → Inbox* to action.)"
+                )
+        except Exception:
+            logging.exception("Failed to write booking request to inbox / notify admins")
+        return
+
+    # Greeting/menu path with comfort hook
+    if intent == "menu":
+        if is_returning:
+            send_whatsapp_text(wa, COMFORT_MSG + "\n\n" + _public_menu())
+        else:
+            send_whatsapp_text(wa, "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu())
+        return
+
+    # Normal FAQ reply for other intents
+    send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask wiring
 # ──────────────────────────────────────────────────────────────────────────────
+
 def register_routes(app):
+    """
+    Mounts:
+      GET  /webhook  – Meta verification (hub.mode=subscribe; hub.verify_token; hub.challenge)
+      POST /webhook  – WhatsApp Cloud API inbound
+      GET  /         – simple OK
+      GET  /health   – liveness probe (registered only if missing)
+    """
     @app.get("/")
     def root():
         return "ok", 200
@@ -319,42 +224,52 @@ def register_routes(app):
             data = request.get_json(force=True, silent=True) or {}
             entry = (data.get("entry") or [])
             if not entry:
-                logging.info("no entry[] in payload"); return "ok", 200
+                return "ok", 200
             changes = (entry[0].get("changes") or [])
             if not changes:
-                logging.info("no changes[] in entry[0]"); return "ok", 200
+                return "ok", 200
             value = changes[0].get("value") or {}
             msgs = value.get("messages") or []
             if not msgs:
-                logging.info("no messages[] in value"); return "ok", 200
+                return "ok", 200
 
             msg = msgs[0]
             from_wa_raw = msg.get("from") or ""
             from_wa = normalize_wa(from_wa_raw)
             msg_type = msg.get("type")
-            logging.info("inbound message → from=%s type=%s", from_wa, msg_type)
 
-            body = ""; btn_id: Optional[str] = None
+            body = ""
+            btn_id: Optional[str] = None
             if msg_type == "text":
                 body = (msg.get("text") or {}).get("body", "") or ""
             elif msg_type == "interactive":
                 inter = msg.get("interactive") or {}
                 if inter.get("type") == "button_reply":
                     br = inter.get("button_reply") or {}
-                    body = br.get("title", "") or ""; btn_id = br.get("id") or None
+                    body = br.get("title", "") or ""
+                    btn_id = br.get("id") or None
                 elif inter.get("type") == "list_reply":
-                    lr = inter.get("list_reply") or {}
-                    body = lr.get("title", "") or ""; btn_id = lr.get("id") or None
-
-            if from_wa in ADMIN_NUMBERS:
-                logging.info("routing to admin handler for %s", from_wa)
-                try:
-                    handle_admin_action(from_wa, msg.get("id"), body, btn_id)
-                except TypeError:
-                    handle_admin_action(from_wa, msg.get("id"), body)
+                    lr = (msg.get("interactive") or {}).get("list_reply") or {}
+                    body = lr.get("title", "") or ""
+                    btn_id = lr.get("id") or None
+                else:
+                    body = ""
             else:
-                logging.info("routing to public handler for %s", from_wa)
-                _handle_public_message(from_wa, body, btn_id)
+                body = ""
+
+            # Route: admin vs public
+            if from_wa in ADMIN_NUMBERS:
+                try:
+                    handle_admin_action(from_wa, msg.get("id"), body, btn_id)  # prefer new signature
+                except TypeError:
+                    try:
+                        handle_admin_action(from_wa, msg.get("id"), body)
+                    except Exception:
+                        logging.exception("admin handler failed")
+                except Exception:
+                    logging.exception("admin handler failed")
+            else:
+                _handle_public_message(from_wa, body)
 
             return "ok", 200
 
