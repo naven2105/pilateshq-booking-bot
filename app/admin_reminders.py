@@ -1,4 +1,4 @@
-# app/reminders.py
+# app/admin_reminders.py
 from __future__ import annotations
 import logging
 from sqlalchemy import text
@@ -9,7 +9,7 @@ from .config import TZ_NAME, ADMIN_NUMBERS
 from . import crud
 
 # ─────────────────────────────────────────────
-# SQL helpers
+# SQL + formatting helpers
 # ─────────────────────────────────────────────
 
 def _rows_today(upcoming_only: bool) -> list[dict]:
@@ -43,9 +43,6 @@ def _rows_today(upcoming_only: bool) -> list[dict]:
         return [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
 def _rows_upcoming_hours() -> str:
-    """
-    Show all hourly blocks from NEXT HOUR until 18:00 local.
-    """
     sql = """
         WITH now_local AS (
             SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
@@ -83,7 +80,6 @@ def _rows_upcoming_hours() -> str:
     with get_session() as s:
         rows = [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
-    # Group + format
     out = ["🕒 Upcoming hours:"]
     seen_blocks = []
     for r in rows:
@@ -106,10 +102,6 @@ def _rows_upcoming_hours() -> str:
                 out.append(f"• {str(sess['start_time'])[:5]}{names_part}  ({status})")
     return "\n".join(out)
 
-# ─────────────────────────────────────────────
-# Formatting helpers
-# ─────────────────────────────────────────────
-
 def _fmt_rows(rows: list[dict]) -> str:
     if not rows:
         return "— none —"
@@ -123,7 +115,7 @@ def _fmt_rows(rows: list[dict]) -> str:
     return "\n".join(out)
 
 # ─────────────────────────────────────────────
-# Core senders
+# Core admin senders
 # ─────────────────────────────────────────────
 
 def _send_to_admins(body: str) -> None:
@@ -131,11 +123,6 @@ def _send_to_admins(body: str) -> None:
         send_whatsapp_text(normalize_wa(admin), body)
 
 def run_admin_tick(force_hour: int | None = None) -> None:
-    """
-    Hourly admin summary:
-      - 06:00 SAST (04:00 UTC) → full day (morning prep).
-      - Other hours → upcoming only.
-    """
     with get_session() as s:
         if force_hour is not None:
             now_utc_hour = force_hour
@@ -162,12 +149,9 @@ def run_admin_tick(force_hour: int | None = None) -> None:
         action_required=False,
         digest=f"hourly-{msg[:20]}",
     )
-    logging.info("[REMINDERS] admin_tick sent + inbox")
+    logging.info("[ADMIN] tick sent + inbox")
 
 def run_daily_recap() -> None:
-    """
-    Daily admin recap at 20:00.
-    """
     today = _rows_today(upcoming_only=False)
     body = "🗓 Today’s sessions (full day)\n" + _fmt_rows(today)
     _send_to_admins(body)
@@ -182,19 +166,13 @@ def run_daily_recap() -> None:
         action_required=False,
         digest=f"recap-{body[:20]}",
     )
-    logging.info("[REMINDERS] daily recap sent + inbox")
-
-def run_client_reminders() -> None:
-    """
-    Placeholder: client 24h-before and 1h-before reminders.
-    """
-    logging.info("[REMINDERS] client reminders tick (not yet implemented)")
+    logging.info("[ADMIN] daily recap sent + inbox")
 
 # ─────────────────────────────────────────────
 # Flask wiring
 # ─────────────────────────────────────────────
 
-def register_reminders(app):
+def register_admin_reminders(app):
     @app.post("/tasks/admin-notify")
     def admin_notify():
         try:
@@ -207,18 +185,13 @@ def register_reminders(app):
             logging.exception("admin-notify failed")
             return "error", 500
 
-    @app.post("/tasks/run-reminders")
-    def run_reminders():
+    @app.post("/tasks/admin-recap")
+    def admin_recap():
         try:
             src = request.args.get("src", "unknown")
-            daily = request.args.get("daily", "0") == "1"
-            logging.info(f"[run-reminders] src={src} daily={daily}")
-            if daily:
-                run_daily_recap()
-                return "ok daily", 200
-            else:
-                run_client_reminders()
-                return "ok clients", 200
+            logging.info(f"[admin-recap] src={src}")
+            run_daily_recap()
+            return "ok recap", 200
         except Exception:
-            logging.exception("run-reminders failed")
+            logging.exception("admin-recap failed")
             return "error", 500

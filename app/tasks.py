@@ -1,12 +1,12 @@
 # app/tasks.py
 """
-Keeps backwards compatibility.
-All reminder/task logic now lives in reminders.py.
+Shim to register all background task routes.
 """
 
 from __future__ import annotations
-from .reminders import register_reminders
+from .admin_reminders import register_admin_reminders
+from .client_reminders import register_client_reminders
 
 def register_tasks(app):
-    # Delegate to reminders
-    register_reminders(app)
+    register_admin_reminders(app)
+    register_client_reminders(app)
