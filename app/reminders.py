@@ -1,42 +1,18 @@
 # app/reminders.py
 from __future__ import annotations
-
-import hashlib
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Optional
-
 from sqlalchemy import text
-
+from flask import request
 from .db import get_session
 from .utils import normalize_wa, send_whatsapp_text
-from .config import TZ_NAME, ADMIN_NUMBERS, NADINE_WA
+from .config import TZ_NAME, ADMIN_NUMBERS
 from . import crud
-from .message_templates import (
-    fmt_rows_with_names,
-    admin_today_block,
-    admin_next_hour_block,
-    admin_future_look_block,
-    client_h1_text,
-    client_d1_text,
-)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SQL helpers
+# ─────────────────────────────────────────────
 
-@dataclass
-class SessionRow:
-    id: int
-    session_date: str   # ISO date from DB (YYYY-MM-DD)
-    start_time: str     # HH:MM:SS
-    capacity: int
-    booked_count: int
-    status: str
-    notes: str
-    names: str
-
-def _rows_today(upcoming_only: bool) -> List[SessionRow]:
+def _rows_today(upcoming_only: bool) -> list[dict]:
     sql = f"""
         WITH now_local AS (
             SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
@@ -64,121 +40,27 @@ def _rows_today(upcoming_only: bool) -> List[SessionRow]:
         ORDER BY p.session_date, p.start_time
     """
     with get_session() as s:
-        rows = s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()
-        return [SessionRow(**dict(r)) for r in rows]
+        return [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
-def _rows_next_hour() -> List[SessionRow]:
-    sql = """
-        WITH now_local AS (
-            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-        ),
-        bounds AS (
-            SELECT date_trunc('hour', ts) AS h,
-                   date_trunc('hour', ts) + INTERVAL '1 hour' AS h_plus
-            FROM now_local
-        )
-        SELECT
-            s.id, s.session_date, s.start_time, s.capacity,
-            s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
-            COALESCE((
-                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                FROM (
-                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                    FROM bookings b2
-                    JOIN clients  c2 ON c2.id = b2.client_id
-                    WHERE b2.session_id = s.id
-                      AND b2.status = 'confirmed'
-                ) d
-            ), '') AS names
-        FROM sessions s, bounds
-        WHERE (s.session_date + s.start_time) >= bounds.h
-          AND (s.session_date + s.start_time) <  bounds.h_plus
-        ORDER BY s.start_time
+def _rows_upcoming_hours() -> str:
     """
-    with get_session() as s:
-        rows = s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()
-        return [SessionRow(**dict(r)) for r in rows]
-
-def _rows_tomorrow() -> List[SessionRow]:
-    sql = """
-        WITH now_local AS (
-            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
-        )
-        SELECT
-            s.id, s.session_date, s.start_time, s.capacity,
-            s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
-            COALESCE((
-                SELECT STRING_AGG(nm, ', ' ORDER BY nm)
-                FROM (
-                    SELECT DISTINCT COALESCE(c2.name, '') AS nm
-                    FROM bookings b2
-                    JOIN clients  c2 ON c2.id = b2.client_id
-                    WHERE b2.session_id = s.id
-                      AND b2.status = 'confirmed'
-                ) d
-            ), '') AS names
-        FROM sessions s, now_local
-        WHERE s.session_date = ((now_local.ts)::date + INTERVAL '1 day')::date
-        ORDER BY s.session_date, s.start_time
-    """
-    with get_session() as s:
-        rows = s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()
-        return [SessionRow(**dict(r)) for r in rows]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Idempotent send-log
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _sendlog_exists(session_id: int, wa: str, kind: str) -> bool:
-    sql = """
-        SELECT 1
-        FROM reminders_sendlog
-        WHERE session_id = :sid AND wa = :wa AND kind = :kind
-        LIMIT 1
-    """
-    with get_session() as s:
-        row = s.execute(text(sql), {"sid": session_id, "wa": wa, "kind": kind}).first()
-        return bool(row)
-
-def _sendlog_insert(session_id: int, wa: str, kind: str) -> None:
-    sql = """
-        INSERT INTO reminders_sendlog (session_id, wa, kind, fired_at)
-        VALUES (:sid, :wa, :kind, now())
-        ON CONFLICT (session_id, wa, kind) DO NOTHING
-    """
-    with get_session() as s:
-        s.execute(text(sql), {"sid": session_id, "wa": wa, "kind": kind})
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Client reminder ticks
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _attendees_for_session(session_id: int) -> List[str]:
-    sql = """
-        SELECT c.wa_number AS wa
-        FROM bookings b
-        JOIN clients  c ON c.id = b.client_id
-        WHERE b.session_id = :sid AND b.status = 'confirmed'
-    """
-    with get_session() as s:
-        rows = s.execute(text(sql), {"sid": session_id}).mappings().all()
-        return [normalize_wa(r["wa"]) for r in rows if r.get("wa")]
-
-def _rows_in_window(minutes_from: int, minutes_to: int) -> List[SessionRow]:
-    """
-    Return sessions starting between [now+minutes_from, now+minutes_to) in local TZ.
-    Useful for 60-minute and 1440-minute windows.
+    Show all hourly blocks from NEXT HOUR until 18:00 local.
     """
     sql = """
         WITH now_local AS (
             SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
         ),
         bounds AS (
-            SELECT (ts + make_interval(mins => :from_m)) AS a,
-                   (ts + make_interval(mins => :to_m))   AS b
+            SELECT generate_series(
+                date_trunc('hour', ts) + interval '1 hour',
+                date_trunc('day', ts) + interval '18 hour',
+                interval '1 hour'
+            ) AS h
             FROM now_local
         )
         SELECT
+            b.h AS block_start,
+            b.h + interval '1 hour' AS block_end,
             s.id, s.session_date, s.start_time, s.capacity,
             s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
             COALESCE((
@@ -191,98 +73,73 @@ def _rows_in_window(minutes_from: int, minutes_to: int) -> List[SessionRow]:
                       AND b2.status = 'confirmed'
                 ) d
             ), '') AS names
-        FROM sessions s, bounds
-        WHERE (s.session_date + s.start_time) >= bounds.a
-          AND (s.session_date + s.start_time) <  bounds.b
-        ORDER BY s.start_time
+        FROM bounds b
+        LEFT JOIN sessions s
+          ON (s.session_date + s.start_time) >= b.h
+         AND (s.session_date + s.start_time) <  b.h + interval '1 hour'
+         AND s.session_date = (b.h)::date
+        ORDER BY b.h, s.start_time
     """
     with get_session() as s:
-        rows = s.execute(
-            text(sql), {"tz": TZ_NAME, "from_m": minutes_from, "to_m": minutes_to}
-        ).mappings().all()
-        return [SessionRow(**dict(r)) for r in rows]
+        rows = [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
-def run_client_tick() -> int:
-    """
-    Sends client reminders:
-      • D-1 (24 hours before): window [1440, 1500) to be tolerant of cron drift.
-      • H-1 (1 hour before):  window [60, 90).
-    Removes any 'CANCEL' instruction from copy (per spec).
-    Returns number of messages sent.
-    """
-    sent = 0
+    # Group + format
+    out = ["🕒 Upcoming hours:"]
+    seen_blocks = []
+    for r in rows:
+        bs = r["block_start"].strftime("%H:%M")
+        if bs in seen_blocks:
+            continue
+        seen_blocks.append(bs)
+        block_sessions = [x for x in rows if x["block_start"] == r["block_start"]]
+        out.append(f"{bs}–{r['block_end'].strftime('%H:%M')}")
+        if not any(x["id"] for x in block_sessions):
+            out.append("— none —")
+        else:
+            for sess in block_sessions:
+                if sess["id"] is None:
+                    continue
+                full = (str(sess["status"]).lower() == "full") or (sess["booked_count"] >= sess["capacity"])
+                status = "🔒 full" if full else "✅ open"
+                names = (sess.get("names") or "").strip()
+                names_part = " (no bookings)" if not names else f" — {names}"
+                out.append(f"• {str(sess['start_time'])[:5]}{names_part}  ({status})")
+    return "\n".join(out)
 
-    # D-1 window (24h ± tolerance)
-    for sess in _rows_in_window(1440, 1500):
-        hhmm = sess.start_time[:5]
-        attendees = _attendees_for_session(sess.id)
-        for wa in attendees:
-            if not wa:
-                continue
-            if _sendlog_exists(sess.id, wa, "D-1"):
-                continue
-            msg = client_d1_text(hhmm)
-            send_whatsapp_text(wa, msg)
-            _sendlog_insert(sess.id, wa, "D-1")
-            sent += 1
+# ─────────────────────────────────────────────
+# Formatting helpers
+# ─────────────────────────────────────────────
 
-    # H-1 window (1h ± tolerance)
-    for sess in _rows_in_window(60, 90):
-        hhmm = sess.start_time[:5]
-        attendees = _attendees_for_session(sess.id)
-        for wa in attendees:
-            if not wa:
-                continue
-            if _sendlog_exists(sess.id, wa, "H-1"):
-                continue
-            msg = client_h1_text(hhmm)
-            send_whatsapp_text(wa, msg)
-            _sendlog_insert(sess.id, wa, "H-1")
-            sent += 1
+def _fmt_rows(rows: list[dict]) -> str:
+    if not rows:
+        return "— none —"
+    out = []
+    for r in rows:
+        full = (str(r["status"]).lower() == "full") or (r["booked_count"] >= r["capacity"])
+        status = "🔒 full" if full else "✅ open"
+        names = (r.get("names") or "").strip()
+        names_part = " (no bookings)" if not names else f" — {names}"
+        out.append(f"• {str(r['start_time'])[:5]}{names_part}  ({status})")
+    return "\n".join(out)
 
-    logging.info("[REMINDERS] client_tick sent=%s", sent)
-    return sent
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Admin summaries
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Core senders
+# ─────────────────────────────────────────────
 
 def _send_to_admins(body: str) -> None:
-    targets = ADMIN_NUMBERS or ([NADINE_WA] if NADINE_WA else [])
-    for admin in targets:
-        if not admin:
-            continue
+    for admin in ADMIN_NUMBERS:
         send_whatsapp_text(normalize_wa(admin), body)
 
 def run_admin_tick() -> None:
     """
-    Hourly admin summary (06:00–19:00 SAST via Cron hitting /tasks/admin-notify):
-      • 06:00 SAST → FULL DAY (morning prep)
-      • Other hours within the band → UPCOMING
-      • Always appends “Next hour”
-      • Writes idempotent admin_inbox entry using digest YYYY-MM-DD-HH|admin-tick
+    Hourly admin summary: today's upcoming + all next hours.
     """
-    with get_session() as s:
-        now_utc_hour = s.execute(
-            text("SELECT EXTRACT(HOUR FROM now())::int AS h")
-        ).mappings().first()["h"]
-        bucket = s.execute(
-            text("SELECT to_char((now() AT TIME ZONE :tz), 'YYYY-MM-DD-HH') AS b"),
-            {"tz": TZ_NAME},
-        ).mappings().first()["b"]
-
-    # 06:00 SAST ≈ 04:00 UTC
-    full_day = (now_utc_hour == 4)
-
-    today_block = admin_today_block(_rows_today(upcoming_only=not full_day))
-    next_hour_rows = _rows_next_hour()
-    msg = today_block + "\n\n" + admin_next_hour_block(next_hour_rows)
-
-    # Dedup inbox by digest
-    digest = f"{bucket}|admin-tick"
-    digest_hex = hashlib.sha256(digest.encode("utf-8")).hexdigest()
-
+    today = _rows_today(upcoming_only=True)
+    body_today = "🗓 Today’s sessions (upcoming)\n" + _fmt_rows(today)
+    hours_block = _rows_upcoming_hours()
+    msg = f"{body_today}\n\n{hours_block}"
     _send_to_admins(msg)
+
     crud.inbox_upsert(
         kind="hourly",
         title="Hourly update",
@@ -291,40 +148,64 @@ def run_admin_tick() -> None:
         status="open",
         is_unread=True,
         action_required=False,
-        digest=digest_hex,
+        digest=f"hourly-{msg[:20]}",
     )
-    logging.info("[REMINDERS] admin_tick sent + inbox digest=%s", digest_hex)
+    logging.info("[REMINDERS] admin_tick sent + inbox")
 
-def run_admin_daily() -> None:
+def run_daily_recap() -> None:
     """
-    20:00 SAST job (Cron calls /tasks/run-reminders?daily=1):
-      • Send full-day recap (today) to admins.
-      • Send a “future look” for tomorrow.
-      • Write idempotent inbox entry with digest YYYY-MM-DD|recap.
+    Daily admin recap at 20:00.
     """
-    today_rows = _rows_today(upcoming_only=False)
-    recap = admin_today_block(today_rows, label="🗓 Today’s sessions (full day)")
-    future = admin_future_look_block(_rows_tomorrow())
-    msg = f"{recap}\n\n{future}"
+    today = _rows_today(upcoming_only=False)
+    body = "🗓 Today’s sessions (full day)\n" + _fmt_rows(today)
+    _send_to_admins(body)
 
-    with get_session() as s:
-        bucket = s.execute(
-            text("SELECT to_char((now() AT TIME ZONE :tz), 'YYYY-MM-DD') AS b"),
-            {"tz": TZ_NAME},
-        ).mappings().first()["b"]
-
-    digest = f"{bucket}|recap"
-    digest_hex = hashlib.sha256(digest.encode("utf-8")).hexdigest()
-
-    _send_to_admins(msg)
     crud.inbox_upsert(
         kind="recap",
-        title="20:00 recap + tomorrow",
-        body=msg,
+        title="20:00 recap",
+        body=body,
         source="cron",
         status="open",
         is_unread=True,
         action_required=False,
-        digest=digest_hex,
+        digest=f"recap-{body[:20]}",
     )
-    logging.info("[REMINDERS] admin_daily recap sent + inbox digest=%s", digest_hex)
+    logging.info("[REMINDERS] daily recap sent + inbox")
+
+def run_client_reminders() -> None:
+    """
+    Placeholder: client 24h-before and 1h-before reminders.
+    """
+    logging.info("[REMINDERS] client reminders tick (not yet implemented)")
+
+# ─────────────────────────────────────────────
+# Flask wiring
+# ─────────────────────────────────────────────
+
+def register_reminders(app):
+    @app.post("/tasks/admin-notify")
+    def admin_notify():
+        try:
+            src = request.args.get("src", "unknown")
+            logging.info(f"[admin-notify] src={src}")
+            run_admin_tick()
+            return "ok", 200
+        except Exception:
+            logging.exception("admin-notify failed")
+            return "error", 500
+
+    @app.post("/tasks/run-reminders")
+    def run_reminders():
+        try:
+            src = request.args.get("src", "unknown")
+            daily = request.args.get("daily", "0") == "1"
+            logging.info(f"[run-reminders] src={src} daily={daily}")
+            if daily:
+                run_daily_recap()
+                return "ok daily", 200
+            else:
+                run_client_reminders()
+                return "ok clients", 200
+        except Exception:
+            logging.exception("run-reminders failed")
+            return "error", 500
