@@ -6,7 +6,7 @@ from flask import request
 # placeholder for SQL and send logic
 def run_client_reminders() -> int:
     """
-    Placeholder: 
+    Placeholder:
     - D-1 (20:00 previous evening)
     - H-1 (1 hour before session)
     - Post-start ("enjoy your session")
@@ -23,7 +23,6 @@ def register_client_reminders(app):
             daily = request.args.get("daily", "0") == "1"
             logging.info(f"[run-reminders] src={src} daily={daily}")
             if daily:
-                # For now, daily=1 is handled by admin_recap instead.
                 return "redirected to admin recap", 200
             else:
                 sent = run_client_reminders()

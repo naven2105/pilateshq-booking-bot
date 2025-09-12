@@ -139,6 +139,7 @@ def run_admin_tick(force_hour: int | None = None) -> None:
     msg = f"{body_today}\n\n{hours_block}"
     _send_to_admins(msg)
 
+    # Inbox entry only — no duplicate WhatsApp send
     crud.inbox_upsert(
         kind="hourly",
         title="Hourly update",
@@ -154,8 +155,11 @@ def run_admin_tick(force_hour: int | None = None) -> None:
 def run_daily_recap() -> None:
     today = _rows_today(upcoming_only=False)
     body = "🗓 Today’s sessions (full day)\n" + _fmt_rows(today)
+
+    # Send once via WhatsApp
     _send_to_admins(body)
 
+    # Store inbox silently
     crud.inbox_upsert(
         kind="recap",
         title="20:00 recap",
