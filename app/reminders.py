@@ -130,12 +130,24 @@ def _send_to_admins(body: str) -> None:
     for admin in ADMIN_NUMBERS:
         send_whatsapp_text(normalize_wa(admin), body)
 
-def run_admin_tick() -> None:
+def run_admin_tick(force_hour: int | None = None) -> None:
     """
-    Hourly admin summary: today's upcoming + all next hours.
+    Hourly admin summary:
+      - 06:00 SAST (04:00 UTC) → full day (morning prep).
+      - Other hours → upcoming only.
     """
-    today = _rows_today(upcoming_only=True)
-    body_today = "🗓 Today’s sessions (upcoming)\n" + _fmt_rows(today)
+    with get_session() as s:
+        if force_hour is not None:
+            now_utc_hour = force_hour
+        else:
+            now_utc_hour = s.execute(
+                text("SELECT EXTRACT(HOUR FROM now())::int AS h")
+            ).mappings().first()["h"]
+
+    full_day = (now_utc_hour == 4)  # 04:00 UTC ≈ 06:00 SAST
+    today = _rows_today(upcoming_only=not full_day)
+    header = "🗓 Today’s sessions (full day)" if full_day else "🗓 Today’s sessions (upcoming)"
+    body_today = header + "\n" + _fmt_rows(today)
     hours_block = _rows_upcoming_hours()
     msg = f"{body_today}\n\n{hours_block}"
     _send_to_admins(msg)
@@ -187,8 +199,9 @@ def register_reminders(app):
     def admin_notify():
         try:
             src = request.args.get("src", "unknown")
-            logging.info(f"[admin-notify] src={src}")
-            run_admin_tick()
+            force_hour = request.args.get("hour")
+            logging.info(f"[admin-notify] src={src} force_hour={force_hour}")
+            run_admin_tick(int(force_hour) if force_hour else None)
             return "ok", 200
         except Exception:
             logging.exception("admin-notify failed")
