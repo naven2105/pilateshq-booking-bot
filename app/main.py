@@ -4,14 +4,16 @@ from flask import Flask
 from .db import init_db
 from .router import router_bp
 from .tasks import register_tasks
+from .diag import diag_bp
 
 log = logging.getLogger(__name__)
 
 def create_app():
     app = Flask(__name__)
 
-    # Register blueprints & tasks
+    # Register blueprints
     app.register_blueprint(router_bp)
+    app.register_blueprint(diag_bp)
     register_tasks(app)
 
     # Initialise DB tables

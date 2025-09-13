@@ -3,37 +3,33 @@
 Database Setup
 --------------
 Initialises SQLAlchemy engine, session, and Base.
+Normalises DATABASE_URL for SQLAlchemy + psycopg2.
 """
 
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
-import os
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Get DB URL from environment
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Render often gives postgres:// instead of postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
 # Create engine
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 
-# Create a configured "Session" class
+# Session factory
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
-# Scoped session for thread safety (used across app)
+# Scoped session (thread-safe for Flask + Gunicorn)
 db_session = scoped_session(SessionLocal)
 
-# Base class for models
+# Base class for ORM models
 Base = declarative_base()
 
-# Dependency helper
-def get_db():
-    """Yields a DB session (for FastAPI/Flask dependency style)."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# Ensure models import this Base
+# Initialise DB tables
 def init_db():
     import app.models  # ensures models are registered
     Base.metadata.create_all(bind=engine)

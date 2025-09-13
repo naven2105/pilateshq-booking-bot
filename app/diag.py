@@ -1,74 +1,31 @@
-from __future__ import annotations
-import json
+# app/diag.py
+"""
+Diagnostic Endpoints
+--------------------
+Used to verify that the service and integrations are healthy.
+"""
+
 import logging
-import os
-from urllib.parse import urlparse
+from flask import Blueprint
+from sqlalchemy import text
+from .db import db_session
 
-import requests
-from flask import Blueprint, request, jsonify, current_app
+diag_bp = Blueprint("diag", __name__)
+log = logging.getLogger(__name__)
 
-from .utils import send_whatsapp_text
-from .utils import GRAPH_URL, ACCESS_TOKEN  # imported only to display host and to use for test send
 
-bp = Blueprint("diag", __name__, url_prefix="/diag")
-
-@bp.get("/ping")
+@diag_bp.get("/diag/ping")
 def ping():
-    """Simple app health with safe env hints (no secrets)."""
-    graph_host = ""
-    try:
-        graph_host = urlparse(GRAPH_URL).netloc
-    except Exception:
-        graph_host = "(invalid GRAPH_URL)"
-    return jsonify({
-        "ok": True,
-        "service": "pilateshq-bot",
-        "graph_host": graph_host,
-        "has_access_token": bool(ACCESS_TOKEN),
-    }), 200
+    """Simple health check."""
+    return {"ok": True, "msg": "pong"}, 200
 
-@bp.get("/webhook-selftest")
-def webhook_selftest():
-    """
-    Calls our own /webhook with a minimal WhatsApp-like payload to prove the route +
-    public handler path work. Does NOT require Meta.
-    """
-    try:
-        payload = {
-            "entry": [{
-                "changes": [{
-                    "value": {
-                        "messages": [{
-                            "id": "wamid.SELFTEST",
-                            "from": "27835534607",
-                            "type": "text",
-                            "text": {"body": "hi (selftest)"},
-                        }]
-                    }
-                }]
-            }]
-        }
-        # Post to our own app
-        url = request.url_root.rstrip("/") + "/webhook"
-        r = requests.post(url, json=payload, timeout=10)
-        return jsonify({"posted_to": url, "status": r.status_code, "body": r.text}), 200
-    except Exception as e:
-        logging.exception("webhook selftest failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
 
-@bp.post("/wa-test")
-def wa_test():
-    """
-    Sends a plain text via WhatsApp Cloud API using current GRAPH_URL/ACCESS_TOKEN.
-    Usage: POST /diag/wa-test?to=27835534607  (no JSON body needed)
-    """
-    to = (request.args.get("to") or "").strip()
-    if not to:
-        return jsonify({"ok": False, "error": "missing ?to=278... parameter"}), 400
+@diag_bp.get("/diag/db-test")
+def db_test():
+    """Check DB connection by running SELECT 1."""
     try:
-        res = send_whatsapp_text(to, "PilatesHQ Cloud API test ✅")
-        code = res.get("status_code", 200)
-        return jsonify({"ok": code < 400, "response": res}), (200 if code < 400 else 500)
+        result = db_session.execute(text("SELECT 1")).scalar()
+        return {"ok": True, "result": result}, 200
     except Exception as e:
-        logging.exception("wa-test send failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        log.exception("DB connection failed")
+        return {"ok": False, "error": str(e)}, 500
