@@ -2,95 +2,161 @@
 from __future__ import annotations
 import logging
 from sqlalchemy import text
+from datetime import timedelta
 from .db import get_session
 from .utils import normalize_wa
-from .config import TZ_NAME, TEMPLATE_LANG
-from .templates import send_template  # helper to send template messages
+from .templates import send_whatsapp_template
+from .config import TZ_NAME
+from . import crud
 
 # ─────────────────────────────────────────────
-# DB Helpers
+# SQL helpers
 # ─────────────────────────────────────────────
 
-def _client_week_sessions() -> list[dict]:
+def _sessions_for_offset(days_ahead: int) -> list[dict]:
     """
-    Fetch all clients who have confirmed bookings for the next 7 days.
-    Returns rows with client_id, client_name, wa_number, session_date, start_time.
+    Return sessions X days ahead (e.g. tomorrow = 1).
+    """
+    sql = """
+        WITH base AS (
+            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz)::date AS today
+        )
+        SELECT s.id, s.session_date, s.start_time, s.capacity,
+               s.booked_count, s.status,
+               COALESCE((
+                   SELECT STRING_AGG(c2.wa_number, ',')
+                   FROM bookings b2
+                   JOIN clients c2 ON c2.id = b2.client_id
+                   WHERE b2.session_id = s.id
+                     AND b2.status = 'confirmed'
+               ), '') AS wa_numbers
+        FROM sessions s, base
+        WHERE s.session_date = base.today + :offset
+        ORDER BY s.start_time
+    """
+    with get_session() as s:
+        return [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME, "offset": days_ahead}).mappings().all()]
+
+def _sessions_next_hour() -> list[dict]:
+    """
+    Return sessions starting within the next hour.
     """
     sql = """
         WITH now_local AS (
             SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz) AS ts
+        ),
+        bounds AS (
+            SELECT date_trunc('hour', ts) AS h,
+                   date_trunc('hour', ts) + interval '1 hour' AS h_plus
+            FROM now_local
         )
-        SELECT 
-            c.id AS client_id,
-            COALESCE(NULLIF(c.name,''), 'Guest') AS client_name,
-            c.wa_number,
-            s.session_date,
-            s.start_time
-        FROM bookings b
-        JOIN sessions s ON s.id = b.session_id
-        JOIN clients c ON c.id = b.client_id
-        , now_local
-        WHERE b.status = 'confirmed'
-          AND s.session_date >= (now_local.ts)::date
-          AND s.session_date < ((now_local.ts)::date + interval '7 days')
-        ORDER BY c.id, s.session_date, s.start_time
+        SELECT s.id, s.session_date, s.start_time, s.capacity,
+               s.booked_count, s.status,
+               COALESCE((
+                   SELECT STRING_AGG(c2.wa_number, ',')
+                   FROM bookings b2
+                   JOIN clients c2 ON c2.id = b2.client_id
+                   WHERE b2.session_id = s.id
+                     AND b2.status = 'confirmed'
+               ), '') AS wa_numbers
+        FROM sessions s, bounds
+        WHERE (s.session_date + s.start_time) >= bounds.h
+          AND (s.session_date + s.start_time) <  bounds.h_plus
+        ORDER BY s.start_time
+    """
+    with get_session() as s:
+        return [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
+
+def _sessions_next_week() -> list[dict]:
+    """
+    Return sessions for the next 7 days.
+    """
+    sql = """
+        WITH base AS (
+            SELECT ((now() AT TIME ZONE 'UTC') AT TIME ZONE :tz)::date AS today
+        )
+        SELECT s.id, s.session_date, s.start_time,
+               COALESCE((
+                   SELECT STRING_AGG(c2.wa_number, ',')
+                   FROM bookings b2
+                   JOIN clients c2 ON c2.id = b2.client_id
+                   WHERE b2.session_id = s.id
+                     AND b2.status = 'confirmed'
+               ), '') AS wa_numbers
+        FROM sessions s, base
+        WHERE s.session_date BETWEEN base.today AND base.today + 6
+        ORDER BY s.session_date, s.start_time
     """
     with get_session() as s:
         return [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
 # ─────────────────────────────────────────────
-# Format Helpers
+# Core senders
 # ─────────────────────────────────────────────
 
-def _fmt_weekly_sessions(rows: list[dict]) -> dict[int, dict]:
-    """
-    Group sessions by client_id → {client_name, wa_number, sessions_list}.
-    """
-    out: dict[int, dict] = {}
-    for r in rows:
-        cid = r["client_id"]
-        if cid not in out:
-            out[cid] = {
-                "name": r["client_name"],
-                "wa_number": r["wa_number"],
-                "sessions": []
-            }
-        day = r["session_date"].strftime("%A")   # e.g. "Tuesday"
-        time = str(r["start_time"])[:5]          # "08:00"
-        out[cid]["sessions"].append(f"• {day} {time}")
-    return out
+def _send_client_template(to_wa: str, template: str, params: list[str]) -> None:
+    send_whatsapp_template(
+        normalize_wa(to_wa),
+        template_name=template,
+        lang="en",
+        components=[{"type": "body", "parameters": [{"type": "text", "text": p} for p in params]}]
+    )
 
-# ─────────────────────────────────────────────
-# Core Weekly Reminder
-# ─────────────────────────────────────────────
+def run_client_tomorrow() -> int:
+    """
+    Send 24h-before reminders using `session_tomorrow`.
+    """
+    sessions = _sessions_for_offset(1)
+    sent = 0
+    for sess in sessions:
+        hhmm = str(sess["start_time"])[:5]
+        for wa in (sess["wa_numbers"] or "").split(","):
+            if not wa:
+                continue
+            _send_client_template(wa, "session_tomorrow", [hhmm])
+            sent += 1
+    logging.info(f"[CLIENT] tomorrow reminders sent={sent}")
+    return sent
+
+def run_client_next_hour() -> int:
+    """
+    Send 1h-before reminders using `session_next_hour`.
+    """
+    sessions = _sessions_next_hour()
+    sent = 0
+    for sess in sessions:
+        hhmm = str(sess["start_time"])[:5]
+        for wa in (sess["wa_numbers"] or "").split(","):
+            if not wa:
+                continue
+            _send_client_template(wa, "session_next_hour", [hhmm])
+            sent += 1
+    logging.info(f"[CLIENT] next-hour reminders sent={sent}")
+    return sent
 
 def run_client_weekly() -> int:
     """
-    Send weekly schedule to each client with confirmed sessions in the next 7 days.
-    Returns number of clients messaged.
+    Send weekly preview on Sundays 18:00 using `session_weekly`.
+    Groups by client, compiles their week’s schedule.
     """
-    rows = _client_week_sessions()
-    grouped = _fmt_weekly_sessions(rows)
+    sessions = _sessions_next_week()
+    per_client: dict[str, list[str]] = {}
 
-    sent_count = 0
-    for cid, info in grouped.items():
-        if not info["sessions"]:
-            continue
-        to = normalize_wa(info["wa_number"])
-        name = info["name"]
-        sessions_str = "\n".join(info["sessions"])
-        try:
-            send_template(
-                to=to,
-                template_name="session_weekly",
-                lang=TEMPLATE_LANG,
-                components=[{"type": "body", "parameters": [
-                    {"type": "text", "text": name},
-                    {"type": "text", "text": sessions_str},
-                ]}],
-            )
-            logging.info(f"[WEEKLY] Sent weekly schedule to {name} ({to})")
-            sent_count += 1
-        except Exception:
-            logging.exception(f"[WEEKLY] Failed to send to {name} ({to})")
-    return sent_count
+    for sess in sessions:
+        day = sess["session_date"].strftime("%A")
+        time = str(sess["start_time"])[:5]
+        slot = f"{day} at {time}"
+        for wa in (sess["wa_numbers"] or "").split(","):
+            if not wa:
+                continue
+            per_client.setdefault(wa, []).append(slot)
+
+    sent = 0
+    for wa, slots in per_client.items():
+        schedule = "\n".join(f"• {s}" for s in slots)
+        msg = f"{schedule}\nLooking forward to seeing you!"
+        _send_client_template(wa, "session_weekly", [msg])
+        sent += 1
+
+    logging.info(f"[CLIENT] weekly previews sent={sent}")
+    return sent

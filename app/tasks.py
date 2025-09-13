@@ -1,23 +1,17 @@
 # app/tasks.py
 from __future__ import annotations
-
 import logging
 from flask import request
 
-from .utils import normalize_wa, send_whatsapp_text  # still here for imports
-from .config import TZ_NAME, NADINE_WA
-from . import crud
 from .admin_reminders import run_admin_tick, run_admin_daily
-from .client_reminders import run_client_tick, run_client_weekly
+from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
 
 def register_tasks(app):
     @app.post("/tasks/admin-notify")
     def admin_notify():
         """
-        Hourly admin summary via CRON (Render):
-          • 06:00 SAST → full day (morning prep)
-          • Other hours (within band) → upcoming
-          • Always includes “Next hour”
+        Hourly admin summary via CRON.
+        - Calls run_admin_tick() which uses template `admin_hourly_update`.
         """
         try:
             src = request.args.get("src", "unknown")
@@ -31,26 +25,39 @@ def register_tasks(app):
     @app.post("/tasks/run-reminders")
     def run_reminders():
         """
-        - daily=1 → 20:00 SAST admin recap (today) + tomorrow preview.
-        - weekly=1 → Sunday 18:00 client weekly schedules.
-        - default  → client reminders (D-1 & H-1).
+        Multi-purpose reminder runner.
+        Query parameters:
+          ?daily=1   → run daily admin recap at 20:00
+          ?tomorrow=1 → send client 24h-before reminders
+          ?next=1    → send client 1h-before reminders
+          ?weekly=1  → send client weekly preview (Sunday 18:00)
         """
         try:
             src = request.args.get("src", "unknown")
             daily = request.args.get("daily", "0") == "1"
+            tomorrow = request.args.get("tomorrow", "0") == "1"
+            next_hour = request.args.get("next", "0") == "1"
             weekly = request.args.get("weekly", "0") == "1"
-            logging.info(f"[run-reminders] src={src} daily={daily} weekly={weekly}")
+
+            logging.info(f"[run-reminders] src={src} daily={daily} tomorrow={tomorrow} next={next_hour} weekly={weekly}")
 
             if daily:
                 run_admin_daily()
                 return "ok daily", 200
 
+            if tomorrow:
+                sent = run_client_tomorrow()
+                return f"ok tomorrow sent={sent}", 200
+
+            if next_hour:
+                sent = run_client_next_hour()
+                return f"ok next-hour sent={sent}", 200
+
             if weekly:
                 sent = run_client_weekly()
                 return f"ok weekly sent={sent}", 200
 
-            sent = run_client_tick()
-            return f"ok sent={sent}", 200
+            return "no action", 200
 
         except Exception:
             logging.exception("run-reminders failed")
