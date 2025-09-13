@@ -13,11 +13,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 # Get DB URL from environment
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Render often gives postgres:// ; ensure psycopg (v3) driver is used
+# Ensure psycopg (v3) driver is used
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
-    # If no driver specified, add psycopg
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 # Create engine
@@ -32,7 +31,6 @@ db_session = scoped_session(SessionLocal)
 # Base class for ORM models
 Base = declarative_base()
 
-# Initialise DB tables
 def init_db():
     import app.models  # ensures models are registered
     Base.metadata.create_all(bind=engine)
