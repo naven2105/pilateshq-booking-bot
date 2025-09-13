@@ -120,3 +120,13 @@ def run_admin_daily() -> None:
         digest=f"recap-{body[:20]}",
     )
     logging.info("[ADMIN] daily recap sent + inbox")
+
+def run_admin_tick() -> None:
+    today = _rows_today(upcoming_only=True)
+    body = _fmt_rows(today)
+    next_time = today[0]["start_time"].strftime("%H:%M") if today else "—"
+
+    logging.info(f"[ADMIN] run_admin_tick next_time={next_time} body={body}")
+
+    params = [next_time, body]
+    _send_admin_template("admin_hourly_update", params)
