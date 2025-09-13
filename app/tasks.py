@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from flask import request
 
-from .admin_reminders import run_admin_tick, run_admin_daily
+from .admin_reminders import run_admin_hourly, run_admin_daily
 from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
 
 def register_tasks(app):
@@ -11,12 +11,12 @@ def register_tasks(app):
     def admin_notify():
         """
         Hourly admin summary via CRON.
-        - Calls run_admin_tick() which uses template `admin_hourly_update`.
+        - Calls run_admin_hourly() which uses template `admin_hourly_update`.
         """
         try:
             src = request.args.get("src", "unknown")
             logging.info(f"[admin-notify] src={src}")
-            run_admin_tick()
+            run_admin_hourly()
             return "ok", 200
         except Exception:
             logging.exception("admin-notify failed")
@@ -27,10 +27,10 @@ def register_tasks(app):
         """
         Multi-purpose reminder runner.
         Query parameters:
-          ?daily=1   → run daily admin recap at 20:00
+          ?daily=1    → run daily admin recap at 20:00
           ?tomorrow=1 → send client 24h-before reminders
-          ?next=1    → send client 1h-before reminders
-          ?weekly=1  → send client weekly preview (Sunday 18:00)
+          ?next=1     → send client 1h-before reminders
+          ?weekly=1   → send client weekly preview (Sunday 18:00)
         """
         try:
             src = request.args.get("src", "unknown")
@@ -39,7 +39,9 @@ def register_tasks(app):
             next_hour = request.args.get("next", "0") == "1"
             weekly = request.args.get("weekly", "0") == "1"
 
-            logging.info(f"[run-reminders] src={src} daily={daily} tomorrow={tomorrow} next={next_hour} weekly={weekly}")
+            logging.info(
+                f"[run-reminders] src={src} daily={daily} tomorrow={tomorrow} next={next_hour} weekly={weekly}"
+            )
 
             if daily:
                 run_admin_daily()
