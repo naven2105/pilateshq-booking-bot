@@ -1,293 +1,153 @@
-# app/router.py
-from __future__ import annotations
+# router.py
+"""
+Router
+------
+Webhook entrypoint for all inbound WhatsApp messages.
+- Distinguishes admin vs client.
+- Routes notifications vs queries.
+- Uses queries.py + formatters.py for ad-hoc inbound requests.
+"""
 
-import hashlib
 import logging
-from typing import Optional, Tuple
+from flask import Blueprint, request
+from . import utils, crud, queries, formatters
 
-from flask import request
+router_bp = Blueprint("router", __name__)
+log = logging.getLogger(__name__)
 
-from .config import ADMIN_NUMBERS, VERIFY_TOKEN
-from .utils import normalize_wa, send_whatsapp_text
-from .admin import handle_admin_action
-from .crud import (
-    client_exists_by_wa,
-    upsert_public_client,
-    inbox_upsert,
-    record_lead_touch,
-)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Public / Lead UX
-# ──────────────────────────────────────────────────────────────────────────────
+# --- Intent Detection (basic, replaceable with NLP later) ---
 
-PUBLIC_MENU = (
-    "—\n"
-    "📋 *Menu*\n"
-    "1) Pricing\n"
-    "2) Address & parking\n"
-    "3) Schedule\n"
-    "4) Group sizes\n"
-    "5) Equipment\n"
-    "6) How to start\n"
-    "7) Book (send request)\n"
-    "8) Contact\n"
-    "Reply with a number or keyword (e.g., *pricing*, *address*, *book*)."
-)
+def detect_intent(body: str, is_admin: bool) -> str:
+    text = body.strip().lower()
 
-def _public_menu() -> str:
-    return PUBLIC_MENU
+    # Client queries
+    if not is_admin:
+        if "next lesson" in text:
+            return "client_next_lesson"
+        if "this week" in text:
+            return "client_sessions_week"
+        if "cancel" in text:
+            return "client_cancel_next"
+        if "weekly schedule" in text:
+            return "client_weekly_schedule"
 
-def _normalize(text: str) -> str:
-    return (text or "").strip().lower()
+    # Admin queries
+    if is_admin:
+        if "sessions for" in text:
+            return "admin_client_sessions"
+        if "09" in text or "clients booked" in text:
+            return "admin_clients_for_time"
+        if "how many clients today" in text:
+            return "admin_clients_today"
+        if "cancellations" in text:
+            return "admin_cancellations"
 
-def _intent_and_payload(text: str) -> Tuple[str, Optional[str]]:
-    t = _normalize(text)
+    # General info (anyone)
+    if "date" in text:
+        return "info_date"
+    if "time" in text:
+        return "info_time"
+    if "address" in text:
+        return "info_address"
+    if "rules" in text:
+        return "info_rules"
 
-    # Direct picks
-    if t in {"1", "pricing", "price", "prices"}:                       return "pricing", None
-    if t in {"2", "address", "parking", "where", "location"}:          return "address", None
-    if t in {"3", "schedule", "hours", "opening", "times"}:            return "schedule", None
-    if t in {"4", "group", "group sizes", "class size"}:               return "group_sizes", None
-    if t in {"5", "equipment", "machines", "reformer"}:                return "equipment", None
-    if t in {"6", "start", "how to start", "assessment"}:              return "how_to_start", None
-    if t in {"7", "book", "booking", "request"}:                       return "book_request", None
-    if t in {"8", "contact", "phone", "email"}:                        return "contact", None
+    return "unknown"
 
-    # Greetings → show menu (or comfort for returning leads)
-    if any(k in t for k in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
-        return "menu", None
 
-    # Fuzzy keywords
-    if "price" in t or "cost" in t or "fee" in t:                       return "pricing", None
-    if "address" in t or "parking" in t or "where" in t or "located" in t:  return "address", None
-    if "schedule" in t or "time" in t or "open" in t or "hour" in t:    return "schedule", None
-    if "group" in t or "size" in t:                                     return "group_sizes", None
-    if "equip" in t or "reformer" in t or "chair" in t or "mat" in t:   return "equipment", None
-    if "start" in t or "assessment" in t or "begin" in t:               return "how_to_start", None
-    if "book" in t or "reserve" in t:                                   return "book_request", None
-    if "contact" in t or "call" in t or "email" in t or "whatsapp" in t:return "contact", None
+# --- Webhook ---
 
-    # Fallback: show menu
-    return "menu", None
-
-def _faq_response(intent: str) -> str:
-    if intent == "pricing":
-        return (
-            "💳 *Pricing*\n"
-            "• Group classes from *R180*\n"
-            "• 1:1 assessment recommended for newcomers\n"
-            "• Packages available – ask us for current specials"
-        )
-    if intent == "address":
-        return (
-            "📍 *Address & Parking*\n"
-            "PilatesHQ — *71 Grant Ave, Norwood, Johannesburg*\n"
-            "Safe off-street parking available."
-        )
-    if intent == "schedule":
-        return (
-            "🗓️ *Schedule*\n"
-            "• Weekdays: 06:00–18:00\n"
-            "• Saturday: 08:00–10:00\n"
-            "Ask for today’s availability and we’ll suggest times."
-        )
-    if intent == "group_sizes":
-        return (
-            "👥 *Group sizes*\n"
-            "Group classes are capped at *6* so coaching stays personal.\n"
-            "We also offer duos and privates."
-        )
-    if intent == "equipment":
-        return (
-            "🧰 *Equipment*\n"
-            "Reformers, Wall Units, Wunda Chairs, small props, and mats.\n"
-            "All sessions are guided by certified instructors."
-        )
-    if intent == "how_to_start":
-        return (
-            "🚀 *How to start*\n"
-            "Most clients begin with a *1:1 assessment* so we can tailor your plan.\n"
-            "Reply *Book* and we’ll forward your request to the studio."
-        )
-    if intent == "contact":
-        return (
-            "☎️ *Contact*\n"
-            "Prefer to chat? Message us here anytime.\n"
-            "We’ll introduce you to an instructor to get started."
-        )
-    if intent == "book_request":
-        return (
-            "✅ *Booking request noted!*\n"
-            "We’ve forwarded your request to the studio. An instructor will confirm time and next steps.\n"
-            "If you have preferred days/times, reply with them now."
-        )
-    return "Thanks! How can we help today?"
-
-def _first_name(name: Optional[str]) -> Optional[str]:
-    if not name: return None
-    n = name.strip()
-    if not n or n.lower() == "guest": return None
-    return n.split()[0][:24]
-
-def _send_returning_comfort(wa: str, name: Optional[str]) -> None:
-    first = _first_name(name)
-    if first:
-        msg = f"Hi {first} 👋\nWe’ve already shared your details with *Nadine* — she’ll be in touch shortly."
-    else:
-        msg = "Hi there 👋\nWe’ve already shared your details with *Nadine* — she’ll be in touch shortly."
-    send_whatsapp_text(wa, msg)
-
-def _handle_public_message(wa: str, body: str) -> None:
+@router_bp.post("/webhook")
+def webhook():
     """
-    Lead/FAQ flow with returning-lead comfort:
-    - Ensure a client row exists (idempotent).
-    - Upsert/refresh a lead row; detect if returning and fetch best-known name.
-    - For greeting intents from returning leads → send ONLY the comfort message (no menu).
+    WhatsApp webhook entrypoint.
     """
-    # Ensure client row
     try:
-        if not client_exists_by_wa(wa):
-            upsert_public_client(wa, None)
-    except Exception:
-        logging.exception("clients upsert failed (non-fatal)")
+        data = request.json
+        log.info(f"[router] inbound: {data}")
 
-    # Upsert/refresh lead + detect returning; prefer known name if present
-    is_returning, lead_name = False, None
-    try:
-        lead_info = record_lead_touch(wa, None)  # name can be filled later
-        is_returning = bool(lead_info.get("returning"))
-        lead_name = (lead_info.get("name") or None)
-    except Exception:
-        logging.exception("leads upsert failed (non-fatal)")
+        msg = utils.extract_message(data)
+        if not msg:
+            return "no message", 200
 
-    intent, _ = _intent_and_payload(body)
+        from_wa = msg["from"]
+        body = msg["body"]
 
-    # Booking request → normal flow + admin ping
-    if intent == "book_request":
-        send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
-        try:
-            digest = hashlib.sha256(f"{wa}|{body}".encode("utf-8")).hexdigest()
-            inbox_upsert(
-                kind="booking_request",
-                title="New booking request",
-                body=f"From {wa}\nMessage: {body.strip() or '(no extra details)'}",
-                source="whatsapp",
-                status="open",
-                is_unread=True,
-                action_required=True,
-                digest=digest,
-            )
-            for admin in ADMIN_NUMBERS:
-                send_whatsapp_text(
-                    normalize_wa(admin),
-                    f"📩 *New booking request* from {wa}\n"
-                    f"Message: {body.strip() or '(no extra details)'}\n"
-                    f"(Open *Admin → Inbox* to action.)"
-                )
-        except Exception:
-            logging.exception("inbox write / admin notify failed")
-        return
+        # Determine role
+        is_admin = utils.is_admin(from_wa)
 
-    # Greeting/menu handling
-    if intent == "menu":
-        if is_returning:
-            # Personalised reassurance ONLY (no menu for returning leads)
-            _send_returning_comfort(wa, lead_name)
+        # Detect intent
+        intent = detect_intent(body, is_admin)
+        log.info(f"[router] from={from_wa} admin={is_admin} intent={intent}")
+
+        reply = handle_intent(intent, from_wa, body, is_admin)
+
+        if reply:
+            utils.send_whatsapp_text(from_wa, reply)
+            return "ok", 200
         else:
-            send_whatsapp_text(wa, "Welcome to *PilatesHQ*! 👋\nHow can we help today?\n" + _public_menu())
-        return
+            utils.send_whatsapp_text(from_wa, "❓ Sorry, I didn’t understand that. Please try again.")
+            return "unknown", 200
 
-    # Other intents → FAQ + menu
-    send_whatsapp_text(wa, _faq_response(intent) + "\n\n" + _public_menu())
+    except Exception:
+        log.exception("webhook failed")
+        return "error", 500
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Flask wiring
-# ──────────────────────────────────────────────────────────────────────────────
 
-def register_routes(app):
-    """
-    Mounts:
-      GET  /webhook  – Meta verification (hub.mode=subscribe; hub.verify_token; hub.challenge)
-      POST /webhook  – WhatsApp Cloud API inbound
-      GET  /         – simple OK
-      GET  /health   – liveness probe (registered only if missing)
-    """
-    @app.get("/")
-    def root():
-        return "ok", 200
+# --- Intent Handlers ---
 
-    if "health_router" not in app.view_functions:
-        @app.get("/health", endpoint="health_router")
-        def health_router():
-            return "ok", 200
+def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> str:
+    """Map intent → queries.py → formatters.py → response string"""
 
-    @app.get("/webhook")
-    def webhook_verify():
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        logging.info("GET /webhook verify mode=%s", mode)
-        if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
-            return challenge, 200
-        return "forbidden", 403
+    # --- Client Intents ---
+    if intent == "client_next_lesson":
+        result = queries.get_next_lesson(crud.get_client_id(from_wa))
+        return formatters.format_next_lesson(result)
 
-    @app.post("/webhook")
-    def webhook():
-        logging.info("POST /webhook received")
-        try:
-            data = request.get_json(force=True, silent=True) or {}
-            entry = (data.get("entry") or [])
-            if not entry:
-                return "ok", 200
-            changes = (entry[0].get("changes") or [])
-            if not changes:
-                return "ok", 200
-            value = changes[0].get("value") or {}
-            msgs = value.get("messages") or []
-            if not msgs:
-                return "ok", 200
+    if intent == "client_sessions_week":
+        result = queries.get_sessions_this_week(crud.get_client_id(from_wa))
+        return formatters.format_sessions_this_week(result)
 
-            msg = msgs[0]
-            from_wa_raw = msg.get("from") or ""
-            from_wa = normalize_wa(from_wa_raw)
-            msg_type = msg.get("type")
+    if intent == "client_cancel_next":
+        success = queries.cancel_next_lesson(crud.get_client_id(from_wa))
+        return "✅ Your next lesson was cancelled." if success else "⚠ No upcoming lesson to cancel."
 
-            body = ""
-            btn_id: Optional[str] = None
-            if msg_type == "text":
-                body = (msg.get("text") or {}).get("body", "") or ""
-            elif msg_type == "interactive":
-                inter = msg.get("interactive") or {}
-                if inter.get("type") == "button_reply":
-                    br = inter.get("button_reply") or {}
-                    body = br.get("title", "") or ""
-                    btn_id = br.get("id") or None
-                elif inter.get("type") == "list_reply":
-                    lr = (msg.get("interactive") or {}).get("list_reply") or {}
-                    body = lr.get("title", "") or ""
-                    btn_id = lr.get("id") or None
-                else:
-                    body = ""
-            else:
-                body = ""
+    if intent == "client_weekly_schedule":
+        result = queries.get_weekly_schedule()
+        return formatters.format_weekly_schedule(result)
 
-            # Route: admin vs public
-            if from_wa in ADMIN_NUMBERS:
-                try:
-                    handle_admin_action(from_wa, msg.get("id"), body, btn_id)  # prefer new signature
-                except TypeError:
-                    try:
-                        handle_admin_action(from_wa, msg.get("id"), body)
-                    except Exception:
-                        logging.exception("admin handler failed")
-                except Exception:
-                    logging.exception("admin handler failed")
-            else:
-                _handle_public_message(from_wa, body)
+    # --- Admin Intents ---
+    if intent == "admin_client_sessions":
+        # Extract client name from message body
+        client_name = body.replace("sessions for", "").strip()
+        result = queries.get_client_sessions(client_name)
+        return formatters.format_client_sessions(result, client_name)
 
-            return "ok", 200
+    if intent == "admin_clients_for_time":
+        # Example assumes "09h00" is always mentioned
+        result = queries.get_clients_for_time(str(date.today()), "09:00")
+        return formatters.format_clients_for_time(result, "09:00", str(date.today()))
 
-        except Exception:
-            logging.exception("webhook failed")
-            return "error", 500
+    if intent == "admin_clients_today":
+        result = queries.get_clients_today()
+        return formatters.format_clients_today(result)
+
+    if intent == "admin_cancellations":
+        result = queries.get_cancellations_today()
+        return formatters.format_cancellations(result)
+
+    # --- Info Intents (anyone) ---
+    if intent == "info_date":
+        return formatters.format_today_date(queries.get_today_date())
+
+    if intent == "info_time":
+        return formatters.format_current_time(queries.get_current_time())
+
+    if intent == "info_address":
+        return formatters.format_studio_address(queries.get_studio_address())
+
+    if intent == "info_rules":
+        return formatters.format_studio_rules(queries.get_studio_rules())
+
+    return None
