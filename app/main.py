@@ -1,21 +1,28 @@
 # app/main.py
+import logging
 from flask import Flask
+from .db import init_db
+from .router import router_bp
 from .tasks import register_tasks
-from .router import register_routes
 
-app = Flask(__name__)
+log = logging.getLogger(__name__)
 
-# Single authoritative health check
-@app.get("/health")
-def health():
-    return "ok", 200
+def create_app():
+    app = Flask(__name__)
 
-# Register app routes and task endpoints
-register_routes(app)
-register_tasks(app)
+    # Register blueprints & tasks
+    app.register_blueprint(router_bp)
+    register_tasks(app)
 
-if __name__ == "__main__":
-    # Render sets PORT; locally you can run `python -m app.main`
-    import os
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # Initialise DB tables
+    with app.app_context():
+        try:
+            init_db()
+            log.info("[DB] Tables created / verified")
+        except Exception:
+            log.exception("[DB] Failed to initialise")
+
+    return app
+
+
+app = create_app()

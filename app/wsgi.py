@@ -1,9 +1,11 @@
+# app/wsgi.py
 from __future__ import annotations
 import logging
 from flask import Flask
 from app.router import register_routes
 from app.diag import bp as diag_bp
 from app.tasks import register_tasks   # import tasks
+from app.main import app
 
 logging.basicConfig(
     level=logging.INFO,
