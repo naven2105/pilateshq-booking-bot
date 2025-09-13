@@ -1,160 +1,199 @@
 # app/utils.py
+"""
+Utilities for WhatsApp Cloud API + routing helpers.
+- extract_message(payload): parse inbound webhook JSON into a simple dict
+- send_whatsapp_text(to, text): send plain text messages
+- send_whatsapp_buttons(to, text, buttons): send interactive reply buttons
+- is_admin(wa_number): check if a WA ID is an admin
+"""
+
 from __future__ import annotations
-
-import re
-import json
 import logging
-from typing import Any, Dict, List
 import requests
+from typing import Any, Dict, List, Optional
 
-from .config import ACCESS_TOKEN, GRAPH_URL
+from . import config
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-def normalize_wa(wa: str) -> str:
-    s = (wa or "").strip().replace(" ", "")
-    s = re.sub(r"[^\d+]", "", s)
-    if s.startswith("+"):
-        s = s[1:]
-    if s.startswith("0") and len(s) >= 10:
-        return "27" + s[1:]
-    return s
+log = logging.getLogger(__name__)
 
-def _post_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+# --- Config / constants -------------------------------------------------------
+
+ACCESS_TOKEN: str = config.ACCESS_TOKEN
+PHONE_NUMBER_ID: str = config.PHONE_NUMBER_ID
+GRAPH_URL: str = config.GRAPH_URL  # e.g. https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages
+
+# Admin numbers: keep legacy single-admin alias for older code
+ADMIN_NUMBERS: List[str] = config.ADMIN_NUMBERS or []
+ADMIN_NUMBER: str = ADMIN_NUMBERS[0] if ADMIN_NUMBERS else ""
+
+# --- Helpers ------------------------------------------------------------------
+
+def is_admin(wa_number: str) -> bool:
+    """Return True if the WA number is configured as an admin."""
+    return (wa_number or "").strip() in ADMIN_NUMBERS
+
+
+def _first(d: Dict, key: str, default=None):
+    v = d.get(key, default)
+    return v
+
+
+def extract_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normalise WhatsApp webhook payload into:
+      {
+        "from": "<wa_id>",
+        "id": "<message_id>",
+        "type": "<text|interactive|button|other>",
+        "body": "<text or button title>",
+        "btn_id": "<reply id>" (optional),
+      }
+    Returns None if no message found (e.g., status updates only).
+    """
     try:
-        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-        resp = requests.post(GRAPH_URL, headers=headers, data=json.dumps(payload), timeout=20)
-        status = resp.status_code
-        body: Dict[str, Any] = {}
-        try:
-            body = resp.json() if resp.content else {}
-        except ValueError:
-            text = (resp.text or "").strip()
-            body = {"raw_text": text[:500]}
-        result = {"status_code": status, **(body or {})}
-        if status >= 400:
-            logging.error("WhatsApp API %s: %s", status, result)
+        if not payload or "entry" not in payload:
+            return None
+
+        # WhatsApp webhook structure: entry -> changes -> value -> messages[0]
+        entries = payload.get("entry", [])
+        if not entries:
+            return None
+        changes = entries[0].get("changes", [])
+        if not changes:
+            return None
+        value = changes[0].get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return None
+
+        msg = messages[0]
+        wa_from = msg.get("from")
+        msg_id = msg.get("id")
+        mtype = msg.get("type", "text")
+
+        # Default body
+        body_text: str = ""
+        btn_id: Optional[str] = None
+
+        # Text message
+        if mtype == "text":
+            body_text = (msg.get("text", {}) or {}).get("body", "")
+
+        # Interactive messages (reply buttons or lists)
+        elif mtype == "interactive":
+            interactive = msg.get("interactive", {}) or {}
+            itype = interactive.get("type")
+            if itype == "button":
+                reply = (interactive.get("button_reply") or interactive.get("nfm_reply") or {})
+                btn_id = reply.get("id")
+                body_text = reply.get("title") or ""
+            elif itype == "list_reply":
+                reply = interactive.get("list_reply") or {}
+                btn_id = reply.get("id")
+                body_text = reply.get("title") or reply.get("description") or ""
+            else:
+                body_text = ""  # unknown interactive subtype
+
+        # Button (older payloads may surface type='button')
+        elif mtype == "button":
+            # Some webhooks use 'button' with 'text' as title and 'payload' as id
+            button = msg.get("button", {}) or {}
+            btn_id = button.get("payload")
+            body_text = button.get("text") or ""
+
         else:
-            logging.info("WhatsApp API %s OK", status)
-        return result
-    except Exception as e:
-        logging.exception("WhatsApp API call failed")
-        return {"status_code": -1, "error": str(e)}
+            # Fallback: try text->body if present
+            body_text = (msg.get("text", {}) or {}).get("body", "")
 
-# ─────────────────────────────────────────────
-# Text
-# ─────────────────────────────────────────────
-def send_whatsapp_text(to_wa: str, text: str) -> Dict[str, Any]:
-    to = normalize_wa(to_wa)
-    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
-    return _post_json(payload)
+        # Normalise casing/whitespace at the router level if needed
+        return {
+            "from": wa_from,
+            "id": msg_id,
+            "type": mtype,
+            "body": body_text.strip(),
+            "btn_id": btn_id,
+        }
 
-# ─────────────────────────────────────────────
-# Buttons (interactive)
-# ─────────────────────────────────────────────
-def _slugify_id(s: str, max_len: int = 256) -> str:
-    base = re.sub(r"\s+", "_", s.strip().lower())
-    base = re.sub(r"[^a-z0-9_.-]", "", base)
-    return base[:max_len] if base else "btn"
+    except Exception:
+        log.exception("Failed to extract message from webhook payload")
+        return None
 
-def _normalize_buttons(buttons: List[Any]) -> List[Dict[str, str]]:
-    norm: List[Dict[str, str]] = []
-    for item in buttons or []:
-        if isinstance(item, str):
-            title = item.strip(); bid = _slugify_id(title)
-        elif isinstance(item, dict):
-            title = (item.get("title") or item.get("text") or "").strip()
-            bid = (item.get("id") or _slugify_id(title)).strip()
-        else:
-            continue
-        if not title:
-            continue
-        if len(title) > 20:
-            title = title[:20]
-        norm.append({"type": "reply", "reply": {"id": bid or "btn", "title": title}})
-        if len(norm) == 3:
-            break
-    return norm
 
-def send_whatsapp_buttons(to_wa: str, body: str, buttons: List[Any]) -> Dict[str, Any]:
-    to = normalize_wa(to_wa)
-    actions = _normalize_buttons(buttons)
-    if not actions:
-        return send_whatsapp_text(to, body)
+# --- Sending messages ---------------------------------------------------------
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def send_whatsapp_text(to: str, text: str) -> Dict[str, Any]:
+    """
+    Send a plain text WhatsApp message via Cloud API.
+    """
+    if not to:
+        raise ValueError("Recipient 'to' is required")
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
-        "type": "interactive",
-        "interactive": {"type": "button", "body": {"text": body}, "action": {"buttons": actions}},
+        "type": "text",
+        "text": {"preview_url": False, "body": text[:4096]},
     }
-    return _post_json(payload)
 
-# ─────────────────────────────────────────────
-# List (picker)
-# ─────────────────────────────────────────────
-def _normalize_list_rows(rows: List[Any]) -> List[Dict[str, Dict[str, str]]]:
-    out: List[Dict[str, Dict[str, str]]] = []
-    for item in rows or []:
-        if isinstance(item, str):
-            title = item.strip(); rid = _slugify_id(title); description = ""
-        elif isinstance(item, dict):
-            title = (item.get("title") or item.get("text") or "").strip()
-            rid = (item.get("id") or _slugify_id(title)).strip()
-            description = (item.get("description") or "").strip()
-        else:
-            continue
-        if not title:
-            continue
-        row = {"id": rid or "row", "title": title}
-        if description:
-            row["description"] = description
-        out.append({"type": "row", "row": row})
-    return out
+    try:
+        r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=15)
+        if r.status_code >= 400:
+            log.error("WA text send failed %s: %s", r.status_code, r.text)
+        return {"status_code": r.status_code, "response": safe_json(r)}
+    except Exception:
+        log.exception("Error sending WhatsApp text")
+        return {"status_code": 0, "response": None}
 
-def send_whatsapp_list(to_wa: str, body: str, button_text: str, section_title: str, rows: List[Any]) -> Dict[str, Any]:
-    to = normalize_wa(to_wa)
-    norm_rows = _normalize_list_rows(rows)
-    if not norm_rows:
-        return send_whatsapp_text(to, body)
+
+def send_whatsapp_buttons(to: str, text: str, buttons: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    Send interactive reply buttons.
+    buttons: list of {"id": "...", "title": "..."} (max 3 per WA spec).
+    """
+    if not to:
+        raise ValueError("Recipient 'to' is required")
+    if not buttons:
+        raise ValueError("At least one button is required")
+
+    # WA allows up to 3 reply buttons
+    btns = []
+    for b in buttons[:3]:
+        bid = b.get("id")
+        title = b.get("title")
+        if not bid or not title:
+            raise ValueError("Each button needs 'id' and 'title'")
+        btns.append({"type": "reply", "reply": {"id": bid, "title": title[:20]}})
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "interactive",
         "interactive": {
-            "type": "list",
-            "body": {"text": body},
-            "action": {
-                "button": button_text[:20] if button_text else "Select",
-                "sections": [{"title": section_title[:24] if section_title else "Options",
-                              "rows": [r["row"] for r in norm_rows]}],
-            },
+            "type": "button",
+            "body": {"text": text[:1024]},
+            "action": {"buttons": btns},
         },
     }
-    return _post_json(payload)
 
-# ─────────────────────────────────────────────
-# Templates
-# ─────────────────────────────────────────────
-def send_whatsapp_template(to_wa: str, template: str, lang: str = "en", components: list[dict] | None = None) -> Dict[str, Any]:
-    """
-    Send a pre-approved WhatsApp template.
-    Logs the payload and Meta's full response for debugging.
-    """
-    to = normalize_wa(to_wa)
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template,
-            "language": {"code": lang},
-        },
-    }
-    if components:
-        payload["template"]["components"] = components
+    try:
+        r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=15)
+        if r.status_code >= 400:
+            log.error("WA buttons send failed %s: %s", r.status_code, r.text)
+        return {"status_code": r.status_code, "response": safe_json(r)}
+    except Exception:
+        log.exception("Error sending WhatsApp buttons")
+        return {"status_code": 0, "response": None}
 
-    logging.debug("[WA TEMPLATE] Payload: %s", json.dumps(payload, indent=2))
-    result = _post_json(payload)
-    logging.debug("[WA TEMPLATE] Response: %s", json.dumps(result, indent=2))
-    return result
+
+def safe_json(r: requests.Response) -> Any:
+    try:
+        return r.json()
+    except Exception:
+        return {"text": r.text[:500]}
