@@ -1,4 +1,4 @@
-# router.py
+# app/router.py
 """
 Router
 ------
@@ -9,14 +9,12 @@ Webhook entrypoint for all inbound WhatsApp messages.
 """
 
 import logging
+from datetime import date
 from flask import Blueprint, request
 
 # Explicit imports from app
 from . import utils, crud, formatters
-from . import queries   # make sure queries.py is loaded directly
-
-router_bp = Blueprint("router", __name__)
-log = logging.getLogger(__name__)
+import app.queries as queries  # explicitly import the module file, not package __init__
 
 router_bp = Blueprint("router", __name__)
 log = logging.getLogger(__name__)
@@ -42,9 +40,9 @@ def detect_intent(body: str, is_admin: bool) -> str:
     if is_admin:
         if "sessions for" in text:
             return "admin_client_sessions"
-        if "09" in text or "clients booked" in text:
+        if "clients booked" in text or "09" in text:
             return "admin_clients_for_time"
-        if "how many clients today" in text:
+        if "how many clients today" in text or "clients today" in text:
             return "admin_clients_today"
         if "cancellations" in text:
             return "admin_cancellations"
@@ -66,9 +64,7 @@ def detect_intent(body: str, is_admin: bool) -> str:
 
 @router_bp.post("/webhook")
 def webhook():
-    """
-    WhatsApp webhook entrypoint.
-    """
+    """WhatsApp webhook entrypoint."""
     try:
         data = request.json
         log.info(f"[router] inbound: {data}")
@@ -103,7 +99,7 @@ def webhook():
 
 # --- Intent Handlers ---
 
-def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> str:
+def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> str | None:
     """Map intent → queries.py → formatters.py → response string"""
 
     # --- Client Intents ---
