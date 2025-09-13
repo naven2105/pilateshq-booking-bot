@@ -2,14 +2,13 @@
 from __future__ import annotations
 import logging
 from sqlalchemy import text
-from flask import request
 from .db import get_session
-from .utils import normalize_wa, send_whatsapp_text
+from .utils import normalize_wa, send_whatsapp_template
 from .config import TZ_NAME, ADMIN_NUMBERS
 from . import crud
 
 # ─────────────────────────────────────────────
-# SQL + formatting helpers
+# SQL helpers
 # ─────────────────────────────────────────────
 
 def _rows_today(upcoming_only: bool) -> list[dict]:
@@ -59,7 +58,7 @@ def _rows_upcoming_hours() -> str:
             b.h AS block_start,
             b.h + interval '1 hour' AS block_end,
             s.id, s.session_date, s.start_time, s.capacity,
-            s.booked_count, s.status, COALESCE(s.notes,'') AS notes,
+            s.booked_count, s.status,
             COALESCE((
                 SELECT STRING_AGG(nm, ', ' ORDER BY nm)
                 FROM (
@@ -80,122 +79,62 @@ def _rows_upcoming_hours() -> str:
     with get_session() as s:
         rows = [dict(r) for r in s.execute(text(sql), {"tz": TZ_NAME}).mappings().all()]
 
-    out = ["🕒 Upcoming hours:"]
-    seen_blocks = []
-    for r in rows:
-        bs = r["block_start"].strftime("%H:%M")
-        if bs in seen_blocks:
-            continue
-        seen_blocks.append(bs)
-        block_sessions = [x for x in rows if x["block_start"] == r["block_start"]]
-        out.append(f"{bs}–{r['block_end'].strftime('%H:%M')}")
-        if not any(x["id"] for x in block_sessions):
-            out.append("— none —")
-        else:
-            for sess in block_sessions:
-                if sess["id"] is None:
-                    continue
-                full = (str(sess["status"]).lower() == "full") or (sess["booked_count"] >= sess["capacity"])
-                status = "🔒 full" if full else "✅ open"
-                names = (sess.get("names") or "").strip()
-                names_part = " (no bookings)" if not names else f" — {names}"
-                out.append(f"• {str(sess['start_time'])[:5]}{names_part}  ({status})")
-    return "\n".join(out)
-
-def _fmt_rows(rows: list[dict]) -> str:
-    if not rows:
-        return "— none —"
     out = []
     for r in rows:
-        full = (str(r["status"]).lower() == "full") or (r["booked_count"] >= r["capacity"])
-        status = "🔒 full" if full else "✅ open"
-        names = (r.get("names") or "").strip()
-        names_part = " (no bookings)" if not names else f" — {names}"
-        out.append(f"• {str(r['start_time'])[:5]}{names_part}  ({status})")
-    return "\n".join(out)
+        if r["id"] is None:
+            continue
+        hhmm = str(r["start_time"])[:5]
+        booked = str(r["names"] or "0")
+        out.append((hhmm, booked))
+    return out
 
 # ─────────────────────────────────────────────
-# Core admin senders
+# Core senders
 # ─────────────────────────────────────────────
 
-def _send_to_admins(body: str) -> None:
+def run_admin_tick() -> None:
+    """
+    Hourly admin summary via template.
+    """
+    hours = _rows_upcoming_hours()
+    today = _rows_today(upcoming_only=True)
+
+    total = len(today)
+    detail = ", ".join([f"{h} ({b})" for h, b in hours]) or "No sessions upcoming"
+
     for admin in ADMIN_NUMBERS:
-        send_whatsapp_text(normalize_wa(admin), body)
+        send_whatsapp_template(normalize_wa(admin), "admin_hourly_update", [detail, str(total)])
 
-def run_admin_tick(force_hour: int | None = None) -> None:
-    with get_session() as s:
-        if force_hour is not None:
-            now_utc_hour = force_hour
-        else:
-            now_utc_hour = s.execute(
-                text("SELECT EXTRACT(HOUR FROM now())::int AS h")
-            ).mappings().first()["h"]
-
-    full_day = (now_utc_hour == 4)  # 04:00 UTC ≈ 06:00 SAST
-    today = _rows_today(upcoming_only=not full_day)
-    header = "🗓 Today’s sessions (full day)" if full_day else "🗓 Today’s sessions (upcoming)"
-    body_today = header + "\n" + _fmt_rows(today)
-    hours_block = _rows_upcoming_hours()
-    msg = f"{body_today}\n\n{hours_block}"
-    _send_to_admins(msg)
-
-    # Inbox entry only — no duplicate WhatsApp send
     crud.inbox_upsert(
         kind="hourly",
         title="Hourly update",
-        body=msg,
+        body=detail,
         source="cron",
         status="open",
         is_unread=True,
         action_required=False,
-        digest=f"hourly-{msg[:20]}",
+        digest=f"hourly-{detail[:20]}",
     )
-    logging.info("[ADMIN] tick sent + inbox")
+    logging.info("[ADMIN_REMINDERS] hourly update sent + inbox")
 
 def run_daily_recap() -> None:
+    """
+    20:00 recap for admins via template.
+    """
     today = _rows_today(upcoming_only=False)
-    body = "🗓 Today’s sessions (full day)\n" + _fmt_rows(today)
+    detail = "\n".join([f"{str(r['start_time'])[:5]} — {r.get('names') or 'no bookings'}" for r in today]) or "— none —"
 
-    # Send once via WhatsApp
-    _send_to_admins(body)
+    for admin in ADMIN_NUMBERS:
+        send_whatsapp_template(normalize_wa(admin), "admin_20h00", [str(len(today)), detail])
 
-    # Store inbox silently
     crud.inbox_upsert(
         kind="recap",
         title="20:00 recap",
-        body=body,
+        body=detail,
         source="cron",
         status="open",
         is_unread=True,
         action_required=False,
-        digest=f"recap-{body[:20]}",
+        digest=f"recap-{detail[:20]}",
     )
-    logging.info("[ADMIN] daily recap sent + inbox")
-
-# ─────────────────────────────────────────────
-# Flask wiring
-# ─────────────────────────────────────────────
-
-def register_admin_reminders(app):
-    @app.post("/tasks/admin-notify")
-    def admin_notify():
-        try:
-            src = request.args.get("src", "unknown")
-            force_hour = request.args.get("hour")
-            logging.info(f"[admin-notify] src={src} force_hour={force_hour}")
-            run_admin_tick(int(force_hour) if force_hour else None)
-            return "ok", 200
-        except Exception:
-            logging.exception("admin-notify failed")
-            return "error", 500
-
-    @app.post("/tasks/admin-recap")
-    def admin_recap():
-        try:
-            src = request.args.get("src", "unknown")
-            logging.info(f"[admin-recap] src={src}")
-            run_daily_recap()
-            return "ok recap", 200
-        except Exception:
-            logging.exception("admin-recap failed")
-            return "error", 500
+    logging.info("[ADMIN_REMINDERS] recap sent + inbox")
