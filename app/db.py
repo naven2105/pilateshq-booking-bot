@@ -1,67 +1,39 @@
 # app/db.py
 """
-Database engine & session lifecycle using SQLAlchemy 2.x style.
-- Normalizes DATABASE_URL to psycopg3
-- Creates a single engine and session factory
-- Provides get_session() context manager with commit/rollback
+Database Setup
+--------------
+Initialises SQLAlchemy engine, session, and Base.
 """
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 import os
-import logging
-from contextlib import contextmanager
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
 
-# Read DB URL from env and force psycopg3 dialect if needed.
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-if not DATABASE_URL:
-    logging.warning("[DB] DATABASE_URL is not set")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Normalize scheme → psycopg3 driver
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+# Create engine
+engine = create_engine(DATABASE_URL, echo=False, future=True)
 
-_engine = None
-_Session = None
+# Create a configured "Session" class
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
-def init_db():
-    """
-    Create the engine & session factory once and sanity-ping the DB.
-    Called lazily on first request (see app/main.py).
-    """
-    global _engine, _Session
-    if _engine:
-        return
-    _engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,  # validates connections before using
-        future=True,         # 2.x style execution
-    )
-    _Session = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+# Scoped session for thread safety (used across app)
+db_session = scoped_session(SessionLocal)
 
-    # Sanity ping (raises if credentials/network wrong)
-    with _engine.connect() as c:
-        c.execute(text("SELECT 1"))
-    logging.info("[DB] Ready")
+# Base class for models
+Base = declarative_base()
 
-@contextmanager
-def get_session():
-    """
-    Usage:
-        with get_session() as s:
-            s.execute(...)
-    Guarantees commit on success, rollback on exception, and close.
-    """
-    if _Session is None:
-        init_db()
-    s = _Session()
+# Dependency helper
+def get_db():
+    """Yields a DB session (for FastAPI/Flask dependency style)."""
+    db = SessionLocal()
     try:
-        yield s
-        s.commit()
-    except Exception:
-        s.rollback()
-        raise
+        yield db
     finally:
-        s.close()
+        db.close()
+
+
+# Ensure models import this Base
+def init_db():
+    import app.models  # noqa: F401
+    Base.metadata.create_all(bind=engine)
