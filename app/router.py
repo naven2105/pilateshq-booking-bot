@@ -10,7 +10,13 @@ Webhook entrypoint for all inbound WhatsApp messages.
 
 import logging
 from flask import Blueprint, request
-from . import utils, crud, queries, formatters
+
+# Explicit imports from app
+from . import utils, crud, formatters
+from . import queries   # make sure queries.py is loaded directly
+
+router_bp = Blueprint("router", __name__)
+log = logging.getLogger(__name__)
 
 router_bp = Blueprint("router", __name__)
 log = logging.getLogger(__name__)
