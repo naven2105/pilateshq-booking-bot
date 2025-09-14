@@ -3,21 +3,22 @@ from __future__ import annotations
 import logging
 from flask import request
 
-from .admin_reminders import run_admin_tick, run_admin_daily
+from .admin_reminders import run_admin_hourly, run_admin_daily
 from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
 from .db import db_session  # for rollback/remove on task completion
+
 
 def register_tasks(app):
     @app.post("/tasks/admin-notify")
     def admin_notify():
         """
         Hourly admin summary via CRON.
-        - Calls run_admin_tick() which uses template sending.
+        Sends using a pre-approved template to bypass the 24h window.
         """
         try:
             src = request.args.get("src", "unknown")
             logging.info(f"[admin-notify] src={src}")
-            run_admin_tick()
+            run_admin_hourly()
             return "ok", 200
         except Exception:
             logging.exception("admin-notify failed")
