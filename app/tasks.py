@@ -3,24 +3,29 @@ from __future__ import annotations
 import logging
 from flask import request
 
-from .admin_reminders import run_admin_hourly, run_admin_daily
+from .admin_reminders import run_admin_tick, run_admin_daily
 from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
+from .db import db_session  # for rollback/remove on task completion
 
 def register_tasks(app):
     @app.post("/tasks/admin-notify")
     def admin_notify():
         """
         Hourly admin summary via CRON.
-        - Calls run_admin_hourly() which uses template `admin_hourly_update`.
+        - Calls run_admin_tick() which uses template sending.
         """
         try:
             src = request.args.get("src", "unknown")
             logging.info(f"[admin-notify] src={src}")
-            run_admin_hourly()
+            run_admin_tick()
             return "ok", 200
         except Exception:
             logging.exception("admin-notify failed")
+            db_session.rollback()
             return "error", 500
+        finally:
+            # ensure the scoped session is clean for the next request
+            db_session.remove()
 
     @app.post("/tasks/run-reminders")
     def run_reminders():
@@ -39,9 +44,7 @@ def register_tasks(app):
             next_hour = request.args.get("next", "0") == "1"
             weekly = request.args.get("weekly", "0") == "1"
 
-            logging.info(
-                f"[run-reminders] src={src} daily={daily} tomorrow={tomorrow} next={next_hour} weekly={weekly}"
-            )
+            logging.info(f"[run-reminders] src={src} daily={daily} tomorrow={tomorrow} next={next_hour} weekly={weekly}")
 
             if daily:
                 run_admin_daily()
@@ -63,4 +66,8 @@ def register_tasks(app):
 
         except Exception:
             logging.exception("run-reminders failed")
+            db_session.rollback()
             return "error", 500
+        finally:
+            # clear any broken connections / transactions between cron calls
+            db_session.remove()
