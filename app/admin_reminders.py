@@ -8,7 +8,7 @@ Uses:
 
 Notes:
 - Sends via templates so it works outside WhatsApp's 24h window.
-- Defaults language to en_ZA (English - South Africa) to match your templates.
+- We FORCE language to en_ZA to match your Meta templates and avoid 132001.
 """
 
 from __future__ import annotations
@@ -24,12 +24,12 @@ from . import utils, config
 
 log = logging.getLogger(__name__)
 
-# Template names match what you have in WhatsApp Manager
+# Match your template names in WhatsApp Manager
 T_ADMIN_HOURLY = getattr(config, "ADMIN_TEMPLATE_HOURLY", "admin_hourly_update")
 T_ADMIN_DAILY  = getattr(config, "ADMIN_TEMPLATE_DAILY",  "admin_20h00")
 
-# IMPORTANT: your admin templates are English (ZAF) → en_ZA
-LANG_ADMIN = getattr(config, "ADMIN_TEMPLATE_LANG", "en_ZA")
+# IMPORTANT: Force English (South Africa) for admin templates to fix 132001
+LANG_ADMIN = "en_ZA"
 
 
 def _time_hhmm(dt_obj) -> str:
@@ -49,7 +49,6 @@ def run_admin_hourly() -> None:
     target = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     today = date.today()
 
-    # Count confirmed bookings for sessions starting at the next top-of-hour
     q = (
         db_session.query(func.count(Booking.client_id))
         .join(Session, Booking.session_id == Session.id)
@@ -68,7 +67,7 @@ def run_admin_hourly() -> None:
         res = utils.send_whatsapp_template(
             to=admin_wa,
             template_name=T_ADMIN_HOURLY,
-            lang_code=LANG_ADMIN,  # en_ZA
+            lang_code=LANG_ADMIN,  # FORCE en_ZA
             body_params=[time_label, str(confirmed_count)],
         )
         log.info(
@@ -111,7 +110,7 @@ def run_admin_daily() -> None:
         res = utils.send_whatsapp_template(
             to=admin_wa,
             template_name=T_ADMIN_DAILY,
-            lang_code=LANG_ADMIN,  # en_ZA
+            lang_code=LANG_ADMIN,  # FORCE en_ZA
             body_params=[str(total_sessions), details],
         )
         log.info(
@@ -121,3 +120,8 @@ def run_admin_daily() -> None:
 
     log.info("[admin-daily] total_sessions=%s admins=%s",
              total_sessions, len(config.ADMIN_NUMBERS))
+
+
+# Back-compat alias if any code still imports run_admin_tick()
+def run_admin_tick() -> None:
+    run_admin_hourly()
