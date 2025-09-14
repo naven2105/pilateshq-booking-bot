@@ -4,7 +4,9 @@ Diagnostic Endpoints
 --------------------
 Lightweight routes to verify service and database connectivity.
 Also exposes a simple landing page at '/' so GET / does not 404.
-Includes a template smoke-test endpoint to send a client template without DB rows.
+Includes template smoke-test endpoints so you can test delivery without DB rows:
+- POST /diag/test-client-template?to=<wa_id>&time=09:00
+- POST /diag/test-weekly-template?to=<wa_id>&name=<Name>&items=<semi-colon list>
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ def root():
                     "tasks_next_hour": "/tasks/run-reminders?next=1",
                     "tasks_weekly": "/tasks/run-reminders?weekly=1",
                     "test_client_template": "/diag/test-client-template?to=<wa_id>&time=09:00",
+                    "test_weekly_template": "/diag/test-weekly-template?to=<wa_id>&name=<Name>&items=Mon 16 Sep at 09:00;Wed 17 Sep at 07:00",
                 },
             }
         ),
@@ -93,7 +96,7 @@ def test_client_template():
         )
         code = res.get("status_code", 0)
         return {
-            "ok": code and code < 400,
+            "ok": bool(code and code < 400),
             "to": to,
             "template": template_name,
             "lang": lang_code,
@@ -103,4 +106,61 @@ def test_client_template():
 
     except Exception as e:
         log.exception("test-client-template failed")
+        return {"ok": False, "error": str(e)}, 500
+
+
+@diag_bp.post("/diag/test-weekly-template")
+def test_weekly_template():
+    """
+    Send the 'weekly_template_message' template (2 vars) without DB:
+      {{1}} = client name
+      {{2}} = bullet-list of sessions (one string with newlines)
+    Query params:
+      - to    : WhatsApp wa_id, e.g. '2773XXXXXXX' (required)
+      - name  : client's name (default 'there')
+      - items : semi-colon OR comma-separated list of entries, e.g.
+                "Mon 16 Sep at 09:00;Wed 17 Sep at 07:00"
+      - tpl   : override template (default 'weekly_template_message')
+      - lang  : override language (default 'en')
+    """
+    try:
+        to = request.args.get("to", "").strip()
+        if not to:
+            return {"ok": False, "error": "Missing 'to' (WhatsApp wa_id)."}, 400
+
+        name = request.args.get("name", "there").strip()
+
+        raw_items = request.args.get("items", "").strip()
+        if raw_items:
+            # split on ';' primarily, fall back to ','
+            parts = [p.strip() for p in (raw_items.split(";") if ";" in raw_items else raw_items.split(","))]
+            lines = [f"- {p}" for p in parts if p]
+        else:
+            # default sample lines if none provided
+            lines = ["- Mon 16 Sep at 09:00", "- Wed 17 Sep at 07:00"]
+
+        body_list = "\n".join(lines) if lines else "No sessions in the next 7 days."
+
+        template_name = request.args.get("tpl", "weekly_template_message")
+        lang_code = request.args.get("lang", "en")
+
+        res = utils.send_whatsapp_template(
+            to=to,
+            template_name=template_name,
+            lang_code=lang_code,
+            body_params=[name, body_list],  # {{1}} name, {{2}} list
+        )
+        code = res.get("status_code", 0)
+        return {
+            "ok": bool(code and code < 400),
+            "to": to,
+            "template": template_name,
+            "lang": lang_code,
+            "status_code": code,
+            "vars": {"name": name, "items": lines},
+            "response": res.get("response"),
+        }, 200 if code and code < 400 else 500
+
+    except Exception as e:
+        log.exception("test-weekly-template failed")
         return {"ok": False, "error": str(e)}, 500
