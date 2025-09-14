@@ -1,230 +1,223 @@
 # app/client_reminders.py
-"""
-Client Reminders (template-based, aligned to approved templates)
-----------------------------------------------------------------
-Uses:
-- session_tomorrow          ({{1}} = time only, lang en_US)
-- session_next_hour         ({{1}} = time only, lang en)
-- weekly_template_message   ({{1}} = name, {{2}} = single-line list or 'No sessions this week.', lang en)
-
-Notes:
-- Casts ENUM booking status to text for Postgres comparisons.
-- Sanitizes template vars to avoid error 132018 (no newlines/tabs, collapse spaces).
-- Weekly job now messages ALL clients with wa_number, even if they have 0 bookings.
-"""
-
 from __future__ import annotations
-import logging
-import re
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Tuple
 
-from sqlalchemy import and_, cast, String
+import logging
+from datetime import datetime, timedelta, time, date
+
+from sqlalchemy import and_, func
+from sqlalchemy.orm import Session as OrmSession
 
 from .db import db_session
-from .models import Client, Booking, Session
-from . import utils, config
+from .config import TEMPLATE_LANG
+from . import utils
+from .models import Client, Session, Booking
 
 log = logging.getLogger(__name__)
 
-# ── Template names / languages (match your WhatsApp Manager setup) ───────────
-T_CLIENT_TOMORROW       = getattr(config, "CLIENT_TEMPLATE_TOMORROW", "session_tomorrow")
-T_CLIENT_TOMORROW_LANG  = getattr(config, "CLIENT_TEMPLATE_TOMORROW_LANG", "en_US")  # English (US)
-
-T_CLIENT_NEXT_HOUR      = getattr(config, "CLIENT_TEMPLATE_NEXT_HOUR", "session_next_hour")
-T_CLIENT_NEXT_HOUR_LANG = getattr(config, "CLIENT_TEMPLATE_NEXT_HOUR_LANG", "en")    # English
-
-T_CLIENT_WEEKLY         = getattr(config, "CLIENT_TEMPLATE_WEEKLY", "weekly_template_message")
-T_CLIENT_WEEKLY_LANG    = getattr(config, "CLIENT_TEMPLATE_WEEKLY_LANG", "en")       # English
-
-# ── Sanitizers (avoid WhatsApp 132018) ────────────────────────────────────────
-_SPACE_COLLAPSE = re.compile(r"\s+")
-_FIVE_SPACES_OR_MORE = re.compile(r" {5,}")
-
-def _sanitize_param(text_val: str) -> str:
-    """Remove newlines/tabs, collapse whitespace, cap at 1024 chars."""
-    if not text_val:
-        return ""
-    t = text_val.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    t = _SPACE_COLLAPSE.sub(" ", t)
-    t = _FIVE_SPACES_OR_MORE.sub("    ", t)  # max four spaces in a row
-    return t.strip()[:1024]
-
-def _join_single_line(items: List[str]) -> str:
-    """Join items with a bullet ' • ' and sanitize to a single line."""
-    flat = " • ".join([_sanitize_param(i) for i in items if i])
-    return _sanitize_param(flat)
-
-# ── Formatters ────────────────────────────────────────────────────────────────
-def _fmt_time(t) -> str:
-    try:
-        return t.strftime("%H:%M")
-    except Exception:
-        return str(t)
-
-def _fmt_weekly_item(d: date, t) -> str:
-    """e.g., 'Mon 16 Sep 09:00'."""
-    try:
-        return f"{d.strftime('%a %d %b')} {_fmt_time(t)}"
-    except Exception:
-        return f"{d} {_fmt_time(t)}"
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Night-before reminders (run ~20:00) → session_tomorrow ({{1}} = time)
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-def run_client_tomorrow() -> int:
-    tomorrow = date.today() + timedelta(days=1)
+
+def _fmt_week_item(d: date, t: time) -> str:
+    # Single-line, template-safe (no \n / \t). Example: "Mon 16 Sep 09:00"
+    return f"{d.strftime('%a %d %b')} {t.strftime('%H:%M')}"
+
+def _send_weekly_template_or_text(to_wa: str, name: str, items_list: list[str]) -> bool:
+    """
+    Use WhatsApp template 'weekly_template_message' with vars:
+      name -> client's display name
+      items -> single-line list, ' • ' separated OR 'No sessions booked this week.'
+    Fall back to plain text if template call fails for any reason.
+    """
+    items_str = " • ".join(items_list) if items_list else "No sessions booked this week."
+    # Guard: WhatsApp rejects >4 consecutive spaces / newlines; keep it tight.
+    items_str = " ".join(items_str.split())
+
     try:
-        rows: List[Tuple[str, object]] = (
-            db_session.query(Client.wa_number, Session.start_time)
-            .join(Booking, Booking.client_id == Client.id)
-            .join(Session, Booking.session_id == Session.id)
-            .filter(
-                and_(
-                    cast(Booking.status, String) == "confirmed",
-                    Session.session_date == tomorrow,
-                    Client.wa_number.isnot(None),
-                )
-            )
-            .order_by(Session.start_time)
-            .all()
+        ok, status, resp = utils.send_template(
+            to=to_wa,
+            template="weekly_template_message",
+            lang=TEMPLATE_LANG or "en",
+            variables={"name": name, "items": items_str},
         )
-
-        sent = 0
-        for wa, stime in rows:
-            res = utils.send_whatsapp_template(
-                to=wa,
-                template_name=T_CLIENT_TOMORROW,
-                lang_code=T_CLIENT_TOMORROW_LANG,
-                body_params=[_sanitize_param(_fmt_time(stime))],
-            )
-            sent += 1 if res.get("status_code", 0) > 0 else 0
-
-        log.info("[reminders:tomorrow] rows=%s sent=%s", len(rows), sent)
-        return sent
-
+        if not ok:
+            log.error("[weekly][tpl-fail] to=%s status=%s resp=%s", to_wa, status, resp)
+            # Fall back to text
+            msg = f"Hi {name}, here’s your PilatesHQ schedule for the week: {items_str}. Looking forward to seeing you!"
+            utils.send_whatsapp_text(to_wa, msg)
+            return False
+        return True
     except Exception:
-        log.exception("[reminders:tomorrow] query failed")
-        db_session.rollback()
-        raise
+        log.exception("[weekly][tpl-exc] to=%s", to_wa)
+        msg = f"Hi {name}, here’s your PilatesHQ schedule for the week: {items_str}. Looking forward to seeing you!"
+        utils.send_whatsapp_text(to_wa, msg)
+        return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1-hour reminders (run hourly) → session_next_hour ({{1}} = time)
-# ──────────────────────────────────────────────────────────────────────────────
-def run_client_next_hour() -> int:
-    now = datetime.now()
-    target = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    next_time = target.time()
-    today = date.today()
+def _send_tomorrow_template_or_text(to_wa: str, when_str: str) -> bool:
     try:
-        rows: List[Tuple[str, object]] = (
-            db_session.query(Client.wa_number, Session.start_time)
-            .join(Booking, Booking.client_id == Client.id)
-            .join(Session, Booking.session_id == Session.id)
-            .filter(
-                and_(
-                    cast(Booking.status, String) == "confirmed",
-                    Session.session_date == today,
-                    Session.start_time == next_time,
-                    Client.wa_number.isnot(None),
-                )
-            )
-            .order_by(Session.start_time)
-            .all()
+        ok, status, resp = utils.send_template(
+            to=to_wa,
+            template="session_tomorrow",
+            lang=TEMPLATE_LANG or "en",
+            variables={"1": when_str} if isinstance(when_str, str) else {"time": when_str},
         )
-
-        sent = 0
-        for wa, stime in rows:
-            res = utils.send_whatsapp_template(
-                to=wa,
-                template_name=T_CLIENT_NEXT_HOUR,
-                lang_code=T_CLIENT_NEXT_HOUR_LANG,
-                body_params=[_sanitize_param(_fmt_time(stime))],
-            )
-            sent += 1 if res.get("status_code", 0) > 0 else 0
-
-        log.info("[reminders:next-hour] time=%s rows=%s sent=%s", _fmt_time(next_time), len(rows), sent)
-        return sent
-
+        if not ok:
+            log.error("[tomorrow][tpl-fail] to=%s status=%s resp=%s", to_wa, status, resp)
+            utils.send_whatsapp_text(to_wa, f"📅 Reminder: Your Pilates session is tomorrow at {when_str}. See you there 🤸‍♀️")
+            return False
+        return True
     except Exception:
-        log.exception("[reminders:next-hour] query failed")
-        db_session.rollback()
-        raise
+        log.exception("[tomorrow][tpl-exc] to=%s", to_wa)
+        utils.send_whatsapp_text(to_wa, f"📅 Reminder: Your Pilates session is tomorrow at {when_str}. See you there 🤸‍♀️")
+        return False
+
+def _send_next_hour_template_or_text(to_wa: str, when_str: str) -> bool:
+    try:
+        ok, status, resp = utils.send_template(
+            to=to_wa,
+            template="session_next_hour",
+            lang=TEMPLATE_LANG or "en",
+            variables={"1": when_str} if isinstance(when_str, str) else {"time": when_str},
+        )
+        if not ok:
+            log.error("[next-hour][tpl-fail] to=%s status=%s resp=%s", to_wa, status, resp)
+            utils.send_whatsapp_text(to_wa, f"⏰ Reminder: Your Pilates session starts at {when_str} today. Reply CANCEL if you cannot attend.")
+            return False
+        return True
+    except Exception:
+        log.exception("[next-hour][tpl-exc] to=%s", to_wa)
+        utils.send_whatsapp_text(to_wa, f"⏰ Reminder: Your Pilates session starts at {when_str} today. Reply CANCEL if you cannot attend.")
+        return False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Weekly preview (Sun 18:00) → weekly_template_message
-# Sends to ALL clients with wa_number; if no bookings, {{2}} = "No sessions this week."
+# Public jobs (called by /tasks/run-reminders)
 # ──────────────────────────────────────────────────────────────────────────────
-def run_client_weekly() -> int:
-    start = date.today()
-    end = start + timedelta(days=7)
-    try:
-        # All clients with WhatsApp numbers (targets to send to)
-        all_clients: List[Tuple[str, str]] = (
-            db_session.query(Client.wa_number, Client.name)
+
+def run_client_weekly(window_days: int = 7) -> int:
+    """
+    NEW BEHAVIOUR: Send a weekly preview to *all clients with a WhatsApp number*.
+    - If client has 0 confirmed bookings in the window → send 'No sessions booked this week.'
+    - Uses template 'weekly_template_message' (falls back to text).
+    Returns: number of WhatsApps attempted (sent count).
+    """
+    sent = 0
+    today = datetime.now().date()
+    end_date = today + timedelta(days=max(1, window_days) - 1)
+
+    with db_session() as s:  # type: OrmSession
+        # 1) Get every client with a WA number
+        clients = (
+            s.query(Client.id, Client.name, Client.wa_number)
             .filter(Client.wa_number.isnot(None))
             .all()
         )
 
-        # Pull bookings in the window
-        rows: List[Tuple[str, str, date, object]] = (
-            db_session.query(
-                Client.wa_number,
-                Client.name,
+        if not clients:
+            log.info("[weekly] no clients with wa_number")
+            return 0
+
+        # 2) Map confirmed bookings in the next 7 days per client
+        rows = (
+            s.query(
+                Booking.client_id,
                 Session.session_date,
                 Session.start_time,
             )
-            .join(Booking, Booking.client_id == Client.id)
-            .join(Session, Booking.session_id == Session.id)
+            .join(Session, Session.id == Booking.session_id)
             .filter(
-                and_(
-                    cast(Booking.status, String) == "confirmed",
-                    Session.session_date.between(start, end),
-                    Client.wa_number.isnot(None),
-                )
+                Booking.status == "confirmed",
+                Session.session_date >= today,
+                Session.session_date <= end_date,
             )
-            .order_by(Client.wa_number, Session.session_date, Session.start_time)
             .all()
         )
 
-        # Group bookings by client wa_number
-        by_client: Dict[str, Dict[str, List[str]]] = {}
-        for wa, name, sdate, stime in rows:
-            entry = _fmt_weekly_item(sdate, stime)
-            bucket = by_client.setdefault(wa, {"name": name or "there", "items": []})
-            bucket["items"].append(entry)
+        per_client: dict[int, list[str]] = {}
+        for client_id, d, t in rows:
+            per_client.setdefault(client_id, []).append(_fmt_week_item(d, t))
 
-        # Send to every client with wa_number; fallback text if none
-        total_targets = len(all_clients)
-        with_sessions = 0
-        zero_sessions = 0
-        sent = 0
+        # 3) Send per client; include “no sessions” branch
+        for cid, name, wa in clients:
+            items = sorted(per_client.get(cid, []))
+            ok = _send_weekly_template_or_text(wa, name or "there", items)
+            sent += 1
+            log.info("[weekly][send] to=%s items=%d ok=%s", wa, len(items), ok)
 
-        for wa, name in all_clients:
-            payload = by_client.get(wa, {"name": name or "there", "items": []})
-            items = payload["items"]
-            if items:
-                with_sessions += 1
-                items_flat = _join_single_line(items)
-            else:
-                zero_sessions += 1
-                items_flat = "No sessions this week."
+    return sent
 
-            res = utils.send_whatsapp_template(
-                to=wa,
-                template_name=T_CLIENT_WEEKLY,
-                lang_code=T_CLIENT_WEEKLY_LANG,
-                body_params=[_sanitize_param(payload["name"]), _sanitize_param(items_flat)],
+
+def run_client_tomorrow() -> int:
+    """
+    Send 'tomorrow' reminders to all confirmed bookings for tomorrow.
+    Uses template 'session_tomorrow' (falls back to text).
+    """
+    sent = 0
+    tomorrow = datetime.now().date() + timedelta(days=1)
+
+    with db_session() as s:  # type: OrmSession
+        rows = (
+            s.query(
+                Client.wa_number,
+                Session.start_time,
+                Client.name,
             )
-            sent += 1 if res.get("status_code", 0) > 0 else 0
-
-        log.info(
-            "[reminders:weekly] targets=%s with_sessions=%s zero_sessions=%s sent=%s",
-            total_targets, with_sessions, zero_sessions, sent
+            .join(Booking, Booking.client_id == Client.id)
+            .join(Session, Session.id == Booking.session_id)
+            .filter(
+                Client.wa_number.isnot(None),
+                Booking.status == "confirmed",
+                Session.session_date == tomorrow,
+            )
+            .order_by(Session.start_time.asc())
+            .all()
         )
-        return sent
 
-    except Exception:
-        log.exception("[reminders:weekly] query failed")
-        db_session.rollback()
-        raise
+        for wa, start_t, name in rows:
+            when_str = start_t.strftime("%H:%M")
+            ok = _send_tomorrow_template_or_text(wa, when_str)
+            sent += 1
+            log.info("[tomorrow][send] to=%s time=%s ok=%s", wa, when_str, ok)
+
+    return sent
+
+
+def run_client_next_hour() -> int:
+    """
+    Send 'next hour' reminders to all confirmed bookings where the start_time falls within [now, now+60m].
+    Uses template 'session_next_hour' (falls back to text).
+    """
+    sent = 0
+    now = datetime.now()
+    today = now.date()
+    next_hour_dt = now + timedelta(hours=1)
+    hour_window_end = next_hour_dt.time()
+
+    with db_session() as s:  # type: OrmSession
+        # We only look at today's sessions between now.time() and +60m
+        rows = (
+            s.query(
+                Client.wa_number,
+                Session.start_time,
+                Client.name,
+            )
+            .join(Booking, Booking.client_id == Client.id)
+            .join(Session, Session.id == Booking.session_id)
+            .filter(
+                Client.wa_number.isnot(None),
+                Booking.status == "confirmed",
+                Session.session_date == today,
+                Session.start_time >= now.time(),
+                Session.start_time <= hour_window_end,
+            )
+            .order_by(Session.start_time.asc())
+            .all()
+        )
+
+        for wa, start_t, name in rows:
+            when_str = start_t.strftime("%H:%M")
+            ok = _send_next_hour_template_or_text(wa, when_str)
+            sent += 1
+            log.info("[next-hour][send] to=%s time=%s ok=%s", wa, when_str, ok)
+
+    return sent

@@ -1,127 +1,108 @@
 # app/admin_reminders.py
-"""
-Admin Reminders (template-based, aligned to your approved templates)
---------------------------------------------------------------------
-Uses:
-- admin_hourly_update ({{1}} time, {{2}} confirmed count)  [lang: en_ZA]
-- admin_20h00        ({{1}} total sessions today, {{2}} details) [lang: en_ZA]
-
-Notes:
-- Sends via templates so it works outside WhatsApp's 24h window.
-- We FORCE language to en_ZA to match your Meta templates and avoid 132001.
-"""
-
 from __future__ import annotations
-import logging
-from datetime import date, datetime, timedelta
-from typing import List, Tuple
 
-from sqlalchemy import and_, cast, String, func
+import logging
+from datetime import datetime, timedelta, time, date
+
+from sqlalchemy.orm import Session as OrmSession
 
 from .db import db_session
-from .models import Client, Booking, Session
-from . import utils, config
+from .config import ADMIN_NUMBERS, TEMPLATE_LANG
+from . import utils
+from .models import Client, Session, Booking
 
 log = logging.getLogger(__name__)
 
-# Match your template names in WhatsApp Manager
-T_ADMIN_HOURLY = getattr(config, "ADMIN_TEMPLATE_HOURLY", "admin_hourly_update")
-T_ADMIN_DAILY  = getattr(config, "ADMIN_TEMPLATE_DAILY",  "admin_20h00")
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-# IMPORTANT: Force English (South Africa) for admin templates to fix 132001
-LANG_ADMIN = "en_ZA"
+def _fmt_admin_line(d: date, t: time, client_name: str) -> str:
+    # Compact, one-line per booking (kept as text for admin template body).
+    return f"{d.strftime('%a %d %b')} {t.strftime('%H:%M')} — {client_name}"
 
+def _send_admin_hourly(next_time_str: str, confirmed_count: int) -> None:
+    for admin in ADMIN_NUMBERS:
+        ok, status, resp = utils.send_template(
+            to=admin,
+            template="admin_hourly_update",
+            lang=TEMPLATE_LANG or "en",
+            variables={"1": next_time_str, "2": str(confirmed_count)},
+        )
+        log.info("[admin-hourly][send] to=%s tpl=admin_hourly_update lang=%s status=%s ok=%s",
+                 admin, TEMPLATE_LANG or "en", status, ok)
 
-def _time_hhmm(dt_obj) -> str:
-    try:
-        return dt_obj.strftime("%H:%M")
-    except Exception:
-        return str(dt_obj)
+def _send_admin_daily_summary(today_count: int, details_text: str) -> None:
+    for admin in ADMIN_NUMBERS:
+        ok, status, resp = utils.send_template(
+            to=admin,
+            template="admin_20h00",
+            lang=TEMPLATE_LANG or "en",
+            variables={"1": str(today_count), "2": details_text or "No sessions today."},
+        )
+        if not ok:
+            # Fallback to text to ensure visibility.
+            msg = f"Number of upcoming sessions: {today_count} total. Here are the details of today’s schedule: {details_text or 'No sessions today.'} End of message."
+            utils.send_whatsapp_text(admin, msg)
+        log.info("[admin-daily][send] to=%s status=%s ok=%s", admin, status, ok)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Public jobs
+# ──────────────────────────────────────────────────────────────────────────────
 
-def run_admin_hourly() -> None:
+def run_admin_tick() -> None:
     """
-    Hourly digest:
-      {{1}} → next hour slot time (e.g., 09:00) or 'None'
-      {{2}} → confirmed booking count for that time (sum across sessions)
+    Hourly small pulse for admins:
+      - Next top-of-hour time string
+      - Current confirmed count for the next hour
     """
     now = datetime.now()
-    target = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    today = date.today()
+    next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).time()
+    next_str = next_hour.strftime("%H:%M")
+    today = now.date()
 
-    q = (
-        db_session.query(func.count(Booking.client_id))
-        .join(Session, Booking.session_id == Session.id)
-        .filter(
-            and_(
+    with db_session() as s:  # type: OrmSession
+        count = (
+            s.query(Booking)
+            .join(Session, Session.id == Booking.session_id)
+            .filter(
+                Booking.status == "confirmed",
                 Session.session_date == today,
-                Session.start_time == target.time(),
-                cast(Booking.status, String) == "confirmed",
+                Session.start_time >= now.time(),
+                Session.start_time < (now + timedelta(hours=1)).time(),
             )
-        )
-    )
-    confirmed_count = int(q.scalar() or 0)
-    time_label = _time_hhmm(target)
-
-    for admin_wa in (config.ADMIN_NUMBERS or []):
-        res = utils.send_whatsapp_template(
-            to=admin_wa,
-            template_name=T_ADMIN_HOURLY,
-            lang_code=LANG_ADMIN,  # FORCE en_ZA
-            body_params=[time_label, str(confirmed_count)],
-        )
-        log.info(
-            "[admin-hourly][send] to=%s tpl=%s lang=%s status=%s",
-            admin_wa, T_ADMIN_HOURLY, LANG_ADMIN, res.get("status_code")
+            .count()
         )
 
-    log.info("[admin-hourly] time=%s confirmed=%s admins=%s",
-             time_label, confirmed_count, len(config.ADMIN_NUMBERS))
+    _send_admin_hourly(next_str, count)
+    log.info("[admin-hourly] time=%s confirmed=%d admins=%d", next_str, count, len(ADMIN_NUMBERS))
 
 
 def run_admin_daily() -> None:
     """
-    Daily 20h00 recap:
-      {{1}} → total sessions today
-      {{2}} → details list, e.g. "- 06:00 (2)\n- 09:00 (3)"
+    20:00 daily summary for admins.
+    Always sends; when there are no sessions, 'details' clearly says so.
     """
-    today = date.today()
+    today = datetime.now().date()
 
-    rows: List[Tuple[object, int]] = (
-        db_session.query(
-            Session.start_time,
-            func.count(Booking.client_id).filter(cast(Booking.status, String) == "confirmed"),
+    with db_session() as s:  # type: OrmSession
+        rows = (
+            s.query(Session.session_date, Session.start_time, Client.name)
+            .join(Booking, Booking.session_id == Session.id)
+            .join(Client, Client.id == Booking.client_id)
+            .filter(
+                Booking.status == "confirmed",
+                Session.session_date == today,
+            )
+            .order_by(Session.start_time.asc())
+            .all()
         )
-        .outerjoin(Booking, Booking.session_id == Session.id)
-        .filter(Session.session_date == today)
-        .group_by(Session.start_time)
-        .order_by(Session.start_time)
-        .all()
-    )
 
-    total_sessions = len(rows)
-    if rows:
-        details_lines = [f"- {_time_hhmm(st)} ({cnt})" for st, cnt in rows]
-        details = "\n".join(details_lines)
+    today_count = len(rows)
+    if today_count == 0:
+        details = "No sessions today."
     else:
-        details = "No sessions scheduled."
+        details = " | ".join(_fmt_admin_line(d, t, n) for d, t, n in rows)
 
-    for admin_wa in (config.ADMIN_NUMBERS or []):
-        res = utils.send_whatsapp_template(
-            to=admin_wa,
-            template_name=T_ADMIN_DAILY,
-            lang_code=LANG_ADMIN,  # FORCE en_ZA
-            body_params=[str(total_sessions), details],
-        )
-        log.info(
-            "[admin-daily][send] to=%s tpl=%s lang=%s status=%s",
-            admin_wa, T_ADMIN_DAILY, LANG_ADMIN, res.get("status_code")
-        )
-
-    log.info("[admin-daily] total_sessions=%s admins=%s",
-             total_sessions, len(config.ADMIN_NUMBERS))
-
-
-# Back-compat alias if any code still imports run_admin_tick()
-def run_admin_tick() -> None:
-    run_admin_hourly()
+    _send_admin_daily_summary(today_count, details)
+    log.info("[admin-daily] count=%d", today_count)
