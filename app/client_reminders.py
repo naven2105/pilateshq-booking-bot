@@ -5,11 +5,12 @@ Client Reminders (template-based, aligned to approved templates)
 Uses:
 - session_tomorrow          ({{1}} = time only, lang en_US)
 - session_next_hour         ({{1}} = time only, lang en)
-- weekly_template_message   ({{1}} = name, {{2}} = single-line list, lang en)
+- weekly_template_message   ({{1}} = name, {{2}} = single-line list or 'No sessions this week.', lang en)
 
 Notes:
 - Casts ENUM booking status to text for Postgres comparisons.
 - Sanitizes template vars to avoid error 132018 (no newlines/tabs, collapse spaces).
+- Weekly job now messages ALL clients with wa_number, even if they have 0 bookings.
 """
 
 from __future__ import annotations
@@ -151,12 +152,21 @@ def run_client_next_hour() -> int:
         raise
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Weekly preview (Sun 18:00) → weekly_template_message ({{1}} name, {{2}} list)
+# Weekly preview (Sun 18:00) → weekly_template_message
+# Sends to ALL clients with wa_number; if no bookings, {{2}} = "No sessions this week."
 # ──────────────────────────────────────────────────────────────────────────────
 def run_client_weekly() -> int:
     start = date.today()
     end = start + timedelta(days=7)
     try:
+        # All clients with WhatsApp numbers (targets to send to)
+        all_clients: List[Tuple[str, str]] = (
+            db_session.query(Client.wa_number, Client.name)
+            .filter(Client.wa_number.isnot(None))
+            .all()
+        )
+
+        # Pull bookings in the window
         rows: List[Tuple[str, str, date, object]] = (
             db_session.query(
                 Client.wa_number,
@@ -177,26 +187,41 @@ def run_client_weekly() -> int:
             .all()
         )
 
-        # Group by recipient
+        # Group bookings by client wa_number
         by_client: Dict[str, Dict[str, List[str]]] = {}
         for wa, name, sdate, stime in rows:
             entry = _fmt_weekly_item(sdate, stime)
             bucket = by_client.setdefault(wa, {"name": name or "there", "items": []})
             bucket["items"].append(entry)
 
+        # Send to every client with wa_number; fallback text if none
+        total_targets = len(all_clients)
+        with_sessions = 0
+        zero_sessions = 0
         sent = 0
-        for wa, payload in by_client.items():
-            name = _sanitize_param(payload["name"])
-            items_flat = _join_single_line(payload["items"]) if payload["items"] else "No sessions in the next 7 days."
+
+        for wa, name in all_clients:
+            payload = by_client.get(wa, {"name": name or "there", "items": []})
+            items = payload["items"]
+            if items:
+                with_sessions += 1
+                items_flat = _join_single_line(items)
+            else:
+                zero_sessions += 1
+                items_flat = "No sessions this week."
+
             res = utils.send_whatsapp_template(
                 to=wa,
                 template_name=T_CLIENT_WEEKLY,
                 lang_code=T_CLIENT_WEEKLY_LANG,
-                body_params=[name, items_flat],
+                body_params=[_sanitize_param(payload["name"]), _sanitize_param(items_flat)],
             )
             sent += 1 if res.get("status_code", 0) > 0 else 0
 
-        log.info("[reminders:weekly] clients=%s sent=%s", len(by_client), sent)
+        log.info(
+            "[reminders:weekly] targets=%s with_sessions=%s zero_sessions=%s sent=%s",
+            total_targets, with_sessions, zero_sessions, sent
+        )
         return sent
 
     except Exception:
