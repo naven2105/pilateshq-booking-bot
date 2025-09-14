@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 # Lightweight Observability (read by /diag/cron-status)
 # ──────────────────────────────────────────────────────────────────────────────
 LAST_RUN: Dict[str, str] = {}        # e.g. {"admin-notify":"2025-09-14T20:00:00Z"}
-ERROR_COUNTERS: Dict[str, int] = {}  # e.g. {"wa_template": 3, "wa_text": 1}
+ERROR_COUNTERS: Dict[str, int] = {}  # e.g. {"wa_template": 3, "wa_text": 1, "wa_template_retry": 2}
 
 def _now_iso() -> str:
     # Keep it UTC + 'Z' for clarity
@@ -26,8 +26,7 @@ def _now_iso() -> str:
 
 def stamp(name: str, extra: Optional[Dict[str, Any]] = None) -> None:
     """
-    Record a 'last run' moment for a job/route, optionally merging metadata.
-    Keep it minimal to avoid memory growth.
+    Record a 'last run' moment for a job/route.
     """
     LAST_RUN[name] = _now_iso()
 
@@ -105,13 +104,32 @@ def _template_components_from_vars(variables: Dict[str, str]) -> List[Dict[str, 
     Supports numeric keys ("1","2") or arbitrary names; order matters.
     """
     params: List[Dict[str, str]] = []
-    # If keys look like "1","2","3", ensure numeric sort; else rely on insertion order.
     keys = list(variables.keys())
     if all(k.isdigit() for k in keys):
         keys = sorted(keys, key=lambda k: int(k))
     for k in keys:
         params.append({"type": "text", "text": str(variables[k])})
     return [{"type": "body", "parameters": params}]
+
+def _post_template(to_norm: str, template: str, lang_code: str, components: List[Dict[str, Any]]):
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to_norm,
+        "type": "template",
+        "template": {
+            "name": template,
+            "language": {"code": lang_code},
+            "components": components,
+        },
+    }
+    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
+    ok = 200 <= resp.status_code < 300
+    payload = {}
+    try:
+        payload = resp.json()
+    except Exception:
+        pass
+    return ok, resp.status_code, payload
 
 def send_template(
     to: str,
@@ -120,32 +138,61 @@ def send_template(
     variables: Dict[str, str],
 ) -> Tuple[bool, int, dict]:
     """
-    Sends a template message using WA Cloud API.
-    variables: dict in the order the placeholders appear, or numeric keys "1","2",...
+    Sends a template message using WA Cloud API with language fallback.
+    Tries: requested lang, then en_US, en_ZA, en (skipping duplicates).
+    Counters:
+      - wa_template_retry increments if we had to try a fallback but succeeded.
+      - wa_template increments only if ALL fallbacks fail.
     """
     to_norm = _normalize_msisdn(to)
     components = _template_components_from_vars(variables)
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to_norm,
-        "type": "template",
-        "template": {
-            "name": template,
-            "language": {"code": lang},
-            "components": components,
-        },
-    }
-    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
-    ok = 200 <= resp.status_code < 300
-    if not ok:
+
+    # Build fallback list
+    candidates = [lang]
+    for alt in ["en_US", "en_ZA", "en"]:
+        if alt not in candidates:
+            candidates.append(alt)
+
+    retry_needed = False
+    last_status = 0
+    last_payload: dict = {}
+
+    for idx, lang_code in enumerate(candidates):
+        ok, status, payload = _post_template(to_norm, template, lang_code, components)
+        if ok:
+            if idx > 0:
+                incr_error("wa_template_retry")
+                log.info("WA template recovered via fallback lang=%s name=%s to=%s", lang_code, template, to_norm)
+            return True, status, payload
+
+        # If it looks like a translation-missing error (132001), mark retry and continue
+        err_code = None
+        try:
+            err_code = payload.get("error", {}).get("code")
+        except Exception:
+            pass
+
+        if err_code == 132001:
+            retry_needed = True
+            last_status, last_payload = status, payload
+            log.warning("WA template missing in lang=%s (name=%s); trying fallback...", lang_code, template)
+            continue
+
+        # Other errors: give up immediately and count as a failure
         incr_error("wa_template")
         try:
-            log.error("WA template send failed %s: %s", resp.status_code, resp.json())
-            return False, resp.status_code, resp.json()
+            log.error("WA template send failed %s: %s", status, payload or "<non-JSON>")
         except Exception:
-            log.error("WA template send failed %s: <non-JSON body>", resp.status_code)
-            return False, resp.status_code, {"error": "non-json"}
-    return True, resp.status_code, resp.json()
+            log.error("WA template send failed %s: <non-JSON body>", status)
+        return False, status, payload or {"error": "non-json"}
+
+    # Exhausted all fallbacks
+    incr_error("wa_template")
+    if retry_needed:
+        log.error("WA template send failed after fallbacks; last_status=%s last_payload=%s", last_status, last_payload or "<non-JSON>")
+    else:
+        log.error("WA template send failed; no fallback applicable; last_status=%s last_payload=%s", last_status, last_payload or "<non-JSON>")
+    return False, last_status or 500, last_payload or {"error": "template failed after fallbacks"}
 
 def send_whatsapp_buttons(to: str, body: str, buttons: List[Dict[str, str]]) -> Tuple[bool, int, dict]:
     """
