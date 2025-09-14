@@ -10,6 +10,7 @@ Webhook entrypoint for all inbound WhatsApp messages.
 
 import logging
 from datetime import date
+from typing import Any, Dict, Optional
 from flask import Blueprint, request
 
 # Explicit imports from app
@@ -22,8 +23,14 @@ log = logging.getLogger(__name__)
 
 # --- Intent Detection (basic, replaceable with NLP later) ---
 
+GREET_WORDS = ("hi", "hello", "hey", "menu", "help", "start", "yo", "howzit", "morning", "afternoon", "evening")
+
 def detect_intent(body: str, is_admin: bool) -> str:
-    text = body.strip().lower()
+    text = (body or "").strip().lower()
+
+    # Greeting / menu
+    if any(w in text for w in GREET_WORDS):
+        return "greet"
 
     # Client queries
     if not is_admin:
@@ -85,12 +92,18 @@ def webhook():
 
         reply = handle_intent(intent, from_wa, body, is_admin)
 
-        if reply:
+        # Reply can be a string (text) or a dict(kind='buttons', text, buttons)
+        if isinstance(reply, dict) and reply.get("kind") == "buttons":
+            utils.send_whatsapp_buttons(from_wa, reply["text"], reply["buttons"])
+            return "ok", 200
+        elif isinstance(reply, str) and reply:
             utils.send_whatsapp_text(from_wa, reply)
             return "ok", 200
         else:
-            utils.send_whatsapp_text(from_wa, "❓ Sorry, I didn’t understand that. Please try again.")
-            return "unknown", 200
+            # Fallback to menu if nothing returned
+            menu = default_menu_payload(is_admin)
+            utils.send_whatsapp_buttons(from_wa, menu["text"], menu["buttons"])
+            return "ok", 200
 
     except Exception:
         log.exception("webhook failed")
@@ -99,20 +112,27 @@ def webhook():
 
 # --- Intent Handlers ---
 
-def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> str | None:
-    """Map intent → queries.py → formatters.py → response string"""
+def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> Optional[Any]:
+    """Map intent → queries.py → formatters.py → response payload"""
+
+    # --- Greeting / Menu (works for both roles) ---
+    if intent in ("greet", "unknown"):
+        return default_menu_payload(is_admin)
 
     # --- Client Intents ---
     if intent == "client_next_lesson":
-        result = queries.get_next_lesson(crud.get_client_id(from_wa))
+        cid = crud.get_client_id(from_wa)
+        result = queries.get_next_lesson(cid) if cid else None
         return formatters.format_next_lesson(result)
 
     if intent == "client_sessions_week":
-        result = queries.get_sessions_this_week(crud.get_client_id(from_wa))
+        cid = crud.get_client_id(from_wa)
+        result = queries.get_sessions_this_week(cid) if cid else []
         return formatters.format_sessions_this_week(result)
 
     if intent == "client_cancel_next":
-        success = queries.cancel_next_lesson(crud.get_client_id(from_wa))
+        cid = crud.get_client_id(from_wa)
+        success = queries.cancel_next_lesson(cid) if cid else False
         return "✅ Your next lesson was cancelled." if success else "⚠ No upcoming lesson to cancel."
 
     if intent == "client_weekly_schedule":
@@ -127,7 +147,7 @@ def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> str |
         return formatters.format_client_sessions(result, client_name)
 
     if intent == "admin_clients_for_time":
-        # Example assumes "09h00" is always mentioned
+        # Example assumes "09h00" is always mentioned (can be extended)
         result = queries.get_clients_for_time(str(date.today()), "09:00")
         return formatters.format_clients_for_time(result, "09:00", str(date.today()))
 
@@ -153,3 +173,32 @@ def handle_intent(intent: str, from_wa: str, body: str, is_admin: bool) -> str |
         return formatters.format_studio_rules(queries.get_studio_rules())
 
     return None
+
+
+# --- Menu builder (buttons) ---
+
+def default_menu_payload(is_admin: bool) -> Dict[str, Any]:
+    """
+    Build a 3-button quick menu depending on role.
+    """
+    if is_admin:
+        text = (
+            "👋 *PilatesHQ Admin*\n"
+            "Choose an option:"
+        )
+        buttons = [
+            {"id": "ADMIN_CLIENTS_TODAY", "title": "Clients today"},
+            {"id": "ADMIN_09H", "title": "Who @09:00?"},
+            {"id": "ADMIN_CANCELS", "title": "Cancellations"},
+        ]
+    else:
+        text = (
+            "👋 *Welcome to PilatesHQ!*\n"
+            "How can I help today?"
+        )
+        buttons = [
+            {"id": "CLIENT_NEXT", "title": "Next lesson"},
+            {"id": "CLIENT_WEEK", "title": "This week"},
+            {"id": "CLIENT_CANCEL", "title": "Cancel next"},
+        ]
+    return {"kind": "buttons", "text": text, "buttons": buttons}
