@@ -3,12 +3,12 @@
 Admin Reminders (template-based, aligned to your approved templates)
 --------------------------------------------------------------------
 Uses:
-- admin_hourly_update ({{1}} time, {{2}} confirmed count)
-- admin_20h00        ({{1}} total sessions today, {{2}} details list)
+- admin_hourly_update ({{1}} time, {{2}} confirmed count)  [lang: en_ZA]
+- admin_20h00        ({{1}} total sessions today, {{2}} details) [lang: en_ZA]
 
 Notes:
 - Sends via templates so it works outside WhatsApp's 24h window.
-- If there are no matching sessions, sensible defaults are used.
+- Defaults language to en_ZA (English - South Africa) to match your templates.
 """
 
 from __future__ import annotations
@@ -24,10 +24,12 @@ from . import utils, config
 
 log = logging.getLogger(__name__)
 
-# Template names / languages (match what you showed in WhatsApp Manager)
+# Template names match what you have in WhatsApp Manager
 T_ADMIN_HOURLY = getattr(config, "ADMIN_TEMPLATE_HOURLY", "admin_hourly_update")
 T_ADMIN_DAILY  = getattr(config, "ADMIN_TEMPLATE_DAILY",  "admin_20h00")
-LANG_ADMIN     = getattr(config, "ADMIN_TEMPLATE_LANG",   "en_ZA")  # your admin templates are English (ZAF)
+
+# IMPORTANT: your admin templates are English (ZAF) → en_ZA
+LANG_ADMIN = getattr(config, "ADMIN_TEMPLATE_LANG", "en_ZA")
 
 
 def _time_hhmm(dt_obj) -> str:
@@ -59,19 +61,23 @@ def run_admin_hourly() -> None:
             )
         )
     )
-
     confirmed_count = int(q.scalar() or 0)
     time_label = _time_hhmm(target)
 
-    # Broadcast to all admins via template
     for admin_wa in (config.ADMIN_NUMBERS or []):
-        utils.send_whatsapp_template(
+        res = utils.send_whatsapp_template(
             to=admin_wa,
             template_name=T_ADMIN_HOURLY,
-            lang_code=LANG_ADMIN,
+            lang_code=LANG_ADMIN,  # en_ZA
             body_params=[time_label, str(confirmed_count)],
         )
-    log.info("[admin-hourly] time=%s confirmed=%s admins=%s", time_label, confirmed_count, len(config.ADMIN_NUMBERS))
+        log.info(
+            "[admin-hourly][send] to=%s tpl=%s lang=%s status=%s",
+            admin_wa, T_ADMIN_HOURLY, LANG_ADMIN, res.get("status_code")
+        )
+
+    log.info("[admin-hourly] time=%s confirmed=%s admins=%s",
+             time_label, confirmed_count, len(config.ADMIN_NUMBERS))
 
 
 def run_admin_daily() -> None:
@@ -82,7 +88,6 @@ def run_admin_daily() -> None:
     """
     today = date.today()
 
-    # For each session today, compute confirmed count
     rows: List[Tuple[object, int]] = (
         db_session.query(
             Session.start_time,
@@ -103,10 +108,16 @@ def run_admin_daily() -> None:
         details = "No sessions scheduled."
 
     for admin_wa in (config.ADMIN_NUMBERS or []):
-        utils.send_whatsapp_template(
+        res = utils.send_whatsapp_template(
             to=admin_wa,
             template_name=T_ADMIN_DAILY,
-            lang_code=LANG_ADMIN,
+            lang_code=LANG_ADMIN,  # en_ZA
             body_params=[str(total_sessions), details],
         )
-    log.info("[admin-daily] total_sessions=%s admins=%s", total_sessions, len(config.ADMIN_NUMBERS))
+        log.info(
+            "[admin-daily][send] to=%s tpl=%s lang=%s status=%s",
+            admin_wa, T_ADMIN_DAILY, LANG_ADMIN, res.get("status_code")
+        )
+
+    log.info("[admin-daily] total_sessions=%s admins=%s",
+             total_sessions, len(config.ADMIN_NUMBERS))
