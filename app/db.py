@@ -1,20 +1,15 @@
 # app/db.py
 from __future__ import annotations
 import logging
+import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.orm import sessionmaker, scoped_session, declarative_base
 from .config import DATABASE_URL
 
 log = logging.getLogger(__name__)
 
 # ── URL normaliser: force psycopg v3 driver ───────────────────────────────────
 def _normalize_db_url(url: str) -> str:
-    """
-    Ensure SQLAlchemy uses psycopg v3 (not psycopg2).
-    - postgres://        -> postgresql+psycopg://
-    - postgresql://      -> postgresql+psycopg://
-    - postgresql+psycopg2:// -> postgresql+psycopg://
-    """
     if not url:
         return url
     u = url.strip()
@@ -42,7 +37,10 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 db_session = scoped_session(SessionLocal)
 
-# ── Preflight checks ──────────────────────────────────────────────────────────
+# ── Declarative Base (models import this) ─────────────────────────────────────
+Base = declarative_base()
+
+# ── Preflight checks (always) ─────────────────────────────────────────────────
 def _preflight_db() -> None:
     """Assert psycopg v3 is active and the DB is reachable."""
     dbapi_name = getattr(engine.dialect.dbapi, "__name__", "")
@@ -58,12 +56,11 @@ def _preflight_db() -> None:
         )
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
-        conn.execute(text("SELECT current_database()"))
     log.info("[DB] Preflight OK (driver=%s)", dbapi_name)
 
-# ── Idempotent DDL guardrails ─────────────────────────────────────────────────
+# ── Optional guardrails (only if you opt in) ──────────────────────────────────
 def _apply_guardrails() -> None:
-    """Add columns the app expects; safe to run every startup."""
+    """Add columns the app expects; only used when schema is app-managed."""
     with engine.begin() as conn:
         conn.execute(text(
             "ALTER TABLE clients ADD COLUMN IF NOT EXISTS package_type VARCHAR(16)"
@@ -73,15 +70,22 @@ def _apply_guardrails() -> None:
 # ── Public init ───────────────────────────────────────────────────────────────
 def init_db() -> None:
     """
-    Startup routine:
-    1) Apply guardrails (keeps runtime safe even before migrations run).
-    2) Preflight driver + connectivity and fail-fast if wrong.
+    Startup routine.
+    By default we DO NOT manage schema (external via psql/Render console).
+    To allow the app to manage schema in dev, set DB_MANAGE_SCHEMA=1.
     """
-    try:
-        _apply_guardrails()
-    except Exception:
-        log.exception("[DB] Guardrails failed")
-        # continue to preflight to surface driver errors too
+    manage = os.environ.get("DB_MANAGE_SCHEMA", "0").lower() in ("1", "true", "yes")
+    if manage:
+        try:
+            from . import models as _models  # noqa: F401
+            Base.metadata.create_all(bind=engine)
+            _apply_guardrails()
+            log.info("[DB] App-managed schema: create_all + guardrails done")
+        except Exception:
+            log.exception("[DB] App-managed schema failed")
+    else:
+        log.info("[DB] External schema mode: skipping create_all and guardrails")
+
     _preflight_db()
 
 def shutdown_session(exception: Exception | None = None) -> None:
