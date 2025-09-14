@@ -2,187 +2,180 @@
 from __future__ import annotations
 
 import logging
-import json
 import requests
-from typing import Any, Dict, Tuple, Optional, Iterable
+from datetime import datetime
+from typing import Dict, Tuple, Optional, List, Any
 
 from .config import (
     ACCESS_TOKEN,
     GRAPH_URL,
     ADMIN_NUMBERS,
-    USE_TEMPLATES,
-    ADMIN_TEMPLATE_NAME,
-    ADMIN_TEMPLATE_LANG,
 )
 
 log = logging.getLogger(__name__)
 
-# ── Simple in-memory error counters (per process) ─────────────────────────────
-_ERROR_COUNTERS: Dict[str, int] = {}
+# ──────────────────────────────────────────────────────────────────────────────
+# Lightweight Observability (read by /diag/cron-status)
+# ──────────────────────────────────────────────────────────────────────────────
+LAST_RUN: Dict[str, str] = {}        # e.g. {"admin-notify":"2025-09-14T20:00:00Z"}
+ERROR_COUNTERS: Dict[str, int] = {}  # e.g. {"wa_template": 3, "wa_text": 1}
 
-def _bump(key: str) -> None:
-    _ERROR_COUNTERS[key] = _ERROR_COUNTERS.get(key, 0) + 1
+def _now_iso() -> str:
+    # Keep it UTC + 'Z' for clarity
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def get_error_counters() -> Dict[str, int]:
-    return dict(_ERROR_COUNTERS)
+def stamp(name: str, extra: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Record a 'last run' moment for a job/route, optionally merging metadata.
+    Keep it minimal to avoid memory growth.
+    """
+    LAST_RUN[name] = _now_iso()
+
+def incr_error(bucket: str, inc: int = 1) -> None:
+    ERROR_COUNTERS[bucket] = ERROR_COUNTERS.get(bucket, 0) + inc
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-level HTTP
+# WhatsApp helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _headers() -> Dict[str, str]:
+def _auth_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
 
-def wa_post(payload: Dict[str, Any]) -> Tuple[bool, int, Any]:
-    """
-    POST to WhatsApp Cloud API /messages.
-    Returns (ok, status_code, response_json_or_text).
-    """
-    try:
-        resp = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=20)
-        content_type = resp.headers.get("Content-Type", "")
-        body: Any = resp.json() if "application/json" in content_type else resp.text
-        ok = 200 <= resp.status_code < 300
-        if not ok:
-            # Count by family and specific code if present
-            fam = f"wa_{resp.status_code // 100}xx"
-            _bump(fam)
-            code = None
-            if isinstance(body, dict):
-                try:
-                    code = int(body.get("error", {}).get("code"))
-                    _bump(f"wa_code_{code}")
-                except Exception:
-                    pass
-            log.error("WA send failed %s: %s", resp.status_code, body)
-        return ok, resp.status_code, body
-    except Exception as e:
-        _bump("wa_exception")
-        log.exception("wa_post failed")
-        return False, 599, str(e)
-
-def _extract_error_code(resp: Any) -> Optional[int]:
-    try:
-        return int(resp.get("error", {}).get("code"))
-    except Exception:
-        return None
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Inbound helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def extract_message(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """
-    Normalizes the incoming webhook into {'from': wa_id, 'body': text}.
-    Returns None if not a text message.
-    """
-    try:
-        entry = data["entry"][0]
-        change = entry["changes"][0]
-        value = change["value"]
-        msgs = value.get("messages")
-        if not msgs:
-            return None
-        msg = msgs[0]
-        if msg.get("type") != "text":
-            return None
-        wa_from = msg.get("from")
-        body = msg.get("text", {}).get("body", "")
-        return {"from": wa_from, "body": body}
-    except Exception:
-        _bump("webhook_parse_error")
-        log.exception("extract_message failed; data=%s", json.dumps(data, ensure_ascii=False)[:500])
-        return None
-
-def _normalize_wa(number: str) -> str:
-    return number.replace("+", "").strip() if number else number
+def _normalize_msisdn(n: str) -> str:
+    # Accepts "2773..." or "+2773..."; returns digits only (Cloud API accepts without '+')
+    return n.replace("+", "").strip()
 
 def is_admin(wa_number: str) -> bool:
-    norm = _normalize_wa(wa_number)
-    return any(_normalize_wa(a) == norm for a in ADMIN_NUMBERS)
+    me = _normalize_msisdn(wa_number)
+    admin_norm = {_normalize_msisdn(n) for n in ADMIN_NUMBERS}
+    return me in admin_norm
+
+def extract_message(payload: dict) -> Optional[Dict[str, str]]:
+    """
+    Extract a user text message from WhatsApp webhook payload.
+    Returns {"from": "<wa_id>", "body": "<text>"} or None for non-message events.
+    """
+    try:
+        entry = payload.get("entry", [])[0]
+        changes = entry.get("changes", [])[0]
+        value = changes.get("value", {})
+        # Status-only webhooks (delivery/read) have no 'messages'
+        messages = value.get("messages")
+        if not messages:
+            return None
+        msg = messages[0]
+        if msg.get("type") != "text":
+            return None
+        return {"from": msg.get("from"), "body": msg.get("text", {}).get("body", "")}
+    except Exception:
+        log.exception("extract_message failed")
+        return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Outbound helpers (with re-engagement fallback)
+# Senders
 # ──────────────────────────────────────────────────────────────────────────────
-
-def send_whatsapp_text(to: str, body: str) -> Tuple[bool, int, Any]:
+def send_whatsapp_text(to: str, body: str) -> Tuple[bool, int, dict]:
     """
-    Send freeform text. If outside the 24h window (error 131047),
-    auto-fallback to the generic template (ADMIN_TEMPLATE_NAME) placing text in {{1}}.
+    Basic text sender (inside 24h window).
     """
-    payload = {
+    to_norm = _normalize_msisdn(to)
+    data = {
         "messaging_product": "whatsapp",
-        "to": _normalize_wa(to),
+        "to": to_norm,
         "type": "text",
         "text": {"preview_url": False, "body": body},
     }
-    ok, status, resp = wa_post(payload)
-    if ok:
-        return ok, status, resp
+    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
+    ok = 200 <= resp.status_code < 300
+    if not ok:
+        incr_error("wa_text")
+        try:
+            log.error("WA send failed %s: %s", resp.status_code, resp.json())
+            return False, resp.status_code, resp.json()
+        except Exception:
+            log.error("WA send failed %s: <non-JSON body>", resp.status_code)
+            return False, resp.status_code, {"error": "non-json"}
+    return True, resp.status_code, resp.json()
 
-    code = _extract_error_code(resp) if isinstance(resp, dict) else None
-    if code == 131047 and USE_TEMPLATES:
-        tpl_name = ADMIN_TEMPLATE_NAME or "admin_update"
-        tpl_lang = ADMIN_TEMPLATE_LANG or "en"
-        log.info("[reengage] Fallback to template '%s' lang=%s for to=%s", tpl_name, tpl_lang, to)
-        tok, tstatus, tresp = send_template(
-            to=to,
-            template=tpl_name,
-            lang=tpl_lang,
-            variables={"1": body},
-        )
-        return tok, tstatus, tresp
-
-    return ok, status, resp
+def _template_components_from_vars(variables: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Convert dict of variables into WA 'parameters' list in the insertion order.
+    Supports numeric keys ("1","2") or arbitrary names; order matters.
+    """
+    params: List[Dict[str, str]] = []
+    # If keys look like "1","2","3", ensure numeric sort; else rely on insertion order.
+    keys = list(variables.keys())
+    if all(k.isdigit() for k in keys):
+        keys = sorted(keys, key=lambda k: int(k))
+    for k in keys:
+        params.append({"type": "text", "text": str(variables[k])})
+    return [{"type": "body", "parameters": params}]
 
 def send_template(
     to: str,
     template: str,
     lang: str,
-    variables: Optional[Dict[str, Any]] = None,
-) -> Tuple[bool, int, Any]:
-    params: list[Dict[str, Any]] = []
-    if variables:
-        keys = list(variables.keys())
-        if all(isinstance(k, str) and k.isdigit() for k in keys):
-            for k in sorted(keys, key=lambda x: int(x)):
-                params.append({"type": "text", "text": str(variables[k])})
-        elif set(keys) == {"name", "items"}:
-            for k in ("name", "items"):
-                params.append({"type": "text", "text": str(variables[k])})
-        else:
-            for k in keys:
-                params.append({"type": "text", "text": str(variables[k])})
-
-    payload = {
+    variables: Dict[str, str],
+) -> Tuple[bool, int, dict]:
+    """
+    Sends a template message using WA Cloud API.
+    variables: dict in the order the placeholders appear, or numeric keys "1","2",...
+    """
+    to_norm = _normalize_msisdn(to)
+    components = _template_components_from_vars(variables)
+    data = {
         "messaging_product": "whatsapp",
-        "to": _normalize_wa(to),
+        "to": to_norm,
         "type": "template",
         "template": {
             "name": template,
             "language": {"code": lang},
-            "components": [{"type": "body", "parameters": params}],
+            "components": components,
         },
     }
-    return wa_post(payload)
+    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
+    ok = 200 <= resp.status_code < 300
+    if not ok:
+        incr_error("wa_template")
+        try:
+            log.error("WA template send failed %s: %s", resp.status_code, resp.json())
+            return False, resp.status_code, resp.json()
+        except Exception:
+            log.error("WA template send failed %s: <non-JSON body>", resp.status_code)
+            return False, resp.status_code, {"error": "non-json"}
+    return True, resp.status_code, resp.json()
 
-def send_whatsapp_buttons(
-    to: str,
-    body_text: str,
-    buttons: Iterable[tuple[str, str]],
-) -> Tuple[bool, int, Any]:
-    btns = [{"type": "reply", "reply": {"id": bid, "title": title}} for bid, title in buttons]
-    payload = {
+def send_whatsapp_buttons(to: str, body: str, buttons: List[Dict[str, str]]) -> Tuple[bool, int, dict]:
+    """
+    Optional: interactive buttons (reply buttons).
+    buttons = [{"id":"next_lesson","title":"Next lesson"}, ...]
+    """
+    to_norm = _normalize_msisdn(to)
+    data = {
         "messaging_product": "whatsapp",
-        "to": _normalize_wa(to),
+        "to": to_norm,
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": body_text},
-            "action": {"buttons": btns[:3]},
+            "body": {"text": body},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                    for b in buttons
+                ]
+            },
         },
     }
-    return wa_post(payload)
+    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
+    ok = 200 <= resp.status_code < 300
+    if not ok:
+        incr_error("wa_buttons")
+        try:
+            log.error("WA buttons failed %s: %s", resp.status_code, resp.json())
+            return False, resp.status_code, resp.json()
+        except Exception:
+            log.error("WA buttons failed %s: <non-JSON body>", resp.status_code)
+            return False, resp.status_code, {"error": "non-json"}
+    return True, resp.status_code, resp.json()
