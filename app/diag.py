@@ -1,23 +1,49 @@
 # app/diag.py
 from __future__ import annotations
+
 import logging
-from datetime import datetime, date, time, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta, time
+from typing import Dict, List, Tuple
 
 from flask import Blueprint, jsonify, request
+from sqlalchemy import text
 from sqlalchemy.orm import Session as OrmSession
 
 from .db import db_session
 from .models import Client, Session, Booking
 from . import utils
 from .config import TEMPLATE_LANG
-from .tasks import LAST_RUN  # in-memory cron audit
 
-diag_bp = Blueprint("diag", __name__)
 log = logging.getLogger(__name__)
+diag_bp = Blueprint("diag", __name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Basic health
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fmt_hhmm(t: time) -> str:
+    return t.strftime("%H:%M")
+
+def _lang_candidates(preferred: str | None) -> List[str]:
+    # Try env first, then safe fallbacks commonly used with WA templates
+    cand = [x for x in [preferred, "en", "en_US", "en_ZA"] if x]
+    seen, out = set(), []
+    for c in cand:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+def _send_template_with_fallback(to: str, template: str, variables: Dict[str, str], preferred_lang: str | None):
+    for lang in _lang_candidates(preferred_lang):
+        ok, status, resp = utils.send_template(to=to, template=template, lang=lang, variables=variables)
+        log.info("[diag tpl-send] to=%s tpl=%s lang=%s status=%s ok=%s", to, template, lang, status, ok)
+        if ok:
+            return ok, status, resp, lang
+    return False, 0, {"error": "all language attempts failed"}, None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Root + DB test + Cron status
 # ──────────────────────────────────────────────────────────────────────────────
 
 @diag_bp.get("/")
@@ -27,26 +53,25 @@ def root():
 @diag_bp.get("/diag/db-test")
 def db_test():
     try:
-        with db_session() as s:
-            s.execute("SELECT 1")
-        return jsonify({"ok": True, "result": 1}), 200
-    except Exception as e:
+        with db_session() as s:  # type: OrmSession
+            # SQLAlchemy 2.x requires text() for textual SQL
+            val = s.execute(text("SELECT 1")).scalar_one()
+            return jsonify({"ok": True, "result": int(val)})
+    except Exception:
         log.exception("db-test failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Cron / WA observability
-# ──────────────────────────────────────────────────────────────────────────────
+        return "error", 500
 
 @diag_bp.get("/diag/cron-status")
 def cron_status():
-    """Expose last-run info and simple WA/API error counters (per process)."""
+    # Best-effort: read counters/timestamps if utils/tasks expose them; otherwise default
+    last_run = getattr(utils, "LAST_RUN", {})
+    error_counters = getattr(utils, "ERROR_COUNTERS", {})
     return jsonify({
+        "ok": True,
         "server_time": datetime.now().isoformat(timespec="seconds"),
-        "timezone_hint": "Africa/Johannesburg (Render cron uses UTC)",
-        "last_run": LAST_RUN,
-        "error_counters": utils.get_error_counters(),
-    }), 200
+        "last_run": last_run,
+        "error_counters": error_counters,
+    })
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Template smoke tests
@@ -55,221 +80,232 @@ def cron_status():
 @diag_bp.post("/diag/test-client-template")
 def test_client_template():
     """
-    Send 'session_tomorrow' template to a number for a given time.
-    Example:
-      POST /diag/test-client-template?to=2773...&time=09:00
+    Smoke test for 'session_tomorrow' template with language fallback.
+    Params: to=MSISDN, time=HH:MM
     """
     to = request.args.get("to", "").strip()
-    when = request.args.get("time", "09:00").strip()
-    lang = TEMPLATE_LANG or "en"
-    ok, status, resp = utils.send_template(
+    hhmm = request.args.get("time", "09:00").strip()
+    ok, status, resp, lang = _send_template_with_fallback(
         to=to,
         template="session_tomorrow",
-        lang=lang,
-        variables={"1": when},
+        variables={"1": hhmm},
+        preferred_lang=TEMPLATE_LANG,
     )
+    code = 200 if ok else 500
     return jsonify({
         "ok": ok,
         "status_code": status,
         "response": resp,
         "to": to,
         "template": "session_tomorrow",
-        "lang": lang,
-    }), 200 if ok else 500
+        "lang": lang or TEMPLATE_LANG or "en",
+    }), code
 
 @diag_bp.post("/diag/test-weekly-template")
 def test_weekly_template():
     """
-    Send 'weekly_template_message' with name + items (semicolon separated).
-    Example:
-      POST /diag/test-weekly-template?to=2773...&name=Test&items=Mon%2016%20Sep%2009:00;Wed%2017%20Sep%2007:00
+    Smoke test for 'weekly_template_message'.
+    Params: to=MSISDN, name=..., items="Mon 15 Sep 09:00;Tue 16 Sep 07:00"
+    We convert ';' separated items into a single Meta-safe string joined with ' • '.
     """
     to = request.args.get("to", "").strip()
     name = request.args.get("name", "there").strip()
-    items_raw = request.args.get("items", "").strip()
-    items_list = [x.strip() for x in items_raw.split(";") if x.strip()]
-    # One line; Meta rejects newlines / >4 spaces. Use bullet separator.
-    items_str = " • ".join(items_list) if items_list else "No sessions booked this week."
-    items_str = " ".join(items_str.split())
-    lang = (TEMPLATE_LANG or "en").replace("_US", "")  # allow "en" or "en_ZA"
+    items = request.args.get("items", "").strip()
+    if ";" in items:
+        parts = [p.strip() for p in items.split(";") if p.strip()]
+        items_str = " • ".join(parts)
+    else:
+        items_str = items
 
-    ok, status, resp = utils.send_template(
+    # Meta-safe: collapse whitespace
+    items_str = " ".join(items_str.split())
+    name_str = " ".join(name.split())
+
+    ok, status, resp, lang = _send_template_with_fallback(
         to=to,
         template="weekly_template_message",
-        lang=lang,
-        variables={"name": name, "items": items_str},
+        variables={"name": name_str, "items": items_str},
+        preferred_lang=TEMPLATE_LANG,
     )
+    code = 200 if ok else 500
     return jsonify({
         "ok": ok,
         "status_code": status,
         "response": resp,
         "to": to,
         "template": "weekly_template_message",
-        "lang": lang,
-        "vars": {"name": name, "items": items_str},
-    }), 200 if ok else 500
+        "lang": lang or TEMPLATE_LANG or "en",
+        "vars": {"name": name_str, "items": items_str},
+    }), code
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Weekly dry-run (no sends) for a preview window
+# Weekly dry-run (no sends): see which bookings would be messaged
 # ──────────────────────────────────────────────────────────────────────────────
 
 @diag_bp.get("/diag/weekly-dry-run")
 def weekly_dry_run():
-    """
-    Preview bookings that *would* be messaged in the next N days.
-    Params:
-      days=7
-      status_in=confirmed (comma-separated if multiple)
-      include_null_wa=0/1 (include clients without WhatsApp number)
-    """
     try:
-        days = int(request.args.get("days", "7"))
-    except ValueError:
-        days = 7
-    status_in = [x.strip() for x in request.args.get("status_in", "confirmed").split(",") if x.strip()]
-    include_null_wa = request.args.get("include_null_wa", "0") in ("1", "true", "True")
+        window_days = int(request.args.get("days", "7"))
+        status_in = request.args.get("status_in", "confirmed").split(",")
+        include_null_wa = request.args.get("include_null_wa", "0") in ("1", "true", "True")
 
-    start = date.today()
-    end = start + timedelta(days=max(1, days) - 1)
+        start = date.today()
+        end = start + timedelta(days=max(1, window_days) - 1)
 
-    with db_session() as s:  # type: OrmSession
-        q = (
-            s.query(
-                Client.id.label("client_id"),
-                Client.name.label("client_name"),
-                Client.wa_number.label("wa_number"),
-                Session.session_date,
-                Session.start_time,
-                Booking.status.label("booking_status"),
+        with db_session() as s:
+            q = (
+                s.query(
+                    Client.id.label("client_id"),
+                    Client.name.label("client_name"),
+                    Client.wa_number.label("wa_number"),
+                    Booking.status.label("booking_status"),
+                    Session.session_date.label("session_date"),
+                    Session.start_time.label("start_time"),
+                )
+                .join(Booking, Booking.client_id == Client.id)
+                .join(Session, Session.id == Booking.session_id)
+                .filter(
+                    Booking.status.in_(status_in),
+                    Session.session_date >= start,
+                    Session.session_date <= end,
+                )
+                .order_by(Session.session_date.asc(), Session.start_time.asc())
             )
-            .join(Booking, Booking.client_id == Client.id)
-            .join(Session, Session.id == Booking.session_id)
-            .filter(
-                Booking.status.in_(status_in),
-                Session.session_date >= start,
-                Session.session_date <= end,
-            )
-            .order_by(Session.session_date.asc(), Session.start_time.asc())
-        )
-        rows = q.all()
+            rows = q.all()
 
-    sample = []
-    with_wa = 0
-    without_wa = 0
-    for r in rows:
-        has_wa = bool(r.wa_number)
-        with_wa += 1 if has_wa else 0
-        without_wa += 0 if has_wa else 1
-        would_send = has_wa or include_null_wa
-        sample.append({
-            "client_id": r.client_id,
-            "client_name": r.client_name,
-            "wa_number": r.wa_number,
-            "session_date": r.session_date.isoformat(),
-            "start_time": str(r.start_time),
-            "booking_status": r.booking_status,
-            "would_send": would_send,
-        })
-    return jsonify({
-        "ok": True,
-        "window_days": days,
-        "status_in": status_in,
-        "include_null_wa": include_null_wa,
-        "total_matches": len(rows),
-        "with_wa_number": with_wa,
-        "without_wa_number": without_wa,
-        "sample_first_100": sample[:100],
-    }), 200
+            sample = []
+            with_wa = 0
+            without_wa = 0
+            for r in rows:
+                has_wa = bool(r.wa_number)
+                with_wa += 1 if has_wa else 0
+                without_wa += 0 if has_wa else 1
+                if include_null_wa or has_wa:
+                    sample.append({
+                        "client_id": r.client_id,
+                        "client_name": r.client_name,
+                        "wa_number": r.wa_number,
+                        "booking_status": r.booking_status,
+                        "session_date": str(r.session_date),
+                        "start_time": str(r.start_time),
+                        "would_send": has_wa,
+                    })
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Demo seeding (creates client + two sessions + bookings)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _parse_hhmm(s: str) -> time:
-    try:
-        return datetime.strptime(s, "%H:%M").time()
+            return jsonify({
+                "ok": True,
+                "window_days": window_days,
+                "status_in": status_in,
+                "include_null_wa": include_null_wa,
+                "total_matches": len(rows),
+                "with_wa_number": with_wa,
+                "without_wa_number": without_wa,
+                "sample_first_100": sample[:100],
+            })
     except Exception:
-        return time(9, 0)
+        log.exception("weekly-dry-run failed")
+        return "error", 500
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Seed demo data: upsert client + two sessions + bookings
+# ──────────────────────────────────────────────────────────────────────────────
 
 @diag_bp.post("/diag/seed-demo")
 def seed_demo():
     """
-    Create a demo client and two bookings on the next two days.
-    Params:
-      wa=27735534607
-      name=Test
-      t1=09:00
-      t2=07:00
+    Seed a single client and two sessions on the next two days:
+      /diag/seed-demo?wa=2773...&name=Test&t1=09:00&t2=07:00
     """
-    wa = (request.args.get("wa") or "").strip()
-    name = (request.args.get("name") or "Guest").strip()
-    t1 = _parse_hhmm(request.args.get("t1", "09:00"))
-    t2 = _parse_hhmm(request.args.get("t2", "07:00"))
-
     try:
+        wa = (request.args.get("wa") or "").strip()
+        nm = (request.args.get("name") or "Test").strip()
+        t1 = (request.args.get("t1") or "09:00").strip()
+        t2 = (request.args.get("t2") or "07:00").strip()
+
+        d1 = date.today() + timedelta(days=1)
+        d2 = d1 + timedelta(days=1)
+
+        def parse_hhmm(s: str) -> time:
+            hh, mm = s.split(":")
+            return time(hour=int(hh), minute=int(mm))
+
         with db_session() as s:  # type: OrmSession
-            # Upsert client
-            client = (
-                s.query(Client)
-                .filter(Client.wa_number == wa)
+            # Upsert client by wa_number
+            c = s.query(Client).filter(Client.wa_number == wa).first()
+            if not c:
+                c = Client(name=nm, wa_number=wa)
+                s.add(c)
+                s.flush()
+            else:
+                c.name = nm
+
+            # Ensure two sessions exist (by date/time)
+            sess1 = (
+                s.query(Session)
+                .filter(Session.session_date == d1, Session.start_time == parse_hhmm(t1))
                 .first()
             )
-            if not client:
-                client = Client(name=name, wa_number=wa)
-                s.add(client)
+            if not sess1:
+                sess1 = Session(
+                    session_date=d1,
+                    start_time=parse_hhmm(t1),
+                    capacity=6,
+                    booked_count=0,
+                    status="open",
+                )
+                s.add(sess1)
                 s.flush()
 
-            # Create sessions for tomorrow and the day after
-            d1 = date.today() + timedelta(days=1)
-            d2 = date.today() + timedelta(days=2)
-
-            def get_or_create_session(d: date, tt: time) -> Session:
-                sess = (
-                    s.query(Session)
-                    .filter(Session.session_date == d, Session.start_time == tt)
-                    .first()
+            sess2 = (
+                s.query(Session)
+                .filter(Session.session_date == d2, Session.start_time == parse_hhmm(t2))
+                .first()
+            )
+            if not sess2:
+                sess2 = Session(
+                    session_date=d2,
+                    start_time=parse_hhmm(t2),
+                    capacity=6,
+                    booked_count=0,
+                    status="open",
                 )
-                if not sess:
-                    sess = Session(
-                        session_date=d,
-                        start_time=tt,
-                        capacity=8,
-                        booked_count=0,
-                        status="open",
-                    )
-                    s.add(sess)
-                    s.flush()
-                return sess
+                s.add(sess2)
+                s.flush()
 
-            s1 = get_or_create_session(d1, t1)
-            s2 = get_or_create_session(d2, t2)
+            # Create (or ensure) bookings for client
+            b1 = (
+                s.query(Booking)
+                .filter(Booking.client_id == c.id, Booking.session_id == sess1.id)
+                .first()
+            )
+            if not b1:
+                b1 = Booking(client_id=c.id, session_id=sess1.id, status="confirmed")
+                s.add(b1)
+                sess1.booked_count = (sess1.booked_count or 0) + 1
 
-            # Create bookings if not exist; increment booked_count
-            created = []
-            for sess in (s1, s2):
-                bk = (
-                    s.query(Booking)
-                    .filter(Booking.client_id == client.id, Booking.session_id == sess.id)
-                    .first()
-                )
-                if not bk:
-                    bk = Booking(client_id=client.id, session_id=sess.id, status="confirmed")
-                    s.add(bk)
-                    sess.booked_count = (sess.booked_count or 0) + 1
-                    created.append({"session_id": sess.id, "status": "confirmed"})
+            b2 = (
+                s.query(Booking)
+                .filter(Booking.client_id == c.id, Booking.session_id == sess2.id)
+                .first()
+            )
+            if not b2:
+                b2 = Booking(client_id=c.id, session_id=sess2.id, status="confirmed")
+                s.add(b2)
+                sess2.booked_count = (sess2.booked_count or 0) + 1
 
-            s.commit()
+            s.flush()
 
             return jsonify({
                 "ok": True,
-                "client": {"id": client.id, "name": client.name, "wa_number": client.wa_number},
+                "client": {"id": c.id, "name": c.name, "wa_number": c.wa_number},
                 "sessions_created": [
-                    {"id": s1.id, "date": s1.session_date.isoformat(), "time": s1.start_time.strftime("%H:%M")},
-                    {"id": s2.id, "date": s2.session_date.isoformat(), "time": s2.start_time.strftime("%H:%M")},
+                    {"id": sess1.id, "date": str(sess1.session_date), "time": _fmt_hhmm(sess1.start_time)},
+                    {"id": sess2.id, "date": str(sess2.session_date), "time": _fmt_hhmm(sess2.start_time)},
                 ],
-                "bookings": created,
-            }), 200
-
+                "bookings": [
+                    {"session_id": sess1.id, "status": "confirmed"},
+                    {"session_id": sess2.id, "status": "confirmed"},
+                ],
+            })
     except Exception as e:
         log.exception("seed_demo failed")
         return jsonify({"ok": False, "error": str(e)}), 500
