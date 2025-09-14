@@ -1,124 +1,218 @@
 # app/queries.py
-"""
-Queries Module
---------------
-Business-facing query functions used by router.py.
-Delegates data access to crud.py and reads some static values from config.py.
-"""
-
 from __future__ import annotations
-from datetime import datetime
-from typing import List, Dict, Optional
 
-from . import crud
-from . import config
+import logging
+from datetime import datetime, timedelta, date, time
+from typing import List, Optional, Tuple
+
+from sqlalchemy import and_, func, select
+from sqlalchemy.orm import Session as OrmSession
+
+from .db import db_session
+from .models import Client, Session, Booking
+
+log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Booking Management (Clients)
+# Client-facing queries
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_next_lesson(client_id: int) -> Optional[Dict]:
-    """Return the next confirmed lesson for a client."""
-    return crud.get_next_lesson(client_id)
+def get_next_lesson(client_id: int) -> Optional[Tuple[date, time]]:
+    """Return the next confirmed booking for the client (date, time), or None."""
+    now = datetime.now()
+    today = now.date()
+    with db_session() as s:  # type: OrmSession
+        row = (
+            s.query(Session.session_date, Session.start_time)
+            .join(Booking, Booking.session_id == Session.id)
+            .filter(
+                Booking.client_id == client_id,
+                Booking.status == "confirmed",
+                # either later today, or any future date
+                ((Session.session_date == today) & (Session.start_time >= now.time()))
+                | (Session.session_date > today),
+            )
+            .order_by(Session.session_date.asc(), Session.start_time.asc())
+            .first()
+        )
+        return row if row else None
 
 
-def get_sessions_this_week(client_id: int) -> List[Dict]:
-    """Return all confirmed sessions for a client in the current week."""
-    return crud.get_sessions_this_week(client_id)
+def get_sessions_this_week(client_id: int, window_days: int = 7) -> List[Tuple[date, time]]:
+    """Return a list of (date, time) for confirmed bookings in the next N days."""
+    start = datetime.now().date()
+    end = start + timedelta(days=max(1, window_days) - 1)
+    with db_session() as s:
+        rows = (
+            s.query(Session.session_date, Session.start_time)
+            .join(Booking, Booking.session_id == Session.id)
+            .filter(
+                Booking.client_id == client_id,
+                Booking.status == "confirmed",
+                Session.session_date >= start,
+                Session.session_date <= end,
+            )
+            .order_by(Session.session_date.asc(), Session.start_time.asc())
+            .all()
+        )
+        return rows
 
 
 def cancel_next_lesson(client_id: int) -> bool:
-    """Cancel the client’s next confirmed lesson. Return True if updated."""
-    return crud.cancel_next_lesson(client_id)
+    """
+    Cancel the client's next confirmed session and decrement the session.booked_count
+    (bounded at 0). Returns True if a booking was cancelled.
+    """
+    now = datetime.now()
+    today = now.date()
+    with db_session() as s:
+        # Find the next confirmed booking (FOR UPDATE to avoid race on the same row)
+        nxt = (
+            s.query(Booking.id, Booking.session_id, Session.session_date, Session.start_time)
+            .join(Session, Session.id == Booking.session_id)
+            .filter(
+                Booking.client_id == client_id,
+                Booking.status == "confirmed",
+                ((Session.session_date == today) & (Session.start_time >= now.time()))
+                | (Session.session_date > today),
+            )
+            .order_by(Session.session_date.asc(), Session.start_time.asc())
+            .with_for_update(skip_locked=True)
+            .first()
+        )
+        if not nxt:
+            return False
+
+        booking_id, session_id, _, _ = nxt
+
+        # Mark booking cancelled
+        s.query(Booking).filter(Booking.id == booking_id).update({"status": "cancelled"})
+
+        # Decrement session.booked_count safely
+        sess = s.query(Session).filter(Session.id == session_id).with_for_update().one()
+        new_count = max(0, (sess.booked_count or 0) - 1)
+        sess.booked_count = new_count
+
+        s.commit()
+        log.info("[cancel-next] client_id=%s session_id=%s booked_count->%s", client_id, session_id, new_count)
+        return True
 
 
-def get_weekly_schedule() -> List[Dict]:
-    """Return all sessions for the coming week."""
-    return crud.get_weekly_schedule()
+def get_weekly_schedule() -> List[Tuple[date, time, str]]:
+    """
+    Generic weekly schedule preview (all confirmed bookings, next 7 days).
+    Returns list of (date, time, client_name).
+    """
+    start = datetime.now().date()
+    end = start + timedelta(days=6)
+    with db_session() as s:
+        rows = (
+            s.query(Session.session_date, Session.start_time, Client.name)
+            .join(Booking, Booking.session_id == Session.id)
+            .join(Client, Client.id == Booking.client_id)
+            .filter(
+                Booking.status == "confirmed",
+                Session.session_date >= start,
+                Session.session_date <= end,
+            )
+            .order_by(Session.session_date.asc(), Session.start_time.asc())
+            .all()
+        )
+        return rows
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Attendance & Participation
+# Admin-facing queries
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_session_attendees(session_id: int) -> List[str]:
-    """Return the list of client names attending a specific session."""
-    return crud.get_session_attendees(session_id)
+def get_client_sessions(client_name: str) -> List[Tuple[date, time]]:
+    """Admin: list all upcoming confirmed sessions for a client name (fuzzy case-insensitive)."""
+    today = datetime.now().date()
+    qname = (client_name or "").strip()
+    if not qname:
+        return []
+    with db_session() as s:
+        rows = (
+            s.query(Session.session_date, Session.start_time)
+            .join(Booking, Booking.session_id == Session.id)
+            .join(Client, Client.id == Booking.client_id)
+            .filter(
+                Booking.status == "confirmed",
+                Session.session_date >= today,
+                func.lower(Client.name).like(f"%{qname.lower()}%"),
+            )
+            .order_by(Session.session_date.asc(), Session.start_time.asc())
+            .all()
+        )
+        return rows
 
 
-def get_lessons_left_this_month(client_id: int) -> int:
-    """Return the number of confirmed lessons for a client in the current month."""
-    return crud.get_lessons_left_this_month(client_id)
-
-
-def get_clients_for_time(date_str: str, time_str: str) -> List[str]:
-    """Return names of clients booked for a given date and time."""
-    return crud.get_clients_for_time(date_str, time_str)
-
-
-def get_clients_today() -> int:
-    """Return the count of clients booked for today."""
-    return crud.get_clients_today()
-
-
-def get_cancellations_today() -> List[Dict]:
-    """Return all cancellations for today with client and session info."""
-    return crud.get_cancellations_today()
-
-
-def get_clients_without_bookings_this_week() -> List[str]:
-    """Return names of clients who have no confirmed bookings this week."""
-    return crud.get_clients_without_bookings_this_week()
-
-
-def get_weekly_recap() -> List[Dict]:
-    """Return all sessions from the past 7 days with attendance counts."""
-    return crud.get_weekly_recap()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Client Lookup (Admin)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_client_sessions(client_name: str) -> List[Dict]:
-    """Return confirmed sessions for a given client by name."""
-    return crud.get_client_sessions(client_name)
-
-
-def get_hours_until_next_lesson(client_id: int) -> float:
-    """Return hours until the client’s next confirmed session today."""
-    return crud.get_hours_until_next_lesson(client_id)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Pricing & Services
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_service_price(service_name: str) -> float:
-    """Return price for a given service (e.g., 'Reformer Duo')."""
+def get_clients_for_time(date_str: str, hhmm: str) -> List[str]:
+    """Admin: list client names booked for a given date (YYYY-MM-DD) and time (HH:MM)."""
     try:
-        return float(crud.get_service_price(service_name) or 0.0)
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
     except Exception:
-        return 0.0
+        d = datetime.now().date()
+    try:
+        t = datetime.strptime(hhmm, "%H:%M").time()
+    except Exception:
+        t = time(9, 0)
+    with db_session() as s:
+        rows = (
+            s.query(Client.name)
+            .join(Booking, Booking.client_id == Client.id)
+            .join(Session, Session.id == Booking.session_id)
+            .filter(
+                Booking.status == "confirmed",
+                Session.session_date == d,
+                Session.start_time == t,
+            )
+            .order_by(Client.name.asc())
+            .all()
+        )
+        return [r[0] for r in rows]
+
+
+def get_clients_today() -> List[Tuple[time, str]]:
+    """Admin: list (time, client_name) for today's confirmed sessions."""
+    today = datetime.now().date()
+    with db_session() as s:
+        rows = (
+            s.query(Session.start_time, Client.name)
+            .join(Booking, Booking.session_id == Session.id)
+            .join(Client, Client.id == Booking.client_id)
+            .filter(Booking.status == "confirmed", Session.session_date == today)
+            .order_by(Session.start_time.asc(), Client.name.asc())
+            .all()
+        )
+        return rows
+
+
+def get_cancellations_today() -> List[Tuple[time, str]]:
+    """Admin: list (time, client_name) for today's cancellations."""
+    today = datetime.now().date()
+    with db_session() as s:
+        rows = (
+            s.query(Session.start_time, Client.name)
+            .join(Booking, Booking.session_id == Session.id)
+            .join(Client, Client.id == Booking.client_id)
+            .filter(Booking.status == "cancelled", Session.session_date == today)
+            .order_by(Session.start_time.asc(), Client.name.asc())
+            .all()
+        )
+        return rows
 
 # ──────────────────────────────────────────────────────────────────────────────
-# General Information (no DB)
+# Simple info helpers (anyone)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_today_date() -> str:
-    """Return today’s date as string (yyyy-mm-dd)."""
-    return datetime.today().strftime("%Y-%m-%d")
-
+    return datetime.now().strftime("%A, %d %B %Y")
 
 def get_current_time() -> str:
-    """Return the current system time as string (HH:MM)."""
     return datetime.now().strftime("%H:%M")
 
-
 def get_studio_address() -> str:
-    """Return the studio’s address from config (fallback to known address)."""
-    addr = getattr(config, "STUDIO_ADDRESS", "").strip()
-    return addr or "106 Wilmington Crescent, Lyndhurst"
-
+    return "PilatesHQ Studio, 123 Main Rd, Cape Town"
 
 def get_studio_rules() -> str:
-    """Return the studio’s rules from config or a sensible default."""
-    rules = getattr(config, "STUDIO_RULES", "").strip()
-    return rules or "Please arrive 5 min early, wear socks, and cancel at least 12 hours in advance."
+    return "Please arrive 5 minutes early; bring a towel; cancellations within 12 hours may be charged."

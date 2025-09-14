@@ -1,118 +1,34 @@
 # app/utils.py
-"""
-Utilities for WhatsApp Cloud API + routing helpers.
-- extract_message(payload): parse inbound webhook JSON into a simple dict
-- send_whatsapp_text(to, text): send plain text messages
-- send_whatsapp_buttons(to, text, buttons): send interactive reply buttons
-- send_whatsapp_template(to, template_name, lang_code, body_params): HSM/template sender
-- send_admin_update(to_or_list, text): convenience wrapper for admin updates (uses template)
-- is_admin(wa_number): check if a WA ID is an admin
-"""
-
 from __future__ import annotations
-import logging
-import requests
-from typing import Any, Dict, List, Optional, Union
 
-from . import config
+import logging
+import json
+import requests
+from typing import Any, Dict, Tuple, Optional, Iterable
+
+from .config import (
+    ACCESS_TOKEN,
+    GRAPH_URL,
+    ADMIN_NUMBERS,
+    USE_TEMPLATES,
+    ADMIN_TEMPLATE_NAME,
+    ADMIN_TEMPLATE_LANG,
+)
 
 log = logging.getLogger(__name__)
 
-# --- Config / constants -------------------------------------------------------
+# ── Simple in-memory error counters (per process) ─────────────────────────────
+_ERROR_COUNTERS: Dict[str, int] = {}
 
-ACCESS_TOKEN: str = config.ACCESS_TOKEN
-PHONE_NUMBER_ID: str = config.PHONE_NUMBER_ID
-GRAPH_URL: str = config.GRAPH_URL  # e.g. https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages
+def _bump(key: str) -> None:
+    _ERROR_COUNTERS[key] = _ERROR_COUNTERS.get(key, 0) + 1
 
-# Admin numbers: keep legacy single-admin alias for older code
-ADMIN_NUMBERS: List[str] = config.ADMIN_NUMBERS or []
-ADMIN_NUMBER: str = ADMIN_NUMBERS[0] if ADMIN_NUMBERS else ""
+def get_error_counters() -> Dict[str, int]:
+    return dict(_ERROR_COUNTERS)
 
-ADMIN_TEMPLATE_NAME: str = getattr(config, "ADMIN_TEMPLATE_NAME", "admin_update")
-ADMIN_TEMPLATE_LANG: str = getattr(config, "ADMIN_TEMPLATE_LANG", "en")
-USE_TEMPLATES: bool = bool(getattr(config, "USE_TEMPLATES", False))
-
-# --- Helpers ------------------------------------------------------------------
-
-def is_admin(wa_number: str) -> bool:
-    """Return True if the WA number is configured as an admin."""
-    return (wa_number or "").strip() in ADMIN_NUMBERS
-
-
-def extract_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Normalise WhatsApp webhook payload into:
-      {
-        "from": "<wa_id>",
-        "id": "<message_id>",
-        "type": "<text|interactive|button|other>",
-        "body": "<text or button title>",
-        "btn_id": "<reply id>" (optional),
-      }
-    Returns None if no message found (e.g., status updates only).
-    """
-    try:
-        if not payload or "entry" not in payload:
-            return None
-
-        entries = payload.get("entry", [])
-        if not entries:
-            return None
-        changes = entries[0].get("changes", [])
-        if not changes:
-            return None
-        value = changes[0].get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return None
-
-        msg = messages[0]
-        wa_from = msg.get("from")
-        msg_id = msg.get("id")
-        mtype = msg.get("type", "text")
-
-        body_text: str = ""
-        btn_id: Optional[str] = None
-
-        if mtype == "text":
-            body_text = (msg.get("text", {}) or {}).get("body", "")
-
-        elif mtype == "interactive":
-            interactive = msg.get("interactive", {}) or {}
-            itype = interactive.get("type")
-            if itype == "button":
-                reply = (interactive.get("button_reply") or interactive.get("nfm_reply") or {})
-                btn_id = reply.get("id")
-                body_text = reply.get("title") or ""
-            elif itype == "list_reply":
-                reply = interactive.get("list_reply") or {}
-                btn_id = reply.get("id")
-                body_text = reply.get("title") or reply.get("description") or ""
-            else:
-                body_text = ""
-
-        elif mtype == "button":
-            button = msg.get("button", {}) or {}
-            btn_id = button.get("payload")
-            body_text = button.get("text") or ""
-
-        else:
-            body_text = (msg.get("text", {}) or {}).get("body", "")
-
-        return {
-            "from": wa_from,
-            "id": msg_id,
-            "type": mtype,
-            "body": body_text.strip(),
-            "btn_id": btn_id,
-        }
-
-    except Exception:
-        log.exception("Failed to extract message from webhook payload")
-        return None
-
-
-# --- HTTP helpers -------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Low-level HTTP
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _headers() -> Dict[str, str]:
     return {
@@ -120,143 +36,153 @@ def _headers() -> Dict[str, str]:
         "Content-Type": "application/json",
     }
 
-
-def safe_json(r: requests.Response) -> Any:
+def wa_post(payload: Dict[str, Any]) -> Tuple[bool, int, Any]:
+    """
+    POST to WhatsApp Cloud API /messages.
+    Returns (ok, status_code, response_json_or_text).
+    """
     try:
-        return r.json()
+        resp = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=20)
+        content_type = resp.headers.get("Content-Type", "")
+        body: Any = resp.json() if "application/json" in content_type else resp.text
+        ok = 200 <= resp.status_code < 300
+        if not ok:
+            # Count by family and specific code if present
+            fam = f"wa_{resp.status_code // 100}xx"
+            _bump(fam)
+            code = None
+            if isinstance(body, dict):
+                try:
+                    code = int(body.get("error", {}).get("code"))
+                    _bump(f"wa_code_{code}")
+                except Exception:
+                    pass
+            log.error("WA send failed %s: %s", resp.status_code, body)
+        return ok, resp.status_code, body
+    except Exception as e:
+        _bump("wa_exception")
+        log.exception("wa_post failed")
+        return False, 599, str(e)
+
+def _extract_error_code(resp: Any) -> Optional[int]:
+    try:
+        return int(resp.get("error", {}).get("code"))
     except Exception:
-        return {"text": r.text[:500]}
+        return None
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Inbound helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-# --- Senders ------------------------------------------------------------------
-
-def send_whatsapp_text(to: str, text: str) -> Dict[str, Any]:
+def extract_message(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """
-    Send a plain text WhatsApp message via Cloud API.
-    NOTE: This will FAIL outside the 24h window. Use templates for re-engagement.
+    Normalizes the incoming webhook into {'from': wa_id, 'body': text}.
+    Returns None if not a text message.
     """
-    if not to:
-        raise ValueError("Recipient 'to' is required")
+    try:
+        entry = data["entry"][0]
+        change = entry["changes"][0]
+        value = change["value"]
+        msgs = value.get("messages")
+        if not msgs:
+            return None
+        msg = msgs[0]
+        if msg.get("type") != "text":
+            return None
+        wa_from = msg.get("from")
+        body = msg.get("text", {}).get("body", "")
+        return {"from": wa_from, "body": body}
+    except Exception:
+        _bump("webhook_parse_error")
+        log.exception("extract_message failed; data=%s", json.dumps(data, ensure_ascii=False)[:500])
+        return None
 
+def _normalize_wa(number: str) -> str:
+    return number.replace("+", "").strip() if number else number
+
+def is_admin(wa_number: str) -> bool:
+    norm = _normalize_wa(wa_number)
+    return any(_normalize_wa(a) == norm for a in ADMIN_NUMBERS)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outbound helpers (with re-engagement fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def send_whatsapp_text(to: str, body: str) -> Tuple[bool, int, Any]:
+    """
+    Send freeform text. If outside the 24h window (error 131047),
+    auto-fallback to the generic template (ADMIN_TEMPLATE_NAME) placing text in {{1}}.
+    """
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": _normalize_wa(to),
         "type": "text",
-        "text": {"preview_url": False, "body": text[:4096]},
+        "text": {"preview_url": False, "body": body},
     }
+    ok, status, resp = wa_post(payload)
+    if ok:
+        return ok, status, resp
 
-    try:
-        r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=15)
-        if r.status_code >= 400:
-            log.error("WA text send failed %s: %s", r.status_code, r.text)
-        return {"status_code": r.status_code, "response": safe_json(r)}
-    except Exception:
-        log.exception("Error sending WhatsApp text")
-        return {"status_code": 0, "response": None}
+    code = _extract_error_code(resp) if isinstance(resp, dict) else None
+    if code == 131047 and USE_TEMPLATES:
+        tpl_name = ADMIN_TEMPLATE_NAME or "admin_update"
+        tpl_lang = ADMIN_TEMPLATE_LANG or "en"
+        log.info("[reengage] Fallback to template '%s' lang=%s for to=%s", tpl_name, tpl_lang, to)
+        tok, tstatus, tresp = send_template(
+            to=to,
+            template=tpl_name,
+            lang=tpl_lang,
+            variables={"1": body},
+        )
+        return tok, tstatus, tresp
 
+    return ok, status, resp
 
-def send_whatsapp_buttons(to: str, text: str, buttons: List[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    Send interactive reply buttons.
-    buttons: list of {"id": "...", "title": "..."} (max 3 per WA spec).
-    """
-    if not to:
-        raise ValueError("Recipient 'to' is required")
-    if not buttons:
-        raise ValueError("At least one button is required")
-
-    btns = []
-    for b in buttons[:3]:
-        bid = b.get("id")
-        title = b.get("title")
-        if not bid or not title:
-            raise ValueError("Each button needs 'id' and 'title'")
-        btns.append({"type": "reply", "reply": {"id": bid, "title": title[:20]}})
+def send_template(
+    to: str,
+    template: str,
+    lang: str,
+    variables: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, int, Any]:
+    params: list[Dict[str, Any]] = []
+    if variables:
+        keys = list(variables.keys())
+        if all(isinstance(k, str) and k.isdigit() for k in keys):
+            for k in sorted(keys, key=lambda x: int(x)):
+                params.append({"type": "text", "text": str(variables[k])})
+        elif set(keys) == {"name", "items"}:
+            for k in ("name", "items"):
+                params.append({"type": "text", "text": str(variables[k])})
+        else:
+            for k in keys:
+                params.append({"type": "text", "text": str(variables[k])})
 
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": _normalize_wa(to),
+        "type": "template",
+        "template": {
+            "name": template,
+            "language": {"code": lang},
+            "components": [{"type": "body", "parameters": params}],
+        },
+    }
+    return wa_post(payload)
+
+def send_whatsapp_buttons(
+    to: str,
+    body_text: str,
+    buttons: Iterable[tuple[str, str]],
+) -> Tuple[bool, int, Any]:
+    btns = [{"type": "reply", "reply": {"id": bid, "title": title}} for bid, title in buttons]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": _normalize_wa(to),
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": text[:1024]},
-            "action": {"buttons": btns},
+            "body": {"text": body_text},
+            "action": {"buttons": btns[:3]},
         },
     }
-
-    try:
-        r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=15)
-        if r.status_code >= 400:
-            log.error("WA buttons send failed %s: %s", r.status_code, r.text)
-        return {"status_code": r.status_code, "response": safe_json(r)}
-    except Exception:
-        log.exception("Error sending WhatsApp buttons")
-        return {"status_code": 0, "response": None}
-
-
-def send_whatsapp_template(
-    to: str,
-    template_name: str,
-    lang_code: str,
-    body_params: List[str] | None = None,
-) -> Dict[str, Any]:
-    """
-    Send a pre-approved template message (HSM).
-    body_params: list of strings to fill {{1}}, {{2}}, ... in the BODY component.
-    """
-    if not to:
-        raise ValueError("Recipient 'to' is required")
-    body_params = body_params or []
-
-    components: List[Dict[str, Any]] = []
-    if body_params:
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(v)[:1024]} for v in body_params]
-        })
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": lang_code},
-            "components": components if components else [],
-        },
-    }
-
-    try:
-        r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=15)
-        if r.status_code >= 400:
-            log.error("WA template send failed %s: %s", r.status_code, r.text)
-        return {"status_code": r.status_code, "response": safe_json(r)}
-    except Exception:
-        log.exception("Error sending WhatsApp template")
-        return {"status_code": 0, "response": None}
-
-
-def send_admin_update(to_or_list: Union[str, List[str]], text: str) -> int:
-    """
-    Send admin update using pre-approved template (avoids 24h failure).
-    Uses config.ADMIN_TEMPLATE_NAME and ADMIN_TEMPLATE_LANG.
-    Returns number of attempts (success not guaranteed by API).
-    """
-    targets: List[str] = []
-    if isinstance(to_or_list, list):
-        targets = [t for t in to_or_list if t]
-    elif isinstance(to_or_list, str) and to_or_list:
-        targets = [to_or_list]
-    elif ADMIN_NUMBERS:
-        targets = ADMIN_NUMBERS
-
-    sent = 0
-    for t in targets:
-        res = send_whatsapp_template(
-            t,
-            template_name=ADMIN_TEMPLATE_NAME,
-            lang_code=ADMIN_TEMPLATE_LANG,
-            body_params=[text],
-        )
-        sent += 1 if res.get("status_code", 0) > 0 else 0
-    return sent
+    return wa_post(payload)

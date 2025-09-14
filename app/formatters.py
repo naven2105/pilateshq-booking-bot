@@ -1,116 +1,67 @@
-# formatters.py
-#Keeps data retrieval (crud.py) separate from user communication (formatters.py).
-#Ensures consistent tone (friendly WhatsApp messages with emojis).
-#Easy to update formatting without touching DB queries.
+# app/formatters.py
+from __future__ import annotations
 
-"""
-Response Formatter
-------------------
-Takes structured query results (dicts/lists) and converts them into
-friendly WhatsApp-ready messages for clients and admins.
-"""
+from datetime import date, time
+from typing import List, Optional, Tuple
 
-from typing import List, Dict
+# ── Client messages ───────────────────────────────────────────────────────────
 
+def _fmt(d: date, t: time) -> str:
+    return f"{d.strftime('%a %d %b')} at {t.strftime('%H:%M')}"
 
-# 🟢 Booking Management
+def format_next_lesson(result: Optional[Tuple[date, time]]) -> str:
+    if not result:
+        return "You have no upcoming sessions. Reply BOOK to schedule one."
+    d, t = result
+    return f"Your next lesson is {_fmt(d, t)}."
 
-def format_next_lesson(lesson: Dict) -> str:
-    if not lesson:
-        return "📌 You don’t have any upcoming lessons booked."
-    return f"📌 Your next lesson is on *{lesson['date']}* at *{lesson['time']}*."
+def format_sessions_this_week(rows: List[Tuple[date, time]]) -> str:
+    if not rows:
+        return "You have no sessions in the next 7 days."
+    items = [f"- {_fmt(d, t)}" for d, t in rows]
+    return "Your sessions this week:\n" + "\n".join(items)
 
+def format_weekly_schedule(rows: List[Tuple[date, time, str]]) -> str:
+    if not rows:
+        return "No sessions scheduled in the next 7 days."
+    items = [f"- {d.strftime('%a %d %b')} {t.strftime('%H:%M')} — {name}" for d, t, name in rows]
+    return "Upcoming week:\n" + "\n".join(items)
 
-def format_sessions_this_week(sessions: List[Dict]) -> str:
-    if not sessions:
-        return "📌 You have no lessons booked for this week."
-    lines = [f"- {s['date']} at {s['time']} ({s['status']})" for s in sessions]
-    return "📅 Here are your lessons this week:\n" + "\n".join(lines)
+# ── Admin messages ────────────────────────────────────────────────────────────
 
+def format_client_sessions(rows: List[Tuple[date, time]], client_name: str) -> str:
+    if not rows:
+        return f"No upcoming sessions found for '{client_name}'."
+    items = [f"- {_fmt(d, t)}" for d, t in rows]
+    return f"Sessions for {client_name}:\n" + "\n".join(items)
 
-def format_weekly_schedule(sessions: List[Dict]) -> str:
-    if not sessions:
-        return "📅 No studio sessions scheduled for the coming week."
-    lines = [f"- {s['date']} at {s['time']} (Capacity {s['capacity']}, {s['status']})" for s in sessions]
-    return "📅 Studio schedule for this week:\n" + "\n".join(lines)
-
-
-# 🔵 Attendance & Participation
-
-def format_session_attendees(names: List[str]) -> str:
+def format_clients_for_time(names: List[str], hhmm: str, date_str: str) -> str:
     if not names:
-        return "👥 No clients booked for this session yet."
-    return "👥 Clients in this session:\n" + "\n".join([f"- {n}" for n in names])
+        return f"No clients booked for {date_str} at {hhmm}."
+    return f"Clients at {date_str} {hhmm}: " + ", ".join(names)
 
+def format_clients_today(rows: List[Tuple[time, str]]) -> str:
+    if not rows:
+        return "No clients booked today."
+    items = [f"- {t.strftime('%H:%M')} — {name}" for t, name in rows]
+    return "Today’s clients:\n" + "\n".join(items)
 
-def format_lessons_left(count: int) -> str:
-    return f"🎟 You have *{count}* lessons left this month."
+def format_cancellations(rows: List[Tuple[time, str]]) -> str:
+    if not rows:
+        return "No cancellations today."
+    items = [f"- {t.strftime('%H:%M')} — {name}" for t, name in rows]
+    return "Cancellations today:\n" + "\n".join(items)
 
+# ── Info messages ─────────────────────────────────────────────────────────────
 
-def format_clients_for_time(names: List[str], time: str, date: str) -> str:
-    if not names:
-        return f"📌 No clients booked for {date} at {time}."
-    return f"👥 Clients booked for {date} at {time}:\n" + "\n".join([f"- {n}" for n in names])
+def format_today_date(s: str) -> str:
+    return f"Today is {s}."
 
+def format_current_time(s: str) -> str:
+    return f"The current time is {s}."
 
-def format_clients_today(count: int) -> str:
-    return f"📌 There are *{count}* clients booked for today."
+def format_studio_address(s: str) -> str:
+    return f"Our studio address is: {s}"
 
-
-def format_cancellations(cancellations: List[Dict]) -> str:
-    if not cancellations:
-        return "❌ No cancellations today."
-    lines = [f"- {c['client']} (was {c['date']} {c['time']})" for c in cancellations]
-    return "❌ Today’s cancellations:\n" + "\n".join(lines)
-
-
-def format_clients_without_bookings(names: List[str]) -> str:
-    if not names:
-        return "✅ All clients have bookings this week."
-    return "⚠️ Clients with no bookings this week:\n" + "\n".join([f"- {n}" for n in names])
-
-
-def format_weekly_recap(sessions: List[Dict]) -> str:
-    if not sessions:
-        return "📊 No sessions found in the last 7 days."
-    lines = [f"- {s['date']} at {s['time']} → {s['count']} booked" for s in sessions]
-    return "📊 Weekly Recap:\n" + "\n".join(lines)
-
-
-# 🟠 Client Lookup (Admin)
-
-def format_client_sessions(sessions: List[Dict], client_name: str) -> str:
-    if not sessions:
-        return f"📌 No confirmed sessions found for {client_name}."
-    lines = [f"- {s['date']} at {s['time']}" for s in sessions]
-    return f"📌 Sessions for {client_name}:\n" + "\n".join(lines)
-
-
-def format_hours_until(hours: float) -> str:
-    if hours <= 0:
-        return "📌 No lessons remaining today."
-    return f"⏳ Next lesson starts in *{hours}* hours."
-
-
-# 🟣 Pricing & Services
-
-def format_service_price(service: str, price: float) -> str:
-    return f"💰 The price for {service} is R{price:.2f}."
-
-
-# 🟤 General Information
-
-def format_today_date(today: str) -> str:
-    return f"📅 Today’s date is {today}."
-
-
-def format_current_time(now: str) -> str:
-    return f"⏰ Current time is {now}."
-
-
-def format_studio_address(address: str) -> str:
-    return f"📍 Studio address: {address}"
-
-
-def format_studio_rules(rules: str) -> str:
-    return "📖 Studio Rules:\n" + rules
+def format_studio_rules(s: str) -> str:
+    return f"Studio rules: {s}"

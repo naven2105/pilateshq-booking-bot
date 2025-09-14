@@ -1,42 +1,50 @@
 # app/tasks.py
 from __future__ import annotations
 import logging
+from datetime import datetime
 from flask import request
 
-from .admin_reminders import run_admin_hourly, run_admin_daily
+from .admin_reminders import run_admin_tick, run_admin_daily
 from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
-from .db import db_session  # for rollback/remove on task completion
 
+log = logging.getLogger(__name__)
+
+# Simple in-memory cron status (per process)
+LAST_RUN = {
+    "admin_notify": {"ts": None, "result": None},
+    "daily": {"ts": None, "result": None},
+    "tomorrow": {"ts": None, "result": None},
+    "next_hour": {"ts": None, "result": None},
+    "weekly": {"ts": None, "result": None},
+}
+
+def _mark(job: str, result: str) -> None:
+    LAST_RUN[job]["ts"] = datetime.now().isoformat(timespec="seconds")
+    LAST_RUN[job]["result"] = result
 
 def register_tasks(app):
     @app.post("/tasks/admin-notify")
     def admin_notify():
-        """
-        Hourly admin summary via CRON.
-        Sends using a pre-approved template to bypass the 24h window.
-        """
+        """Hourly admin summary via CRON (template admin_hourly_update)."""
         try:
             src = request.args.get("src", "unknown")
-            logging.info(f"[admin-notify] src={src}")
-            run_admin_hourly()
+            log.info("[admin-notify] src=%s", src)
+            run_admin_tick()
+            _mark("admin_notify", "ok")
             return "ok", 200
         except Exception:
             logging.exception("admin-notify failed")
-            db_session.rollback()
+            _mark("admin_notify", "error")
             return "error", 500
-        finally:
-            # ensure the scoped session is clean for the next request
-            db_session.remove()
 
     @app.post("/tasks/run-reminders")
     def run_reminders():
         """
         Multi-purpose reminder runner.
-        Query parameters:
-          ?daily=1    → run daily admin recap at 20:00
-          ?tomorrow=1 → send client 24h-before reminders
-          ?next=1     → send client 1h-before reminders
-          ?weekly=1   → send client weekly preview (Sunday 18:00)
+          ?daily=1    → admin 20:00 recap
+          ?tomorrow=1 → client 24h-before
+          ?next=1     → client 1h-before
+          ?weekly=1   → client weekly preview (Sun 18:00)
         """
         try:
             src = request.args.get("src", "unknown")
@@ -45,30 +53,32 @@ def register_tasks(app):
             next_hour = request.args.get("next", "0") == "1"
             weekly = request.args.get("weekly", "0") == "1"
 
-            logging.info(f"[run-reminders] src={src} daily={daily} tomorrow={tomorrow} next={next_hour} weekly={weekly}")
+            log.info("[run-reminders] src=%s daily=%s tomorrow=%s next=%s weekly=%s",
+                     src, daily, tomorrow, next_hour, weekly)
 
             if daily:
                 run_admin_daily()
+                _mark("daily", "ok")
                 return "ok daily", 200
 
             if tomorrow:
                 sent = run_client_tomorrow()
+                _mark("tomorrow", f"ok sent={sent}")
                 return f"ok tomorrow sent={sent}", 200
 
             if next_hour:
                 sent = run_client_next_hour()
+                _mark("next_hour", f"ok sent={sent}")
                 return f"ok next-hour sent={sent}", 200
 
             if weekly:
                 sent = run_client_weekly()
+                _mark("weekly", f"ok sent={sent}")
                 return f"ok weekly sent={sent}", 200
 
             return "no action", 200
 
         except Exception:
             logging.exception("run-reminders failed")
-            db_session.rollback()
+            _mark("daily", "error")  # generic bucket
             return "error", 500
-        finally:
-            # clear any broken connections / transactions between cron calls
-            db_session.remove()
