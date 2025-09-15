@@ -90,11 +90,14 @@ def send_whatsapp_text(to: str, text: str) -> Dict[str, Any]:
     return {"ok": ok, "status_code": status, "response": body}
 
 
-def send_whatsapp_template(to: str, name: str, lang: str, variables: List[str]) -> Dict[str, Any]:
+def send_whatsapp_template(to: str, name: str, lang: str = "en_US", variables: List[str] = None) -> Dict[str, Any]:
     """
     Send a template by name/language with body variables (text only).
-    Returns dict: ok, status_code, response.
+    Defaults to English (US) templates.
     """
+    if variables is None:
+        variables = []
+
     components = [{
         "type": "body",
         "parameters": [{"type": "text", "text": str(v)} for v in variables],
@@ -121,7 +124,6 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: List[str]) 
             log.warning("WA template send failed name=%s lang=%s to=%s", name, lang, to)
 
     return {"ok": ok, "status_code": status, "response": body}
-
 
 def send_whatsapp_buttons(to: str, body_text: str, buttons: List[Tuple[str, str]]) -> Dict[str, Any]:
     """
