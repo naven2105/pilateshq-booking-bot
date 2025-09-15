@@ -14,9 +14,10 @@ from . import utils
 log = logging.getLogger(__name__)
 TZ = ZoneInfo("Africa/Johannesburg")
 
+
 def _fetch_today_hourly_names() -> Dict[str, List[str]]:
     """
-    Returns dict keyed by 'HH:MM' -> [name, name, ...] for today's confirmed bookings.
+    Dict 'HH:MM' -> [client names...] for today's confirmed bookings.
     """
     today = datetime.now(TZ).date()
     sql = text("""
@@ -35,9 +36,10 @@ def _fetch_today_hourly_names() -> Dict[str, List[str]]:
         by_hour.setdefault(hhmm, []).append(name)
     return by_hour
 
+
 def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
     """
-    Builds single-line summary: '06:00(3): A, B, C • 07:00(2): D, E'
+    One-line summary: '06:00(3): A, B, C • 07:00(2): D, E'
     """
     if not by_hour:
         return "No sessions today — we’re missing you."
@@ -47,81 +49,64 @@ def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
         parts.append(f"{hhmm}({len(names)}): {', '.join(names)}")
     return " • ".join(parts)
 
+
+def _send_to_admins(tpl_name: str, count: int, details: str, context_label: str) -> int:
+    """
+    Shared sender for morning/evening.
+    """
+    sent_ok = 0
+    langs = [TEMPLATE_LANG or "en", "en_ZA", "en_US"]
+
+    for admin in ADMIN_NUMBERS:
+        ok = False
+        last_status = None
+        # IMPORTANT: pass template name positionally (no 'template=' kwarg)
+        for lang in langs:
+            resp = utils.send_whatsapp_template(
+                admin,                 # to
+                tpl_name,              # template name (positional)
+                lang,                  # language
+                [str(count), details], # variables
+            )
+            last_status = getattr(resp, "status_code", None) if resp else None
+            ok = bool(resp and getattr(resp, "ok", False))
+            log.info(
+                "[%s][send] to=%s tpl=%s lang=%s status=%s ok=%s count=%s",
+                context_label, admin, tpl_name, lang, last_status, ok, count
+            )
+            if ok:
+                break
+
+        if not ok:
+            # Plain text fallback if template/lang unavailable
+            title = "Morning Brief" if context_label == "admin-morning" else "20h Recap"
+            body = f"PilatesHQ {title}\nTotal time slots today: {count}\n{details}"
+            utils.send_whatsapp_text(admin, body)
+            log.warning("[%s] template fallback → text for %s", context_label, admin)
+        else:
+            sent_ok += 1
+
+    log.info("[%s] slots=%s admins=%s sent=%s", context_label, count, len(ADMIN_NUMBERS), sent_ok)
+    return sent_ok
+
+
 def run_admin_morning() -> int:
     """
-    06:00 SAST morning brief using the approved 'admin_20h00' template.
-      {{1}} → count of distinct time slots today
-      {{2}} → 'HH:MM(count): names • ...'  (or 'No sessions today — we’re missing you.')
-    Returns number of admin messages sent successfully.
+    06:00 SAST morning brief using 'admin_20h00' template for consistency.
+      {{1}} → number of distinct time slots today
+      {{2}} → 'HH:MM(count): names • ...' (or 'No sessions today — we’re missing you.')
     """
     by_hour = _fetch_today_hourly_names()
     details = _format_admin_summary_line(by_hour)
     count = len(by_hour)
-    tpl = "admin_20h00"
+    return _send_to_admins("admin_20h00", count, details, "admin-morning")
 
-    sent_ok = 0
-    # Try configured template language first, then fallback to en_ZA and en_US, then plain text
-    langs = [TEMPLATE_LANG or "en", "en_ZA", "en_US"]
-    for admin in ADMIN_NUMBERS:
-        ok = False
-        last_status = None
-        for lang in langs:
-            resp = utils.send_whatsapp_template(
-                to=admin,
-                template=tpl,
-                lang=lang,
-                variables=[str(count), details],
-            )
-            last_status = getattr(resp, "status_code", None) if resp else None
-            ok = bool(resp and getattr(resp, "ok", False))
-            log.info("[admin-morning][send] to=%s tpl=%s lang=%s status=%s ok=%s count=%s",
-                     admin, tpl, lang, last_status, ok, count)
-            if ok:
-                break
-        if not ok:
-            # Fallback to plain text if template/lang is missing
-            body = f"PilatesHQ Morning Brief\nTotal time slots today: {count}\n{details}"
-            utils.send_whatsapp_text(admin, body)
-            log.warning("[admin-morning] template fallback → text for %s", admin)
-        else:
-            sent_ok += 1
-    log.info("[admin-morning] slots=%s admins=%s sent=%s", count, len(ADMIN_NUMBERS), sent_ok)
-    return sent_ok
 
 def run_admin_daily() -> int:
     """
-    20:00 SAST recap using the same 'admin_20h00' template.
-    Shows today's final schedule line and total distinct time slots.
+    20:00 SAST recap using 'admin_20h00' template.
     """
     by_hour = _fetch_today_hourly_names()
     details = _format_admin_summary_line(by_hour)
     count = len(by_hour)
-    tpl = "admin_20h00"
-
-    sent_ok = 0
-    langs = [TEMPLATE_LANG or "en", "en_ZA", "en_US"]
-    for admin in ADMIN_NUMBERS:
-        resp = None
-        ok = False
-        last_status = None
-        for lang in langs:
-            resp = utils.send_whatsapp_template(
-                to=admin,
-                template=tpl,
-                lang=lang,
-                variables=[str(count), details],
-            )
-            last_status = getattr(resp, "status_code", None) if resp else None
-            ok = bool(resp and getattr(resp, "ok", False))
-            log.info("[admin-daily][send] to=%s tpl=%s lang=%s status=%s ok=%s count=%s",
-                     admin, tpl, lang, last_status, ok, count)
-            if ok:
-                break
-        if not ok:
-            body = f"PilatesHQ 20h Recap\nTotal time slots today: {count}\n{details}"
-            utils.send_whatsapp_text(admin, body)
-            log.warning("[admin-daily] template fallback → text for %s", admin)
-        else:
-            sent_ok += 1
-    log.info("[admin-daily] slots=%s admins=%s sent=%s", count, len(ADMIN_NUMBERS), sent_ok)
-    return sent_ok
+    return _send_to_admins("admin_20h00", count, details, "admin-daily")
