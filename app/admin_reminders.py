@@ -1,147 +1,127 @@
 # app/admin_reminders.py
 from __future__ import annotations
 import logging
-from datetime import date
-from typing import Dict, List, Tuple
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from typing import List, Dict
+
 from sqlalchemy import text
 
-from .db import get_session
-from .config import ADMIN_NUMBERS
+from .config import ADMIN_NUMBERS, TEMPLATE_LANG
+from .db import db_session
 from . import utils
 
 log = logging.getLogger(__name__)
+TZ = ZoneInfo("Africa/Johannesburg")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _fmt_d(d: date) -> str:
-    return d.strftime("%a %d %b")
-
-def _flatten_pairs(pairs: List[Tuple[str, List[str]]]) -> str:
+def _fetch_today_hourly_names() -> Dict[str, List[str]]:
     """
-    Build a SINGLE-LINE summary acceptable for WA template param:
-    "06:00(3): Alice, Ben, Cara • 07:00(2): Dan, Emma • ..."
+    Returns dict keyed by 'HH:MM' -> [name, name, ...] for today's confirmed bookings.
     """
-    chunks: List[str] = []
-    for hhmm, names in pairs:
-        who = ", ".join(names) if names else "-"
-        chunks.append(f"{hhmm}({len(names)}): {who}")
-    return " • ".join(chunks) if chunks else "No sessions booked today"
+    today = datetime.now(TZ).date()
+    sql = text("""
+        SELECT to_char(s.start_time, 'HH24:MI') AS hhmm, c.name AS client_name
+        FROM sessions s
+        JOIN bookings b ON b.session_id = s.id
+        JOIN clients  c ON c.id = b.client_id
+        WHERE s.session_date = :today
+          AND b.status = 'confirmed'
+        ORDER BY s.start_time, c.name
+    """)
+    by_hour: Dict[str, List[str]] = {}
+    with db_session() as s:
+        rows = s.execute(sql, {"today": today}).all()
+    for hhmm, name in rows:
+        by_hour.setdefault(hhmm, []).append(name)
+    return by_hour
 
-def _cap_line(s: str, max_len: int = 900) -> str:
-    """Cap the detail line to stay within WA param limits (~1024), with soft buffer."""
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 12].rstrip() + " … +more"
-
-def _load_today_buckets(the_day: date) -> Tuple[List[Tuple[str, List[str]]], int]:
+def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
     """
-    Returns (pairs, session_count) where:
-      - pairs: [(HH:MM, [client names]), ...] for CONFIRMED bookings only.
-      - session_count: number of distinct start_time buckets that have at least one confirmed booking.
+    Builds single-line summary: '06:00(3): A, B, C • 07:00(2): D, E'
     """
-    with get_session() as s:
-        rows = s.execute(
-            text(
-                """
-                SELECT sessions.start_time, clients.name
-                FROM sessions
-                JOIN bookings ON bookings.session_id = sessions.id
-                JOIN clients  ON clients.id = bookings.client_id
-                WHERE sessions.session_date = :d
-                  AND bookings.status = 'confirmed'
-                ORDER BY sessions.start_time, clients.name
-                """
-            ),
-            {"d": the_day},
-        ).fetchall()
+    if not by_hour:
+        return "No sessions today — we’re missing you."
+    parts: List[str] = []
+    for hhmm in sorted(by_hour.keys()):
+        names = by_hour[hhmm]
+        parts.append(f"{hhmm}({len(names)}): {', '.join(names)}")
+    return " • ".join(parts)
 
-    bucket: Dict[str, List[str]] = {}
-    for start_time, client_name in rows:
-        hhmm = str(start_time)[:5]  # 'HH:MM:SS' -> 'HH:MM'
-        bucket.setdefault(hhmm, []).append(client_name)
-
-    pairs = sorted(bucket.items(), key=lambda kv: kv[0])
-    session_count = len(pairs)
-    return pairs, session_count
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 06:00 Admin Morning Brief  (uses admin_20h00)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_admin_morning(today: date | None = None) -> int:
+def run_admin_morning() -> int:
     """
-    Compile today's CONFIRMED sessions grouped by hour with client names and
-    send ONE message to each admin using the 'admin_20h00' template.
-    Params: {{1}} = count of booked session slots today, {{2}} = compact details line.
+    06:00 SAST morning brief using the approved 'admin_20h00' template.
+      {{1}} → count of distinct time slots today
+      {{2}} → 'HH:MM(count): names • ...'  (or 'No sessions today — we’re missing you.')
+    Returns number of admin messages sent successfully.
     """
-    the_day = today or date.today()
-    pairs, session_count = _load_today_buckets(the_day)
-    details = _cap_line(_flatten_pairs(pairs))
-    count_str = str(session_count)
+    by_hour = _fetch_today_hourly_names()
+    details = _format_admin_summary_line(by_hour)
+    count = len(by_hour)
+    tpl = "admin_20h00"
 
-    ok_count = 0
+    sent_ok = 0
+    # Try configured template language first, then fallback to en_ZA and en_US, then plain text
+    langs = [TEMPLATE_LANG or "en", "en_ZA", "en_US"]
     for admin in ADMIN_NUMBERS:
-        ok, status, resp, chosen_lang = utils.send_whatsapp_template(
-            to=admin,
-            template_name="admin_20h00",
-            params=[count_str, details],
-            # Prefer the approved language first to avoid 132001 errors.
-            lang_prefer=["en_ZA", "en", "en_US"],
-        )
+        ok = False
+        last_status = None
+        for lang in langs:
+            resp = utils.send_whatsapp_template(
+                to=admin,
+                template=tpl,
+                lang=lang,
+                variables=[str(count), details],
+            )
+            last_status = getattr(resp, "status_code", None) if resp else None
+            ok = bool(resp and getattr(resp, "ok", False))
+            log.info("[admin-morning][send] to=%s tpl=%s lang=%s status=%s ok=%s count=%s",
+                     admin, tpl, lang, last_status, ok, count)
+            if ok:
+                break
         if not ok:
-            # Fallback: concise single-line text
-            text_line = f"Daily schedule { _fmt_d(the_day) }: sessions={count_str}; {details}"
-            ok, status, resp = utils.send_whatsapp_text(admin, text_line)
-        log.info("[admin-morning][send] to=%s status=%s ok=%s lang=%s",
-                 admin, status, ok, chosen_lang if ok else None)
-        ok_count += 1 if ok else 0
+            # Fallback to plain text if template/lang is missing
+            body = f"PilatesHQ Morning Brief\nTotal time slots today: {count}\n{details}"
+            utils.send_whatsapp_text(admin, body)
+            log.warning("[admin-morning] template fallback → text for %s", admin)
+        else:
+            sent_ok += 1
+    log.info("[admin-morning] slots=%s admins=%s sent=%s", count, len(ADMIN_NUMBERS), sent_ok)
+    return sent_ok
 
-    # Cron heartbeat
-    try:
-        from .diag import note_cron_run
-        note_cron_run("admin-morning")
-    except Exception:
-        pass
-
-    log.info("[admin-morning] %s sent=%s", _fmt_d(the_day), ok_count)
-    return ok_count
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 20:00 Admin Recap  (also uses admin_20h00)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_admin_daily(today: date | None = None) -> int:
+def run_admin_daily() -> int:
     """
-    20:00 recap using the same 'admin_20h00' template.
-    We reuse the CONFIRMED-by-hour with names format for {{2}} to keep consistency.
+    20:00 SAST recap using the same 'admin_20h00' template.
+    Shows today's final schedule line and total distinct time slots.
     """
-    the_day = today or date.today()
-    pairs, session_count = _load_today_buckets(the_day)
-    details = _cap_line(_flatten_pairs(pairs))
-    count_str = str(session_count)
+    by_hour = _fetch_today_hourly_names()
+    details = _format_admin_summary_line(by_hour)
+    count = len(by_hour)
+    tpl = "admin_20h00"
 
-    ok_total = 0
+    sent_ok = 0
+    langs = [TEMPLATE_LANG or "en", "en_ZA", "en_US"]
     for admin in ADMIN_NUMBERS:
-        ok, status, resp, chosen_lang = utils.send_whatsapp_template(
-            to=admin,
-            template_name="admin_20h00",
-            params=[count_str, details],
-            lang_prefer=["en_ZA", "en", "en_US"],
-        )
+        resp = None
+        ok = False
+        last_status = None
+        for lang in langs:
+            resp = utils.send_whatsapp_template(
+                to=admin,
+                template=tpl,
+                lang=lang,
+                variables=[str(count), details],
+            )
+            last_status = getattr(resp, "status_code", None) if resp else None
+            ok = bool(resp and getattr(resp, "ok", False))
+            log.info("[admin-daily][send] to=%s tpl=%s lang=%s status=%s ok=%s count=%s",
+                     admin, tpl, lang, last_status, ok, count)
+            if ok:
+                break
         if not ok:
-            text_line = f"Today { _fmt_d(the_day) }: sessions={count_str}; {details}"
-            ok, status, resp = utils.send_whatsapp_text(admin, text_line)
-        log.info("[admin-daily][send] to=%s status=%s ok=%s lang=%s",
-                 admin, status, ok, chosen_lang if ok else None)
-        ok_total += 1 if ok else 0
-
-    try:
-        from .diag import note_cron_run
-        note_cron_run("admin-daily")
-    except Exception:
-        pass
-
-    log.info("[admin-daily] %s sent=%s", _fmt_d(the_day), ok_total)
-    return ok_total
+            body = f"PilatesHQ 20h Recap\nTotal time slots today: {count}\n{details}"
+            utils.send_whatsapp_text(admin, body)
+            log.warning("[admin-daily] template fallback → text for %s", admin)
+        else:
+            sent_ok += 1
+    log.info("[admin-daily] slots=%s admins=%s sent=%s", count, len(ADMIN_NUMBERS), sent_ok)
+    return sent_ok

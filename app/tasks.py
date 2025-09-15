@@ -4,23 +4,14 @@ import logging
 from flask import request
 
 from .admin_reminders import run_admin_morning, run_admin_daily
-from .client_reminders import (
-    run_client_tomorrow,
-    run_client_next_hour,
-    run_client_weekly,
-)
+from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
 
 log = logging.getLogger(__name__)
 
 def register_tasks(app):
     @app.post("/tasks/admin-morning")
     def admin_morning():
-        """
-        One-shot admin morning brief (06:00 SAST via cron @ 04:00 UTC).
-        Uses the approved 'admin_20h00' template with:
-          {{1}} = count of time slots booked today
-          {{2}} = single-line 'HH:MM(count): names • HH:MM(count): names ...'
-        """
+        """One-shot admin morning brief (cron 04:00 UTC = 06:00 SAST)."""
         try:
             src = request.args.get("src", "unknown")
             log.info("[admin-morning] src=%s", src)
@@ -32,14 +23,10 @@ def register_tasks(app):
 
     @app.post("/tasks/admin-notify")
     def admin_notify():
-        """
-        Legacy hourly endpoint. Keep for backward compatibility.
-        Recommendation: disable the hourly Render job and use /tasks/admin-morning instead.
-        """
+        """Legacy hourly endpoint (kept for backward compatibility)."""
         try:
             src = request.args.get("src", "unknown")
             log.info("[admin-notify] src=%s (legacy; prefer /tasks/admin-morning)", src)
-            # No-op or you could call run_admin_morning() if you want to reuse it
             return "ok", 200
         except Exception:
             logging.exception("admin-notify failed")
@@ -48,12 +35,11 @@ def register_tasks(app):
     @app.post("/tasks/run-reminders")
     def run_reminders():
         """
-        Multi-purpose reminder runner.
-        Query parameters:
-          ?daily=1     → run admin evening recap (20:00 SAST / 18:00 UTC) using admin_20h00
-          ?tomorrow=1  → client 24h-before reminders
-          ?next=1      → client 1h-before reminders
-          ?weekly=1    → client weekly preview (Sunday 18:00 SAST / 16:00 UTC)
+        Multi-purpose runner:
+          ?daily=1     → admin evening recap
+          ?tomorrow=1  → client 24h reminders
+          ?next=1      → client 1h reminders
+          ?weekly=1    → client weekly preview
         """
         try:
             src = request.args.get("src", "unknown")
