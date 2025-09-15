@@ -1,21 +1,17 @@
 # app/utils.py
 from __future__ import annotations
 
-import logging
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .config import (
-    ACCESS_TOKEN,
-    GRAPH_URL,
-    ADMIN_NUMBERS,
-)
+from .config import ACCESS_TOKEN, GRAPH_URL, ADMIN_NUMBERS
 
 log = logging.getLogger(__name__)
 
-# Simple in-memory error counters used by /diag/cron-status
+# Simple in-memory error counters consumed by /diag/cron-status
 ERROR_COUNTERS: Dict[str, int] = {
     "wa_template": 0,
     "wa_text": 0,
@@ -55,19 +51,17 @@ def _post_wa(payload: Dict[str, Any]) -> Tuple[bool, int, Dict[str, Any]]:
 
 def _norm_err_code(j: Dict[str, Any]) -> Optional[str]:
     """
-    Normalize Meta error code (which can be int/string/list/dict in some toolchains)
-    to a stable string so we can safely count/log it.
+    Normalize Meta error code (int/string/list/dict) to a stable string for logging/counters.
     """
     err = j.get("error")
     if not isinstance(err, dict):
         return None
     code = err.get("code")
-    # Normalize any nested/iterable form to a compact string
     try:
-        if isinstance(code, (list, dict)):
-            return json.dumps(code, sort_keys=True)
         if code is None:
             return None
+        if isinstance(code, (list, dict)):
+            return json.dumps(code, sort_keys=True)
         return str(code)
     except Exception:
         return "unknown"
@@ -101,8 +95,7 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: List[str]) 
     Send a template by name/language with body variables (text only).
     Returns dict: ok, status_code, response.
     """
-    # Build template components
-    comps = [{
+    components = [{
         "type": "body",
         "parameters": [{"type": "text", "text": str(v)} for v in variables],
     }]
@@ -114,7 +107,7 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: List[str]) 
         "template": {
             "name": name,
             "language": {"code": lang},
-            "components": comps,
+            "components": components,
         },
     }
 
@@ -122,7 +115,6 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: List[str]) 
     if not ok:
         ERROR_COUNTERS["wa_template"] = ERROR_COUNTERS.get("wa_template", 0) + 1
         code = _norm_err_code(body)
-        # Log a clear, single-line warning without any unhashable/list issues
         if code:
             log.warning("WA template send failed code=%s name=%s lang=%s to=%s", code, name, lang, to)
         else:
