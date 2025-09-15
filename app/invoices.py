@@ -6,6 +6,25 @@ from typing import List, Tuple, Dict
 import calendar
 import re
 
+# Banking details & notes (rendered in both text and HTML)
+BANKING_LINES = [
+    "Banking details",
+    "Pilates HQ Pty Ltd",
+    "Absa Bank",
+    "Current Account",
+    "Account No: 41171518 87",
+]
+
+NOTES_LINES = [
+    "Payment is due on or before the due date.",
+    "Use your name as a reference when making payment",
+    "Kindly send me your POP via WhatsApp once you have made the payment.",
+    "24 cancellation is required for your sessions to be made up",
+    "Sessions will not be carried over into the following month",
+    "Late cancellations of sessions will be charged.",
+]
+
+
 from sqlalchemy import text
 
 from .db import db_session
@@ -172,20 +191,29 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
     }
 
 def generate_invoice_text(client_name: str, month_spec: str) -> str:
-    """
-    WhatsApp-friendly, plain-text invoice.
-    """
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
 
+    def banking_block() -> List[str]:
+        out = [""]
+        out.append("—")
+        out.extend(BANKING_LINES)
+        out.append("")
+        out.append("Notes:")
+        out.extend([f"• {x}" for x in NOTES_LINES])
+        return out
+
     if not rows:
-        return (
-            f"PilatesHQ Invoice — {client_name}\n"
-            f"Period: {label}\n"
-            f"No sessions found for this period.\n"
-            f"If you missed classes, reply *BOOK* to schedule — we’re missing you! 💪"
-        )
+        lines = [
+            f"PilatesHQ Invoice — {client_name}",
+            f"Period: {label}",
+            "",
+            "No sessions found for this period.",
+            "If you missed classes, reply *BOOK* to schedule — we’re missing you! 💪",
+        ]
+        lines.extend(banking_block())
+        return "\n".join(lines)
 
     lines = []
     lines.append(f"PilatesHQ Invoice — {client_name}")
@@ -202,12 +230,10 @@ def generate_invoice_text(client_name: str, month_spec: str) -> str:
     lines.append(f"Amount due: R{totals['billable_amount']}")
     lines.append("")
     lines.append("Note: Cancelled bookings remain billable. Credits carry over to the next cycle.")
+    lines.extend(banking_block())
     return "\n".join(lines)
 
 def generate_invoice_html(client_name: str, month_spec: str) -> str:
-    """
-    Simple printer/PDF-friendly HTML invoice.
-    """
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
@@ -221,7 +247,6 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
                 f"<tr>"
                 f"<td>{r.session_date}</td>"
                 f"<td>{r.start_time}</td>"
-                f"<td class='center'>{r.capacity}</td>"
                 f"<td>{kind.title()}</td>"
                 f"<td class='right'>R{rate}</td>"
                 f"<td>{r.status}</td>"
@@ -229,9 +254,12 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
             )
     else:
         rows_html = (
-            "<tr><td colspan='6' class='muted'>No sessions found for this period."
+            "<tr><td colspan='5' class='muted'>No sessions found for this period."
             " If you missed classes, book your next one — we’re missing you! 💪</td></tr>"
         )
+
+    bank_html = "<br>".join(BANKING_LINES)
+    notes_html = "".join([f"<li>{x}</li>" for x in NOTES_LINES])
 
     html = f"""<!doctype html>
 <html>
@@ -242,13 +270,13 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
   body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; color: #111; }}
   h1 {{ margin: 0 0 6px 0; font-size: 20px; }}
   h2 {{ margin: 0 0 18px 0; font-size: 14px; font-weight: normal; color: #555; }}
+  h3 {{ margin: 18px 0 6px 0; font-size: 14px; }}
   table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
   th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; }}
   th {{ background: #f7f7f7; text-align: left; }}
   .right {{ text-align: right; }}
-  .center {{ text-align: center; }}
-  .summary {{ margin-top: 16px; font-size: 13px; }}
   .muted {{ color: #666; }}
+  .summary {{ margin-top: 16px; font-size: 13px; }}
   .totals {{ margin-top: 6px; font-weight: 600; }}
   .note {{ margin-top: 12px; font-size: 12px; color: #555; }}
   @media print {{
@@ -267,7 +295,7 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
   <table>
     <thead>
       <tr>
-        <th>Date</th><th>Time</th><th>Cap.</th><th>Type</th><th class="right">Rate</th><th>Status</th>
+        <th>Date</th><th>Time</th><th>Type</th><th class="right">Rate</th><th>Status</th>
       </tr>
     </thead>
     <tbody>
@@ -280,6 +308,14 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
     Total sessions billed: {totals['billable_count']}<br>
     <span class="totals">Amount due: R{totals['billable_amount']}</span>
   </div>
+
+  <h3>Banking details</h3>
+  <div>{bank_html}</div>
+
+  <h3>Notes</h3>
+  <ul>
+    {notes_html}
+  </ul>
 
   <div class="note">
     Note: Cancelled bookings remain billable; credits carry to the next cycle.

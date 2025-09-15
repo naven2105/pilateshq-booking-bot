@@ -290,18 +290,20 @@ def diag_invoice_csv():
 
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["date", "time", "capacity", "type", "rate", "status"])
+    # removed capacity column
+    w.writerow(["date", "time", "type", "rate", "status"])
     for d, t, cap, st in rows:
         capi = int(cap or 1)
         typ = classify_type(capi)
         rate = rate_for_capacity(capi)
         hhmm = t if isinstance(t, str) else f"{t.hour:02d}:{t.minute:02d}"
-        w.writerow([str(d), hhmm, capi, typ, rate, st])
+        w.writerow([str(d), hhmm, typ, rate, st])
 
     csv_bytes = out.getvalue().encode("utf-8")
     filename = f"invoice_{client.replace(' ', '_')}_{label.replace(' ', '_')}.csv"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(csv_bytes, mimetype="text/csv", headers=headers)
+
 
 @diag_bp.get("/diag/invoice-html")
 def diag_invoice_html():
