@@ -1,228 +1,240 @@
-# app/utils.py
 from __future__ import annotations
-
 import logging
+from typing import Any, Dict, List, Optional, Tuple
 import requests
-from datetime import datetime
-from typing import Dict, Tuple, Optional, List, Any
 
 from .config import (
     ACCESS_TOKEN,
     GRAPH_URL,
     ADMIN_NUMBERS,
+    TEMPLATE_LANG,  # default language preference from config (e.g., "en_ZA" or "en")
 )
 
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lightweight Observability (read by /diag/cron-status)
-# ──────────────────────────────────────────────────────────────────────────────
-LAST_RUN: Dict[str, str] = {}        # e.g. {"admin-notify":"2025-09-14T20:00:00Z"}
-ERROR_COUNTERS: Dict[str, int] = {}  # e.g. {"wa_template": 3, "wa_text": 1, "wa_template_retry": 2}
-
-def _now_iso() -> str:
-    # Keep it UTC + 'Z' for clarity
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def stamp(name: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Record a 'last run' moment for a job/route.
-    """
-    LAST_RUN[name] = _now_iso()
-
-def incr_error(bucket: str, inc: int = 1) -> None:
-    ERROR_COUNTERS[bucket] = ERROR_COUNTERS.get(bucket, 0) + inc
-
-# ──────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # WhatsApp helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def _auth_headers() -> Dict[str, str]:
+# -----------------------------------------------------------------------------
+
+def _headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
 
-def _normalize_msisdn(n: str) -> str:
-    # Accepts "2773..." or "+2773..."; returns digits only (Cloud API accepts without '+')
-    return n.replace("+", "").strip()
-
 def is_admin(wa_number: str) -> bool:
-    me = _normalize_msisdn(wa_number)
-    admin_norm = {_normalize_msisdn(n) for n in ADMIN_NUMBERS}
-    return me in admin_norm
+    """Return True if a WA number is in the configured admin list (accepts with or without leading '+')."""
+    n = wa_number.strip().lstrip("+")
+    return any(n == a.strip().lstrip("+") for a in ADMIN_NUMBERS)
 
-def extract_message(payload: dict) -> Optional[Dict[str, str]]:
+def extract_message(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """
-    Extract a user text message from WhatsApp webhook payload.
-    Returns {"from": "<wa_id>", "body": "<text>"} or None for non-message events.
+    Extract a simple text message from the WhatsApp webhook payload.
+    Returns: {"from": "<wa_id>", "body": "<text>"} or None if not a text message.
+    Ignores 'statuses' callbacks.
     """
     try:
-        entry = payload.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
-        # Status-only webhooks (delivery/read) have no 'messages'
-        messages = value.get("messages")
-        if not messages:
-            return None
-        msg = messages[0]
-        if msg.get("type") != "text":
-            return None
-        return {"from": msg.get("from"), "body": msg.get("text", {}).get("body", "")}
+        entries = payload.get("entry", [])
+        for entry in entries:
+            changes = entry.get("changes", [])
+            for ch in changes:
+                value = ch.get("value", {})
+                # ignore status webhooks
+                if "statuses" in value:
+                    continue
+                msgs = value.get("messages", [])
+                if not msgs:
+                    continue
+                msg = msgs[0]
+                if msg.get("type") != "text":
+                    return None
+                return {"from": msg.get("from", ""), "body": msg.get("text", {}).get("body", "")}
     except Exception:
         log.exception("extract_message failed")
-        return None
+    return None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Senders
-# ──────────────────────────────────────────────────────────────────────────────
-def send_whatsapp_text(to: str, body: str) -> Tuple[bool, int, dict]:
+# -----------------------------------------------------------------------------
+# Send: plain text
+# -----------------------------------------------------------------------------
+
+def send_whatsapp_text(to: str, text: str) -> Tuple[bool, int, Dict[str, Any]]:
     """
-    Basic text sender (inside 24h window).
+    Send a plain text WhatsApp message.
+    Returns (ok, status_code, response_json)
     """
-    to_norm = _normalize_msisdn(to)
-    data = {
+    payload = {
         "messaging_product": "whatsapp",
-        "to": to_norm,
+        "to": to,
         "type": "text",
-        "text": {"preview_url": False, "body": body},
+        "text": {"body": text},
     }
-    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
-    ok = 200 <= resp.status_code < 300
+    r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=20)
+    ok = r.status_code // 100 == 2
     if not ok:
-        incr_error("wa_text")
         try:
-            log.error("WA send failed %s: %s", resp.status_code, resp.json())
-            return False, resp.status_code, resp.json()
+            log.error("WA send failed %s: %s", r.status_code, r.json())
         except Exception:
-            log.error("WA send failed %s: <non-JSON body>", resp.status_code)
-            return False, resp.status_code, {"error": "non-json"}
-    return True, resp.status_code, resp.json()
+            log.error("WA send failed %s (no json body)", r.status_code)
+    return ok, r.status_code, _safe_json(r)
 
-def _template_components_from_vars(variables: Dict[str, str]) -> List[Dict[str, str]]:
-    """
-    Convert dict of variables into WA 'parameters' list in the insertion order.
-    Supports numeric keys ("1","2") or arbitrary names; order matters.
-    """
-    params: List[Dict[str, str]] = []
-    keys = list(variables.keys())
-    if all(k.isdigit() for k in keys):
-        keys = sorted(keys, key=lambda k: int(k))
-    for k in keys:
-        params.append({"type": "text", "text": str(variables[k])})
-    return [{"type": "body", "parameters": params}]
+# -----------------------------------------------------------------------------
+# Send: quick buttons (for simple menus)
+# -----------------------------------------------------------------------------
 
-def _post_template(to_norm: str, template: str, lang_code: str, components: List[Dict[str, Any]]):
-    data = {
+def send_whatsapp_buttons(to: str, body_text: str, buttons: List[str]) -> Tuple[bool, int, Dict[str, Any]]:
+    """
+    Send 1–3 quick-reply buttons under a text message.
+    """
+    if not buttons:
+        return send_whatsapp_text(to, body_text)
+
+    # WhatsApp expects up to 3 button replies
+    btns = []
+    for idx, label in enumerate(buttons[:3], start=1):
+        btns.append({
+            "type": "reply",
+            "reply": {"id": f"btn_{idx}", "title": label[:20]}  # WA UI truncates long titles; keep it short
+        })
+
+    payload = {
         "messaging_product": "whatsapp",
-        "to": to_norm,
-        "type": "template",
-        "template": {
-            "name": template,
-            "language": {"code": lang_code},
-            "components": components,
-        },
-    }
-    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
-    ok = 200 <= resp.status_code < 300
-    payload = {}
-    try:
-        payload = resp.json()
-    except Exception:
-        pass
-    return ok, resp.status_code, payload
-
-def send_template(
-    to: str,
-    template: str,
-    lang: str,
-    variables: Dict[str, str],
-) -> Tuple[bool, int, dict]:
-    """
-    Sends a template message using WA Cloud API with language fallback.
-    Tries: requested lang, then en_US, en_ZA, en (skipping duplicates).
-    Counters:
-      - wa_template_retry increments if we had to try a fallback but succeeded.
-      - wa_template increments only if ALL fallbacks fail.
-    """
-    to_norm = _normalize_msisdn(to)
-    components = _template_components_from_vars(variables)
-
-    # Build fallback list
-    candidates = [lang]
-    for alt in ["en_US", "en_ZA", "en"]:
-        if alt not in candidates:
-            candidates.append(alt)
-
-    retry_needed = False
-    last_status = 0
-    last_payload: dict = {}
-
-    for idx, lang_code in enumerate(candidates):
-        ok, status, payload = _post_template(to_norm, template, lang_code, components)
-        if ok:
-            if idx > 0:
-                incr_error("wa_template_retry")
-                log.info("WA template recovered via fallback lang=%s name=%s to=%s", lang_code, template, to_norm)
-            return True, status, payload
-
-        # If it looks like a translation-missing error (132001), mark retry and continue
-        err_code = None
-        try:
-            err_code = payload.get("error", {}).get("code")
-        except Exception:
-            pass
-
-        if err_code == 132001:
-            retry_needed = True
-            last_status, last_payload = status, payload
-            log.warning("WA template missing in lang=%s (name=%s); trying fallback...", lang_code, template)
-            continue
-
-        # Other errors: give up immediately and count as a failure
-        incr_error("wa_template")
-        try:
-            log.error("WA template send failed %s: %s", status, payload or "<non-JSON>")
-        except Exception:
-            log.error("WA template send failed %s: <non-JSON body>", status)
-        return False, status, payload or {"error": "non-json"}
-
-    # Exhausted all fallbacks
-    incr_error("wa_template")
-    if retry_needed:
-        log.error("WA template send failed after fallbacks; last_status=%s last_payload=%s", last_status, last_payload or "<non-JSON>")
-    else:
-        log.error("WA template send failed; no fallback applicable; last_status=%s last_payload=%s", last_status, last_payload or "<non-JSON>")
-    return False, last_status or 500, last_payload or {"error": "template failed after fallbacks"}
-
-def send_whatsapp_buttons(to: str, body: str, buttons: List[Dict[str, str]]) -> Tuple[bool, int, dict]:
-    """
-    Optional: interactive buttons (reply buttons).
-    buttons = [{"id":"next_lesson","title":"Next lesson"}, ...]
-    """
-    to_norm = _normalize_msisdn(to)
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to_norm,
+        "to": to,
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": body},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
-                    for b in buttons
-                ]
-            },
+            "body": {"text": body_text},
+            "action": {"buttons": [{"type": "reply", "reply": b["reply"]} for b in btns]},
+        }
+    }
+    r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=20)
+    ok = r.status_code // 100 == 2
+    if not ok:
+        try:
+            log.error("WA buttons send failed %s: %s", r.status_code, r.json())
+        except Exception:
+            log.error("WA buttons send failed %s (no json body)", r.status_code)
+    return ok, r.status_code, _safe_json(r)
+
+# -----------------------------------------------------------------------------
+# Send: template with language fallback
+# -----------------------------------------------------------------------------
+
+# Per-template preferred language order (most-preferred first).
+# We’ll try these, then fall back to config.TEMPLATE_LANG, then common English variants.
+PREFERRED_LANGS: Dict[str, List[str]] = {
+    # Admin ops
+    "admin_hourly_update": ["en_ZA", "en", "en_US"],
+    "admin_20h00": ["en_ZA", "en", "en_US"],
+    "admin_cancel_all_sessions_admin_sick_unavailable": ["en_ZA", "en", "en_US"],
+    "admin_update": ["en", "en_US", "en_ZA"],
+
+    # Client reminders
+    "session_tomorrow": ["en_US", "en", "en_ZA"],
+    "session_next_hour": ["en", "en_US", "en_ZA"],
+    "weekly_template_message": ["en", "en_US", "en_ZA"],
+}
+
+def send_whatsapp_template(
+    to: str,
+    template_name: str,
+    params: Optional[List[str]] = None,
+    lang_prefer: Optional[str] = None,
+) -> Tuple[bool, int, Dict[str, Any], Optional[str]]:
+    """
+    Send a template message with robust language fallback.
+
+    Args:
+        to: recipient wa_id or phone (without +).
+        template_name: Meta-approved template name.
+        params: list of strings -> used as BODY parameters {{1}}, {{2}}, ...
+        lang_prefer: optional explicit first-choice language (e.g., "en_ZA").
+
+    Returns:
+        (ok, status_code, response_json, chosen_language)
+    """
+    params = params or []
+    # Build prioritized language chain without duplicates
+    chain = []
+    if lang_prefer:
+        chain.append(lang_prefer)
+    chain.extend(PREFERRED_LANGS.get(template_name, []))
+    if TEMPLATE_LANG:
+        chain.append(TEMPLATE_LANG)
+    chain.extend(["en_ZA", "en_US", "en"])  # generic fallbacks
+
+    # de-duplicate while preserving order
+    seen = set()
+    lang_chain = []
+    for code in chain:
+        if code and code not in seen:
+            seen.add(code)
+            lang_chain.append(code)
+
+    # Try each language until one succeeds or we hit a non-translation error
+    last_resp: Dict[str, Any] = {}
+    last_status = 0
+    for lang in lang_chain:
+        payload = _template_payload(to, template_name, lang, params)
+        r = requests.post(GRAPH_URL, headers=_headers(), json=payload, timeout=20)
+        last_status = r.status_code
+        last_resp = _safe_json(r)
+
+        if r.status_code // 100 == 2:
+            return True, r.status_code, last_resp, lang
+
+        # If the error is "template not in this translation", continue fallback.
+        err = (last_resp or {}).get("error", {})
+        err_code = err.get("code")
+        details = (err.get("error_data") or {}).get("details", "")
+        if err_code == 132001 and "does not exist in" in str(details):
+            log.warning("WA template missing in lang=%s (name=%s); trying fallback...", lang, template_name)
+            continue
+
+        # For parameter format issues or 24h window etc., don't keep trying.
+        if err_code in (131047, 132018):
+            log.error("WA send failed %s: %s", r.status_code, last_resp)
+            return False, r.status_code, last_resp, lang
+
+        # Unknown error: stop retrying to avoid rate noise
+        log.error("WA send failed %s: %s", r.status_code, last_resp)
+        return False, r.status_code, last_resp, lang
+
+    # If we exhausted the chain
+    log.error("WA template send failed for all languages (name=%s). last_status=%s resp=%s",
+              template_name, last_status, last_resp)
+    return False, last_status, last_resp, None
+
+def _template_payload(to: str, template_name: str, language: str, params: List[str]) -> Dict[str, Any]:
+    return {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": _normalize_param(p)} for p in params],
+                }
+            ],
         },
     }
-    resp = requests.post(GRAPH_URL, json=data, headers=_auth_headers(), timeout=15)
-    ok = 200 <= resp.status_code < 300
-    if not ok:
-        incr_error("wa_buttons")
-        try:
-            log.error("WA buttons failed %s: %s", resp.status_code, resp.json())
-            return False, resp.status_code, resp.json()
-        except Exception:
-            log.error("WA buttons failed %s: <non-JSON body>", resp.status_code)
-            return False, resp.status_code, {"error": "non-json"}
-    return True, resp.status_code, resp.json()
+
+def _normalize_param(s: str) -> str:
+    """
+    WhatsApp template params cannot include newlines or tab characters,
+    and cannot have 5+ consecutive spaces. Normalize lightly.
+    """
+    if s is None:
+        return ""
+    out = str(s).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    while "     " in out:  # collapse 5+ spaces to 4
+        out = out.replace("     ", "    ")
+    return out.strip()
+
+def _safe_json(r: requests.Response) -> Dict[str, Any]:
+    try:
+        return r.json()
+    except Exception:
+        return {}
