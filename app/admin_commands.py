@@ -1,31 +1,25 @@
 import re
 from flask import url_for
 from .settings import ADMIN_NUMBER
-from .invoices import generate_invoice_text
-from .invoices_workflow import generate_payments_report
-
-# ────────────────────────────────────────────────
-# Handle "invoice ..." admin command
-# ────────────────────────────────────────────────
+from .invoices import generate_invoice_whatsapp
 
 def handle_invoice_command(from_number: str, message: str) -> str | None:
     """
     Process admin 'invoice' commands.
-    Examples:
-      - "invoice Sept" → monthly report
-      - "invoice Lily Sept" → single client invoice
-    Returns a text message (or None if not an invoice command).
+    - "invoice Sept" → monthly report
+    - "invoice Lily Sept" → short WhatsApp invoice (same as client gets)
     """
     if from_number != ADMIN_NUMBER:
-        return None  # only Nadine can use this
+        return None
 
     m = re.match(r"^invoice\s+(.+)$", message.strip(), flags=re.I)
     if not m:
         return None
 
     args = m.group(1).strip().split(maxsplit=1)
+
     if len(args) == 1:
-        # only month provided → monthly report
+        # Only month provided → monthly report
         month_spec = args[0]
         report_url = url_for("diag_monthly_report_html", month=month_spec, _external=True)
         csv_url = url_for("diag_monthly_report_csv", month=month_spec, _external=True)
@@ -35,14 +29,8 @@ def handle_invoice_command(from_number: str, message: str) -> str | None:
             f"• Download CSV: {csv_url}"
         )
     else:
-        # client + month provided → individual invoice
+        # Client + month provided → short WhatsApp invoice
         client_name, month_spec = args[0], args[1]
-        invoice_text = generate_invoice_text(client_name, month_spec)
-        html_url = url_for("diag_invoice_html", client=client_name, month=month_spec, _external=True)
-        csv_url = url_for("diag_invoice_csv", client=client_name, month=month_spec, _external=True)
-        return (
-            f"{invoice_text}\n\n"
-            f"🔗 Download options:\n"
-            f"• HTML: {html_url}\n"
-            f"• CSV: {csv_url}"
-        )
+        base_url = url_for("webhook", _external=True).rstrip("/webhook")  # get app base URL
+        invoice_msg = generate_invoice_whatsapp(client_name, month_spec, base_url)
+        return invoice_msg

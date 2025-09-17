@@ -3,11 +3,12 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import List, Tuple, Dict
 from collections import defaultdict
-import calendar
-import re
+import calendar, re
 
 from sqlalchemy import text
 from .db import db_session
+
+from weasyprint import HTML   # NEW for PDF generation
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Banking details & notes
@@ -116,7 +117,7 @@ def parse_month_spec(spec: str) -> Tuple[date, date, str]:
     return start, end, f"{calendar.month_name[start.month]} {start.year}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Data fetch + invoice builders
+# Data fetch + helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -201,62 +202,84 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
     lines.append("• Send POP once paid")
 
     html_url = f"{base_url}/diag/invoice-html?client={client_name}&month={month_spec}"
+    pdf_url = f"{base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
     lines.append("")
-    lines.append(f"🔗 Full invoice: {html_url}")
+    lines.append(f"🔗 Full invoice (PDF): {pdf_url}")
+    lines.append(f"🔗 Preview (HTML): {html_url}")
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Payments & reconciliation
+# HTML invoice (for preview)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def record_payment(client_name: str, amount: float, pay_date: date, notes: str = "") -> int:
-    sql = text("INSERT INTO payments (client_id, amount, date_received, notes) "
-               "SELECT c.id, :amount, :date_received, :notes "
-               "FROM clients c WHERE c.name ILIKE :client_name RETURNING id")
-    with db_session() as s:
-        row = s.execute(sql, {
-            "client_name": f"%{client_name}%",
-            "amount": amount,
-            "date_received": pay_date,
-            "notes": notes,
-        }).first()
-        s.commit()
-    return row[0] if row else -1
-
-def fetch_payments(client_name: str, start_d: date, end_d: date) -> List[Tuple[date, float, str]]:
-    sql = text("""
-        SELECT p.date_received, p.amount, p.notes
-        FROM payments p
-        JOIN clients c ON c.id = p.client_id
-        WHERE c.name ILIKE :client_name
-          AND p.date_received >= :start_d
-          AND p.date_received < :end_d
-        ORDER BY p.date_received
-    """)
-    with db_session() as s:
-        rows = s.execute(sql, {
-            "client_name": f"%{client_name}%",
-            "start_d": start_d,
-            "end_d": end_d
-        }).all()
-    return [(r[0], float(r[1]), r[2]) for r in rows]
-
-def generate_payments_report(month_spec: str) -> str:
+def generate_invoice_html(client_name: str, month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
+    rows = _fetch_client_rows(client_name, start_d, end_d)
+    totals = _totals(rows)
 
-    sql = text("SELECT id, name FROM clients ORDER BY name")
-    with db_session() as s:
-        clients = s.execute(sql).all()
+    rows_html = ""
+    if rows:
+        for r in rows:
+            kind = classify_type(r.capacity)
+            rate = rate_for_capacity(r.capacity)
+            rows_html += (
+                f"<tr>"
+                f"<td>{r.session_date}</td>"
+                f"<td>{r.start_time}</td>"
+                f"<td>{kind.title()}</td>"
+                f"<td class='right'>R{rate}</td>"
+                f"<td>{r.status}</td>"
+                f"</tr>"
+            )
+    else:
+        rows_html = (
+            "<tr><td colspan='5' class='muted'>No sessions found for this period.</td></tr>"
+        )
 
-    lines = [f"📊 Payments report — {label}", ""]
-    for cid, cname in clients:
-        rows = _fetch_client_rows(cname, start_d, end_d)
-        totals = _totals(rows)
-        billed = totals["billable_amount"]
+    bank_html = "<br>".join(BANKING_LINES)
+    notes_html = "".join([f"<li>{x}</li>" for x in NOTES_LINES])
 
-        pays = fetch_payments(cname, start_d, end_d)
-        paid = sum(p[1] for p in pays)
-        balance = billed - paid
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PilatesHQ Invoice — {client_name} — {label}</title>
+<style>
+  body {{ font-family: system-ui, Arial, sans-serif; margin: 24px; color: #111; }}
+  h1 {{ margin: 0 0 6px 0; font-size: 20px; }}
+  h2 {{ margin: 0 0 18px 0; font-size: 14px; font-weight: normal; color: #555; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; }}
+  th {{ background: #f7f7f7; text-align: left; }}
+  .right {{ text-align: right; }}
+  .muted {{ color: #666; }}
+</style>
+</head>
+<body>
+  <h1>PilatesHQ — Invoice</h1>
+  <h2>Client: {client_name} • Period: {label}</h2>
+  <table>
+    <thead>
+      <tr><th>Date</th><th>Time</th><th>Type</th><th class="right">Rate</th><th>Status</th></tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+  <p><b>Confirmed:</b> {totals['confirmed']} • <b>Cancelled:</b> {totals['cancelled']}<br>
+  <b>Total sessions billed:</b> {totals['billable_count']}<br>
+  <b>Amount due:</b> R{totals['billable_amount']}</p>
+  <h3>Banking details</h3>
+  <div>{bank_html}</div>
+  <h3>Notes</h3>
+  <ul>{notes_html}</ul>
+</body>
+</html>"""
+    return html
 
-        lines.append(f"{cname}: billed R{billed}, paid R{paid}, balance R{balance}")
-    return "\n".join(lines)
+# ──────────────────────────────────────────────────────────────────────────────
+# PDF invoice
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_invoice_pdf(client_name: str, month_spec: str) -> bytes:
+    html_str = generate_invoice_html(client_name, month_spec)
+    pdf_bytes = HTML(string=html_str).write_pdf()
+    return pdf_bytes
