@@ -10,9 +10,9 @@ from sqlalchemy import text
 from .db import db_session
 from weasyprint import HTML
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # Banking details & notes
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 BANKING_LINES = [
     "Banking details",
@@ -31,9 +31,9 @@ NOTES_LINES = [
     "Late cancellations of sessions will be charged.",
 ]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # Pricing & classification
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 def classify_type(capacity: int) -> str:
     if capacity <= 1:
@@ -48,9 +48,9 @@ def rate_for_capacity(capacity: int) -> int:
     t = classify_type(capacity)
     return {"single": 300, "duo": 250, "group": 180}[t]
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # Month parsing
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 _MONTHS = {
     "jan": 1, "january": 1,
@@ -116,9 +116,9 @@ def parse_month_spec(spec: str) -> Tuple[date, date, str]:
     end = _first_of_next_month(start)
     return start, end, f"{calendar.month_name[start.month]} {start.year}"
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 # Data fetch + helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
 
 @dataclass
 class SessionRow:
@@ -151,6 +151,11 @@ def _fetch_client_rows(client_name: str, start_d: date, end_d: date) -> List[Ses
         out.append(SessionRow(d, hhmm, int(cap or 1), st))
     return out
 
+def _fetch_client_name_from_number(phone: str) -> str | None:
+    sql = text("SELECT name FROM clients WHERE phone = :phone LIMIT 1")
+    with db_session() as s:
+        return s.execute(sql, {"phone": phone}).scalar()
+
 def _totals(rows: List[SessionRow]) -> Dict[str, int]:
     confirmed = sum(1 for r in rows if r.status == "confirmed")
     cancelled = sum(1 for r in rows if r.status == "cancelled")
@@ -163,14 +168,35 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
         "billable_amount": billable_amount,
     }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Invoice Generators (WhatsApp + PDF)
-# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_client_id(client_name: str) -> int | None:
+    sql = text("SELECT id FROM clients WHERE name ILIKE :cname LIMIT 1")
+    with db_session() as s:
+        cid = s.execute(sql, {"cname": f"%{client_name}%"}).scalar()
+    return cid
+
+def _fetch_payments(client_id: int, start_d: date, end_d: date) -> float:
+    sql = text("""
+        SELECT COALESCE(SUM(amount),0)
+        FROM payments
+        WHERE client_id = :cid
+          AND date_received >= :start_d
+          AND date_received < :end_d
+    """)
+    with db_session() as s:
+        amt = s.execute(sql, {"cid": client_id, "start_d": start_d, "end_d": end_d}).scalar()
+    return float(amt or 0)
+
+def _fetch_client_payments(client_name: str, start_d: date, end_d: date) -> float:
+    cid = _fetch_client_id(client_name)
+    if not cid:
+        return 0.0
+    return _fetch_payments(cid, start_d, end_d)
+
+# ──────────────────────────────────────────────────────────────
+# Invoice generators (WhatsApp / HTML / PDF)
+# ──────────────────────────────────────────────────────────────
 
 def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) -> str:
-    """
-    Generate a WhatsApp-friendly invoice message.
-    """
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
@@ -188,13 +214,18 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
     if not rows:
         lines.append("No sessions this period.")
     else:
+        lines.append("Sessions:")
         for kind, dates in grouped.items():
             rate = rate_for_capacity(1 if kind == "single" else (2 if kind == "duo" else 3))
             date_str = ", ".join(dates)
             lines.append(f"• {kind.title()}: {date_str} ({len(dates)}x R{rate})")
 
+        paid = _fetch_client_payments(client_name, start_d, end_d)
+        balance = totals["billable_amount"] - paid
         lines.append("")
-        lines.append(f"Total due: R{totals['billable_amount']}")
+        lines.append(f"Billed: R{totals['billable_amount']} | Paid: R{paid} | Balance: R{balance}")
+        if balance <= 0:
+            lines.append("✅ Paid in full")
 
     lines.append("")
     lines.append("Banking details:")
@@ -206,13 +237,10 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
 
     pdf_url = f"{base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
     lines.append("")
-    lines.append(f"🔗 Download full invoice (PDF): {pdf_url}")
+    lines.append(f"🔗 Full invoice (PDF): {pdf_url}")
     return "\n".join(lines)
 
-def _generate_invoice_html(client_name: str, month_spec: str) -> str:
-    """
-    Internal: HTML invoice used for PDF rendering.
-    """
+def generate_invoice_html(client_name: str, month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
@@ -237,6 +265,17 @@ def _generate_invoice_html(client_name: str, month_spec: str) -> str:
     bank_html = "<br>".join(BANKING_LINES)
     notes_html = "".join([f"<li>{x}</li>" for x in NOTES_LINES])
 
+    paid = _fetch_client_payments(client_name, start_d, end_d)
+    balance = totals["billable_amount"] - paid
+
+    paid_html = (
+        f"<p><b>Amount billed:</b> R{totals['billable_amount']}<br>"
+        f"<b>Payments received:</b> R{paid}<br>"
+        f"<b>Balance due:</b> R{balance}</p>"
+    )
+    if balance <= 0:
+        paid_html += "<p style='color:green; font-weight:bold;'>✅ Paid in full</p>"
+
     html = f"""<!doctype html>
 <html>
 <head>
@@ -258,11 +297,13 @@ def _generate_invoice_html(client_name: str, month_spec: str) -> str:
   <h2>Client: {client_name} • Period: {label}</h2>
   <table>
     <thead>
-      <tr><th>Date</th><th>Time</th><th>Type</th><th class='right'>Rate</th><th>Status</th></tr>
+      <tr><th>Date</th><th>Time</th><th>Type</th><th class="right">Rate</th><th>Status</th></tr>
     </thead>
     <tbody>{rows_html}</tbody>
   </table>
-  <p><b>Total billed:</b> R{totals['billable_amount']}</p>
+  <p><b>Confirmed:</b> {totals['confirmed']} • <b>Cancelled:</b> {totals['cancelled']}<br>
+  <b>Total sessions billed:</b> {totals['billable_count']}</p>
+  {paid_html}
   <h3>Banking details</h3>
   <div>{bank_html}</div>
   <h3>Notes</h3>
@@ -272,85 +313,6 @@ def _generate_invoice_html(client_name: str, month_spec: str) -> str:
     return html
 
 def generate_invoice_pdf(client_name: str, month_spec: str) -> bytes:
-    html_str = _generate_invoice_html(client_name, month_spec)
+    html_str = generate_invoice_html(client_name, month_spec)
     pdf_bytes = HTML(string=html_str).write_pdf()
     return pdf_bytes
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Monthly Report (PDF for Nadine)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def generate_monthly_report_pdf(month_spec: str) -> bytes:
-    """
-    Generate a PDF report of all clients' sessions for a given month.
-    """
-    start_d, end_d, label = parse_month_spec(month_spec)
-
-    sql_clients = text("SELECT id, name FROM clients ORDER BY name")
-    with db_session() as s:
-        clients = s.execute(sql_clients).all()
-
-    rows_html = ""
-    for cid, cname in clients:
-        rows = _fetch_client_rows(cname, start_d, end_d)
-        if not rows:
-            continue
-
-        grouped: Dict[str, List[SessionRow]] = defaultdict(list)
-        for r in rows:
-            grouped[classify_type(r.capacity)].append(r)
-
-        client_total = 0
-        subrows = ""
-        for kind, sess in grouped.items():
-            rate = rate_for_capacity(sess[0].capacity)
-            dates = ", ".join(str(r.session_date.day) for r in sess)
-            subtotal = len(sess) * rate
-            client_total += subtotal
-            subrows += (
-                f"<tr>"
-                f"<td>{kind.title()}</td>"
-                f"<td>{dates}</td>"
-                f"<td>{len(sess)}</td>"
-                f"<td class='right'>R{rate}</td>"
-                f"<td class='right'>R{subtotal}</td>"
-                f"</tr>"
-            )
-
-        rows_html += (
-            f"<tr class='client-header'><td colspan='5'><b>{cname}</b> — "
-            f"Total Billed: R{client_total}</td></tr>"
-            f"{subrows}"
-        )
-
-    if not rows_html:
-        rows_html = "<tr><td colspan='5' class='muted'>No sessions found for this period.</td></tr>"
-
-    html = f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>PilatesHQ Monthly Report — {label}</title>
-<style>
-  body {{ font-family: system-ui, Arial, sans-serif; margin: 24px; color: #111; }}
-  h1 {{ margin: 0 0 12px 0; font-size: 20px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
-  th, td {{ border: 1px solid #ddd; padding: 6px; font-size: 13px; }}
-  th {{ background: #f7f7f7; text-align: left; }}
-  .right {{ text-align: right; }}
-  .client-header td {{ background: #eef; font-weight: bold; }}
-  .muted {{ color: #666; }}
-</style>
-</head>
-<body>
-  <h1>PilatesHQ — Monthly Report</h1>
-  <h2>Period: {label}</h2>
-  <table>
-    <thead>
-      <tr><th>Type</th><th>Dates</th><th>Count</th><th>Rate</th><th>Subtotal</th></tr>
-    </thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-</body>
-</html>"""
-    return HTML(string=html).write_pdf()
