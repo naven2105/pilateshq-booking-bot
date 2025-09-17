@@ -1,3 +1,5 @@
+#app/invoices.py
+
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -7,8 +9,7 @@ import calendar, re
 
 from sqlalchemy import text
 from .db import db_session
-
-from weasyprint import HTML   # NEW for PDF generation
+from weasyprint import HTML
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Banking details & notes
@@ -163,8 +164,32 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
         "billable_amount": billable_amount,
     }
 
+def _fetch_client_id(client_name: str) -> int | None:
+    sql = text("SELECT id FROM clients WHERE name ILIKE :cname LIMIT 1")
+    with db_session() as s:
+        cid = s.execute(sql, {"cname": f"%{client_name}%"}).scalar()
+    return cid
+
+def _fetch_payments(client_id: int, start_d: date, end_d: date) -> float:
+    sql = text("""
+        SELECT COALESCE(SUM(amount),0)
+        FROM payments
+        WHERE client_id = :cid
+          AND date_received >= :start_d
+          AND date_received < :end_d
+    """)
+    with db_session() as s:
+        amt = s.execute(sql, {"cid": client_id, "start_d": start_d, "end_d": end_d}).scalar()
+    return float(amt or 0)
+
+def _fetch_client_payments(client_name: str, start_d: date, end_d: date) -> float:
+    cid = _fetch_client_id(client_name)
+    if not cid:
+        return 0.0
+    return _fetch_payments(cid, start_d, end_d)
+
 # ──────────────────────────────────────────────────────────────────────────────
-# WhatsApp short invoice
+# Invoice generators (WhatsApp / HTML / PDF)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) -> str:
@@ -208,9 +233,6 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
     lines.append(f"🔗 Preview (HTML): {html_url}")
     return "\n".join(lines)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HTML invoice (for preview)
-# ──────────────────────────────────────────────────────────────────────────────
 
 def generate_invoice_html(client_name: str, month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
@@ -232,12 +254,22 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
                 f"</tr>"
             )
     else:
-        rows_html = (
-            "<tr><td colspan='5' class='muted'>No sessions found for this period.</td></tr>"
-        )
+        rows_html = "<tr><td colspan='5' class='muted'>No sessions found for this period.</td></tr>"
 
     bank_html = "<br>".join(BANKING_LINES)
     notes_html = "".join([f"<li>{x}</li>" for x in NOTES_LINES])
+
+    # Payments
+    paid = _fetch_client_payments(client_name, start_d, end_d)
+    balance = totals["billable_amount"] - paid
+
+    paid_html = (
+        f"<p><b>Amount billed:</b> R{totals['billable_amount']}<br>"
+        f"<b>Payments received:</b> R{paid}<br>"
+        f"<b>Balance due:</b> R{balance}</p>"
+    )
+    if balance <= 0:
+        paid_html += "<p style='color:green; font-weight:bold;'>✅ Paid in full</p>"
 
     html = f"""<!doctype html>
 <html>
@@ -265,8 +297,8 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
     <tbody>{rows_html}</tbody>
   </table>
   <p><b>Confirmed:</b> {totals['confirmed']} • <b>Cancelled:</b> {totals['cancelled']}<br>
-  <b>Total sessions billed:</b> {totals['billable_count']}<br>
-  <b>Amount due:</b> R{totals['billable_amount']}</p>
+  <b>Total sessions billed:</b> {totals['billable_count']}</p>
+  {paid_html}
   <h3>Banking details</h3>
   <div>{bank_html}</div>
   <h3>Notes</h3>
@@ -275,9 +307,6 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
 </html>"""
     return html
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PDF invoice
-# ──────────────────────────────────────────────────────────────────────────────
 
 def generate_invoice_pdf(client_name: str, month_spec: str) -> bytes:
     html_str = generate_invoice_html(client_name, month_spec)
