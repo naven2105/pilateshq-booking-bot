@@ -6,6 +6,43 @@ from flask import request
 from .admin_reminders import run_admin_morning, run_admin_daily
 from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
 
+from datetime import date
+from .utils import _send_to_meta
+
+logger = logging.getLogger(__name__)
+
+def remind_admin_invoices():
+    """
+    Send Nadine a reminder on the 25th of each month to review invoices.
+    """
+    today = date.today()
+    if today.day != 25:
+        return "Not 25th, skipping."
+
+    # Nadine’s WhatsApp number (put in env or config ideally)
+    to = "27XXXXXXXXX"  
+
+    message = (
+        f"📝 Reminder: Please review PilatesHQ invoices for {today.strftime('%B %Y')}.\n"
+        "Use /monthly_report to view and check. Resolve discrepancies before approving."
+    )
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": message},
+    }
+
+    ok, status, body = _send_to_meta(payload)
+    if not ok:
+        logger.error("[InvoiceReminderError] status=%s body=%s", status, body)
+    else:
+        logger.info("[InvoiceReminderSent] to=%s status=%s", to, status)
+
+    return body
+
+
 log = logging.getLogger(__name__)
 
 def register_tasks(app):

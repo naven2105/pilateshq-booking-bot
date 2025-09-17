@@ -1,12 +1,18 @@
-# app/invoices.py
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import List, Tuple, Dict
+from collections import defaultdict
 import calendar
 import re
 
-# Banking details & notes (rendered in both text and HTML)
+from sqlalchemy import text
+from .db import db_session
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Banking details & notes
+# ──────────────────────────────────────────────────────────────────────────────
+
 BANKING_LINES = [
     "Banking details",
     "Pilates HQ Pty Ltd",
@@ -24,23 +30,11 @@ NOTES_LINES = [
     "Late cancellations of sessions will be charged.",
 ]
 
-
-from sqlalchemy import text
-
-from .db import db_session
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Pricing & classification
 # ──────────────────────────────────────────────────────────────────────────────
 
 def classify_type(capacity: int) -> str:
-    """
-    Map session capacity → commercial type.
-    - 1 → single
-    - 2 → duo
-    - 3..6 → group
-    (Guard: anything <=0 defaults to single; anything >6 treated as group.)
-    """
     if capacity <= 1:
         return "single"
     if capacity == 2:
@@ -50,10 +44,6 @@ def classify_type(capacity: int) -> str:
     return "group"
 
 def rate_for_capacity(capacity: int) -> int:
-    """
-    Rates (ZAR):
-      single=300, duo=250, group=180
-    """
     t = classify_type(capacity)
     return {"single": 300, "duo": 250, "group": 180}[t]
 
@@ -78,37 +68,24 @@ _MONTHS = {
 
 def _first_of_next_month(d: date) -> date:
     y, m = d.year, d.month
-    if m == 12:
-        return date(y + 1, 1, 1)
-    return date(y, m + 1, 1)
+    return date(y + (1 if m == 12 else 0), 1 if m == 12 else m + 1, 1)
 
 def parse_month_spec(spec: str) -> Tuple[date, date, str]:
-    """
-    Accepts:
-      - "this month", "last month"
-      - "sept", "september 2025", "oct 24"
-      - "2025-09" (YYYY-MM)
-    Returns: (start_date, end_date_exclusive, pretty_label)
-    """
     s = (spec or "").strip().lower()
     today = date.today()
 
     if s in ("this month", "thismonth", "tm"):
         start = date(today.year, today.month, 1)
         end = _first_of_next_month(start)
-        label = f"{calendar.month_name[start.month]} {start.year}"
-        return start, end, label
+        return start, end, f"{calendar.month_name[start.month]} {start.year}"
 
     if s in ("last month", "lastmonth", "lm"):
-        # go to first of this month, subtract one day → last month
         first_this = date(today.year, today.month, 1)
         last_prev = first_this - timedelta(days=1)
         start = date(last_prev.year, last_prev.month, 1)
         end = _first_of_next_month(start)
-        label = f"{calendar.month_name[start.month]} {start.year}"
-        return start, end, label
+        return start, end, f"{calendar.month_name[start.month]} {start.year}"
 
-    # YYYY-MM
     m = re.match(r"^\s*(\d{4})-(\d{1,2})\s*$", s)
     if m:
         y = int(m.group(1)); mnum = int(m.group(2))
@@ -116,7 +93,6 @@ def parse_month_spec(spec: str) -> Tuple[date, date, str]:
         end = _first_of_next_month(start)
         return start, end, f"{calendar.month_name[mnum]} {y}"
 
-    # "sept", "september 2025", "oct 24"
     parts = s.split()
     if len(parts) == 1 and parts[0] in _MONTHS:
         mnum = _MONTHS[parts[0]]
@@ -127,21 +103,17 @@ def parse_month_spec(spec: str) -> Tuple[date, date, str]:
 
     if len(parts) >= 1 and parts[0] in _MONTHS:
         mnum = _MONTHS[parts[0]]
-        # year may be 2-digit or 4-digit
+        y = today.year
         if len(parts) >= 2 and parts[1].isdigit():
             yraw = int(parts[1])
             y = 2000 + yraw if yraw < 100 else yraw
-        else:
-            y = today.year
         start = date(y, mnum, 1)
         end = _first_of_next_month(start)
         return start, end, f"{calendar.month_name[mnum]} {y}"
 
-    # Fallback: treat as "this month"
     start = date(today.year, today.month, 1)
     end = _first_of_next_month(start)
-    label = f"{calendar.month_name[start.month]} {start.year}"
-    return start, end, label
+    return start, end, f"{calendar.month_name[start.month]} {start.year}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data fetch + invoice builders
@@ -190,136 +162,101 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
         "billable_amount": billable_amount,
     }
 
-def generate_invoice_text(client_name: str, month_spec: str) -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+# WhatsApp short invoice
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
 
-    def banking_block() -> List[str]:
-        out = [""]
-        out.append("—")
-        out.extend(BANKING_LINES)
-        out.append("")
-        out.append("Notes:")
-        out.extend([f"• {x}" for x in NOTES_LINES])
-        return out
-
-    if not rows:
-        lines = [
-            f"PilatesHQ Invoice — {client_name}",
-            f"Period: {label}",
-            "",
-            "No sessions found for this period.",
-            "If you missed classes, reply *BOOK* to schedule — we’re missing you! 💪",
-        ]
-        lines.extend(banking_block())
-        return "\n".join(lines)
-
-    lines = []
-    lines.append(f"PilatesHQ Invoice — {client_name}")
-    lines.append(f"Period: {label}")
-    lines.append("")
-    lines.append("Sessions:")
+    grouped: Dict[str, List[str]] = defaultdict(list)
     for r in rows:
         kind = classify_type(r.capacity)
-        rate = rate_for_capacity(r.capacity)
-        lines.append(f"• {r.session_date} {r.start_time} — {kind.title()} (R{rate}) — {r.status}")
+        grouped[kind].append(str(r.session_date.day))
+
+    lines = []
+    lines.append(f"📑 PilatesHQ Invoice — {client_name}")
+    lines.append(f"Period: {label}")
     lines.append("")
-    lines.append(f"Confirmed: {totals['confirmed']}  |  Cancelled (still billable, credit carried): {totals['cancelled']}")
-    lines.append(f"Total sessions billed: {totals['billable_count']}")
-    lines.append(f"Amount due: R{totals['billable_amount']}")
+
+    if not rows:
+        lines.append("No sessions this period.")
+    else:
+        lines.append("Sessions:")
+        for kind, dates in grouped.items():
+            rate = rate_for_capacity(1 if kind == "single" else (2 if kind == "duo" else 3))
+            date_str = ", ".join(dates)
+            lines.append(f"• {kind.title()}: {date_str} ({len(dates)}x R{rate})")
+        lines.append("")
+        lines.append(f"Total due: R{totals['billable_amount']}")
+
     lines.append("")
-    lines.append("Note: Cancelled bookings remain billable. Credits carry over to the next cycle.")
-    lines.extend(banking_block())
+    lines.append("Banking details:")
+    lines.extend(BANKING_LINES[1:])
+    lines.append("")
+    lines.append("Notes:")
+    lines.append("• Use your name as reference")
+    lines.append("• Send POP once paid")
+
+    html_url = f"{base_url}/diag/invoice-html?client={client_name}&month={month_spec}"
+    lines.append("")
+    lines.append(f"🔗 Full invoice: {html_url}")
     return "\n".join(lines)
 
-def generate_invoice_html(client_name: str, month_spec: str) -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+# Payments & reconciliation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def record_payment(client_name: str, amount: float, pay_date: date, notes: str = "") -> int:
+    sql = text("INSERT INTO payments (client_id, amount, date_received, notes) "
+               "SELECT c.id, :amount, :date_received, :notes "
+               "FROM clients c WHERE c.name ILIKE :client_name RETURNING id")
+    with db_session() as s:
+        row = s.execute(sql, {
+            "client_name": f"%{client_name}%",
+            "amount": amount,
+            "date_received": pay_date,
+            "notes": notes,
+        }).first()
+        s.commit()
+    return row[0] if row else -1
+
+def fetch_payments(client_name: str, start_d: date, end_d: date) -> List[Tuple[date, float, str]]:
+    sql = text("""
+        SELECT p.date_received, p.amount, p.notes
+        FROM payments p
+        JOIN clients c ON c.id = p.client_id
+        WHERE c.name ILIKE :client_name
+          AND p.date_received >= :start_d
+          AND p.date_received < :end_d
+        ORDER BY p.date_received
+    """)
+    with db_session() as s:
+        rows = s.execute(sql, {
+            "client_name": f"%{client_name}%",
+            "start_d": start_d,
+            "end_d": end_d
+        }).all()
+    return [(r[0], float(r[1]), r[2]) for r in rows]
+
+def generate_payments_report(month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
-    rows = _fetch_client_rows(client_name, start_d, end_d)
-    totals = _totals(rows)
 
-    rows_html = ""
-    if rows:
-        for r in rows:
-            kind = classify_type(r.capacity)
-            rate = rate_for_capacity(r.capacity)
-            rows_html += (
-                f"<tr>"
-                f"<td>{r.session_date}</td>"
-                f"<td>{r.start_time}</td>"
-                f"<td>{kind.title()}</td>"
-                f"<td class='right'>R{rate}</td>"
-                f"<td>{r.status}</td>"
-                f"</tr>"
-            )
-    else:
-        rows_html = (
-            "<tr><td colspan='5' class='muted'>No sessions found for this period."
-            " If you missed classes, book your next one — we’re missing you! 💪</td></tr>"
-        )
+    sql = text("SELECT id, name FROM clients ORDER BY name")
+    with db_session() as s:
+        clients = s.execute(sql).all()
 
-    bank_html = "<br>".join(BANKING_LINES)
-    notes_html = "".join([f"<li>{x}</li>" for x in NOTES_LINES])
+    lines = [f"📊 Payments report — {label}", ""]
+    for cid, cname in clients:
+        rows = _fetch_client_rows(cname, start_d, end_d)
+        totals = _totals(rows)
+        billed = totals["billable_amount"]
 
-    html = f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>PilatesHQ Invoice — {client_name} — {label}</title>
-<style>
-  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; color: #111; }}
-  h1 {{ margin: 0 0 6px 0; font-size: 20px; }}
-  h2 {{ margin: 0 0 18px 0; font-size: 14px; font-weight: normal; color: #555; }}
-  h3 {{ margin: 18px 0 6px 0; font-size: 14px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
-  th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; }}
-  th {{ background: #f7f7f7; text-align: left; }}
-  .right {{ text-align: right; }}
-  .muted {{ color: #666; }}
-  .summary {{ margin-top: 16px; font-size: 13px; }}
-  .totals {{ margin-top: 6px; font-weight: 600; }}
-  .note {{ margin-top: 12px; font-size: 12px; color: #555; }}
-  @media print {{
-    body {{ margin: 0; }}
-    .no-print {{ display: none; }}
-  }}
-</style>
-</head>
-<body>
-  <div class="no-print" style="text-align:right;">
-    <button onclick="window.print()">Print / Save as PDF</button>
-  </div>
-  <h1>PilatesHQ — Invoice</h1>
-  <h2>Client: {client_name} &nbsp;•&nbsp; Period: {label}</h2>
+        pays = fetch_payments(cname, start_d, end_d)
+        paid = sum(p[1] for p in pays)
+        balance = billed - paid
 
-  <table>
-    <thead>
-      <tr>
-        <th>Date</th><th>Time</th><th>Type</th><th class="right">Rate</th><th>Status</th>
-      </tr>
-    </thead>
-    <tbody>
-      {rows_html}
-    </tbody>
-  </table>
-
-  <div class="summary">
-    Confirmed: {totals['confirmed']} &nbsp;|&nbsp; Cancelled (billable): {totals['cancelled']}<br>
-    Total sessions billed: {totals['billable_count']}<br>
-    <span class="totals">Amount due: R{totals['billable_amount']}</span>
-  </div>
-
-  <h3>Banking details</h3>
-  <div>{bank_html}</div>
-
-  <h3>Notes</h3>
-  <ul>
-    {notes_html}
-  </ul>
-
-  <div class="note">
-    Note: Cancelled bookings remain billable; credits carry to the next cycle.
-  </div>
-</body>
-</html>"""
-    return html
+        lines.append(f"{cname}: billed R{billed}, paid R{paid}, balance R{balance}")
+    return "\n".join(lines)
