@@ -1,3 +1,4 @@
+# app/invoices.py
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -162,35 +163,14 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
         "billable_amount": billable_amount,
     }
 
-def _fetch_client_id(client_name: str) -> int | None:
-    sql = text("SELECT id FROM clients WHERE name ILIKE :cname LIMIT 1")
-    with db_session() as s:
-        cid = s.execute(sql, {"cname": f"%{client_name}%"}).scalar()
-    return cid
-
-def _fetch_payments(client_id: int, start_d: date, end_d: date) -> float:
-    sql = text("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM payments
-        WHERE client_id = :cid
-          AND date_received >= :start_d
-          AND date_received < :end_d
-    """)
-    with db_session() as s:
-        amt = s.execute(sql, {"cid": client_id, "start_d": start_d, "end_d": end_d}).scalar()
-    return float(amt or 0)
-
-def _fetch_client_payments(client_name: str, start_d: date, end_d: date) -> float:
-    cid = _fetch_client_id(client_name)
-    if not cid:
-        return 0.0
-    return _fetch_payments(cid, start_d, end_d)
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Invoice generators (WhatsApp / HTML / PDF)
+# Invoice Generators (WhatsApp + PDF)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) -> str:
+    """
+    Generate a WhatsApp-friendly invoice message.
+    """
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
@@ -208,19 +188,13 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
     if not rows:
         lines.append("No sessions this period.")
     else:
-        lines.append("Sessions:")
         for kind, dates in grouped.items():
             rate = rate_for_capacity(1 if kind == "single" else (2 if kind == "duo" else 3))
             date_str = ", ".join(dates)
             lines.append(f"• {kind.title()}: {date_str} ({len(dates)}x R{rate})")
 
-        # Payment details
-        paid = _fetch_client_payments(client_name, start_d, end_d)
-        balance = totals["billable_amount"] - paid
         lines.append("")
-        lines.append(f"Billed: R{totals['billable_amount']} | Paid: R{paid} | Balance: R{balance}")
-        if balance <= 0:
-            lines.append("✅ Paid in full")
+        lines.append(f"Total due: R{totals['billable_amount']}")
 
     lines.append("")
     lines.append("Banking details:")
@@ -230,15 +204,15 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
     lines.append("• Use your name as reference")
     lines.append("• Send POP once paid")
 
-    html_url = f"{base_url}/diag/invoice-html?client={client_name}&month={month_spec}"
     pdf_url = f"{base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
     lines.append("")
-    lines.append(f"🔗 Full invoice (PDF): {pdf_url}")
-    lines.append(f"🔗 Preview (HTML): {html_url}")
+    lines.append(f"🔗 Download full invoice (PDF): {pdf_url}")
     return "\n".join(lines)
 
-
-def generate_invoice_html(client_name: str, month_spec: str) -> str:
+def _generate_invoice_html(client_name: str, month_spec: str) -> str:
+    """
+    Internal: HTML invoice used for PDF rendering.
+    """
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
     totals = _totals(rows)
@@ -263,18 +237,6 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
     bank_html = "<br>".join(BANKING_LINES)
     notes_html = "".join([f"<li>{x}</li>" for x in NOTES_LINES])
 
-    # Payments
-    paid = _fetch_client_payments(client_name, start_d, end_d)
-    balance = totals["billable_amount"] - paid
-
-    paid_html = (
-        f"<p><b>Amount billed:</b> R{totals['billable_amount']}<br>"
-        f"<b>Payments received:</b> R{paid}<br>"
-        f"<b>Balance due:</b> R{balance}</p>"
-    )
-    if balance <= 0:
-        paid_html += "<p style='color:green; font-weight:bold;'>✅ Paid in full</p>"
-
     html = f"""<!doctype html>
 <html>
 <head>
@@ -296,13 +258,11 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
   <h2>Client: {client_name} • Period: {label}</h2>
   <table>
     <thead>
-      <tr><th>Date</th><th>Time</th><th>Type</th><th class="right">Rate</th><th>Status</th></tr>
+      <tr><th>Date</th><th>Time</th><th>Type</th><th class='right'>Rate</th><th>Status</th></tr>
     </thead>
     <tbody>{rows_html}</tbody>
   </table>
-  <p><b>Confirmed:</b> {totals['confirmed']} • <b>Cancelled:</b> {totals['cancelled']}<br>
-  <b>Total sessions billed:</b> {totals['billable_count']}</p>
-  {paid_html}
+  <p><b>Total billed:</b> R{totals['billable_amount']}</p>
   <h3>Banking details</h3>
   <div>{bank_html}</div>
   <h3>Notes</h3>
@@ -311,55 +271,19 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
 </html>"""
     return html
 
-
 def generate_invoice_pdf(client_name: str, month_spec: str) -> bytes:
-    html_str = generate_invoice_html(client_name, month_spec)
+    html_str = _generate_invoice_html(client_name, month_spec)
     pdf_bytes = HTML(string=html_str).write_pdf()
     return pdf_bytes
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Monthly Reports (with payments)
+# Monthly Report (PDF for Nadine)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def generate_monthly_report_csv(month_spec: str) -> str:
-    start_d, end_d, label = parse_month_spec(month_spec)
-
-    sql_clients = text("SELECT id, name FROM clients ORDER BY name")
-    with db_session() as s:
-        clients = s.execute(sql_clients).all()
-
-    lines = ["Client,Type,Dates,Count,Rate,Subtotal,TotalBilled,Paid,Outstanding"]
-    for cid, cname in clients:
-        rows = _fetch_client_rows(cname, start_d, end_d)
-        if not rows:
-            continue
-
-        grouped: Dict[str, List[SessionRow]] = defaultdict(list)
-        for r in rows:
-            grouped[classify_type(r.capacity)].append(r)
-
-        client_total = 0
-        for kind, sess in grouped.items():
-            rate = rate_for_capacity(sess[0].capacity)
-            subtotal = len(sess) * rate
-            client_total += subtotal
-
-        paid = _fetch_payments(cid, start_d, end_d)
-        outstanding = client_total - paid
-
-        for kind, sess in grouped.items():
-            rate = rate_for_capacity(sess[0].capacity)
-            dates = [str(r.session_date.day) for r in sess]
-            subtotal = len(sess) * rate
-            lines.append(
-                f"{cname},{kind},{' '.join(dates)},{len(sess)},{rate},"
-                f"{subtotal},{client_total},{paid},{outstanding}"
-            )
-
-    return "\n".join(lines)
-
-
-def generate_monthly_report_html(month_spec: str) -> str:
+def generate_monthly_report_pdf(month_spec: str) -> bytes:
+    """
+    Generate a PDF report of all clients' sessions for a given month.
+    """
     start_d, end_d, label = parse_month_spec(month_spec)
 
     sql_clients = text("SELECT id, name FROM clients ORDER BY name")
@@ -393,12 +317,9 @@ def generate_monthly_report_html(month_spec: str) -> str:
                 f"</tr>"
             )
 
-        paid = _fetch_payments(cid, start_d, end_d)
-        outstanding = client_total - paid
-
         rows_html += (
             f"<tr class='client-header'><td colspan='5'><b>{cname}</b> — "
-            f"Total Billed: R{client_total} | Paid: R{paid} | Outstanding: R{outstanding}</td></tr>"
+            f"Total Billed: R{client_total}</td></tr>"
             f"{subrows}"
         )
 
@@ -432,10 +353,4 @@ def generate_monthly_report_html(month_spec: str) -> str:
   </table>
 </body>
 </html>"""
-    return html
-
-def generate_monthly_report_pdf(month_spec: str) -> bytes:
-    """Generate a PDF report of all clients' sessions for a given month."""
-    html_str = generate_monthly_report_html(month_spec)
-    pdf_bytes = HTML(string=html_str).write_pdf()
-    return pdf_bytes
+    return HTML(string=html).write_pdf()
