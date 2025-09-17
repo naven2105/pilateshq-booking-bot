@@ -14,3 +14,16 @@ PRICING_RULES = {
 # Max number of clients allowed in a group session
 # (Change if new reformers are bought or sold)
 GROUP_MAX_CAPACITY = 6
+
+import os
+
+# WhatsApp Cloud API
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+
+# Admin (Nadine) WhatsApp number
+# Format: E.164 (no +, just digits, e.g., 27735534607)
+ADMIN_NUMBER = os.getenv("ADMIN_NUMBER", "27735534607")
+
+# App settings
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "your-verify-token")
