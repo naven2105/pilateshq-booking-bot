@@ -1,5 +1,3 @@
-#app/invoices.py
-
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -215,8 +213,14 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) 
             rate = rate_for_capacity(1 if kind == "single" else (2 if kind == "duo" else 3))
             date_str = ", ".join(dates)
             lines.append(f"• {kind.title()}: {date_str} ({len(dates)}x R{rate})")
+
+        # Payment details
+        paid = _fetch_client_payments(client_name, start_d, end_d)
+        balance = totals["billable_amount"] - paid
         lines.append("")
-        lines.append(f"Total due: R{totals['billable_amount']}")
+        lines.append(f"Billed: R{totals['billable_amount']} | Paid: R{paid} | Balance: R{balance}")
+        if balance <= 0:
+            lines.append("✅ Paid in full")
 
     lines.append("")
     lines.append("Banking details:")
@@ -310,5 +314,128 @@ def generate_invoice_html(client_name: str, month_spec: str) -> str:
 
 def generate_invoice_pdf(client_name: str, month_spec: str) -> bytes:
     html_str = generate_invoice_html(client_name, month_spec)
+    pdf_bytes = HTML(string=html_str).write_pdf()
+    return pdf_bytes
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Monthly Reports (with payments)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_monthly_report_csv(month_spec: str) -> str:
+    start_d, end_d, label = parse_month_spec(month_spec)
+
+    sql_clients = text("SELECT id, name FROM clients ORDER BY name")
+    with db_session() as s:
+        clients = s.execute(sql_clients).all()
+
+    lines = ["Client,Type,Dates,Count,Rate,Subtotal,TotalBilled,Paid,Outstanding"]
+    for cid, cname in clients:
+        rows = _fetch_client_rows(cname, start_d, end_d)
+        if not rows:
+            continue
+
+        grouped: Dict[str, List[SessionRow]] = defaultdict(list)
+        for r in rows:
+            grouped[classify_type(r.capacity)].append(r)
+
+        client_total = 0
+        for kind, sess in grouped.items():
+            rate = rate_for_capacity(sess[0].capacity)
+            subtotal = len(sess) * rate
+            client_total += subtotal
+
+        paid = _fetch_payments(cid, start_d, end_d)
+        outstanding = client_total - paid
+
+        for kind, sess in grouped.items():
+            rate = rate_for_capacity(sess[0].capacity)
+            dates = [str(r.session_date.day) for r in sess]
+            subtotal = len(sess) * rate
+            lines.append(
+                f"{cname},{kind},{' '.join(dates)},{len(sess)},{rate},"
+                f"{subtotal},{client_total},{paid},{outstanding}"
+            )
+
+    return "\n".join(lines)
+
+
+def generate_monthly_report_html(month_spec: str) -> str:
+    start_d, end_d, label = parse_month_spec(month_spec)
+
+    sql_clients = text("SELECT id, name FROM clients ORDER BY name")
+    with db_session() as s:
+        clients = s.execute(sql_clients).all()
+
+    rows_html = ""
+    for cid, cname in clients:
+        rows = _fetch_client_rows(cname, start_d, end_d)
+        if not rows:
+            continue
+
+        grouped: Dict[str, List[SessionRow]] = defaultdict(list)
+        for r in rows:
+            grouped[classify_type(r.capacity)].append(r)
+
+        client_total = 0
+        subrows = ""
+        for kind, sess in grouped.items():
+            rate = rate_for_capacity(sess[0].capacity)
+            dates = ", ".join(str(r.session_date.day) for r in sess)
+            subtotal = len(sess) * rate
+            client_total += subtotal
+            subrows += (
+                f"<tr>"
+                f"<td>{kind.title()}</td>"
+                f"<td>{dates}</td>"
+                f"<td>{len(sess)}</td>"
+                f"<td class='right'>R{rate}</td>"
+                f"<td class='right'>R{subtotal}</td>"
+                f"</tr>"
+            )
+
+        paid = _fetch_payments(cid, start_d, end_d)
+        outstanding = client_total - paid
+
+        rows_html += (
+            f"<tr class='client-header'><td colspan='5'><b>{cname}</b> — "
+            f"Total Billed: R{client_total} | Paid: R{paid} | Outstanding: R{outstanding}</td></tr>"
+            f"{subrows}"
+        )
+
+    if not rows_html:
+        rows_html = "<tr><td colspan='5' class='muted'>No sessions found for this period.</td></tr>"
+
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PilatesHQ Monthly Report — {label}</title>
+<style>
+  body {{ font-family: system-ui, Arial, sans-serif; margin: 24px; color: #111; }}
+  h1 {{ margin: 0 0 12px 0; font-size: 20px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+  th, td {{ border: 1px solid #ddd; padding: 6px; font-size: 13px; }}
+  th {{ background: #f7f7f7; text-align: left; }}
+  .right {{ text-align: right; }}
+  .client-header td {{ background: #eef; font-weight: bold; }}
+  .muted {{ color: #666; }}
+</style>
+</head>
+<body>
+  <h1>PilatesHQ — Monthly Report</h1>
+  <h2>Period: {label}</h2>
+  <table>
+    <thead>
+      <tr><th>Type</th><th>Dates</th><th>Count</th><th>Rate</th><th>Subtotal</th></tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+</body>
+</html>"""
+    return html
+
+def generate_monthly_report_pdf(month_spec: str) -> bytes:
+    """Generate a PDF report of all clients' sessions for a given month."""
+    html_str = generate_monthly_report_html(month_spec)
     pdf_bytes = HTML(string=html_str).write_pdf()
     return pdf_bytes
