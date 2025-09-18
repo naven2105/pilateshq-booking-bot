@@ -1,6 +1,6 @@
 # app/router.py
 from flask import Blueprint, request, Response
-from .invoices import generate_invoice_pdf, generate_invoice_whatsapp
+from .invoices import generate_invoice_pdf
 from .utils import _send_to_meta
 from .db import db_session
 from sqlalchemy import text
