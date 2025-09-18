@@ -1,5 +1,3 @@
-# app/invoices.py
-
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -163,6 +161,63 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
 # ──────────────────────────────────────────────
 # Invoice generators
 # ──────────────────────────────────────────────
+
+def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str) -> str:
+    """Generate a WhatsApp-friendly invoice summary with dates and amounts."""
+    start_d, end_d, label = parse_month_spec(month_spec)
+    rows = _fetch_client_rows(client_name, start_d, end_d)
+    totals = _totals(rows)
+
+    if not rows:
+        return (
+            f"📑 PilatesHQ Invoice — {client_name}\n"
+            f"Period: {label}\n\n"
+            "No sessions this period.\n\n"
+            "Banking details:\n" + "\n".join(BANKING_LINES[1:]) +
+            "\n\nNotes:\n• Use your name as reference\n• Send POP once paid\n"
+            f"\n🔗 Download full invoice (PDF): {base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
+        )
+
+    # Group by type
+    grouped: Dict[str, List[SessionRow]] = defaultdict(list)
+    for r in rows:
+        grouped[classify_type(r.capacity)].append(r)
+
+    # Build message
+    lines = []
+    lines.append(f"📑 PilatesHQ Invoice — {client_name}")
+    lines.append(f"Period: {label}")
+    lines.append("")
+
+    month_short = label.split()[0][:3]  # e.g. Sept
+    for kind, sess in grouped.items():
+        rate = rate_for_capacity(sess[0].capacity)
+        dates = ",".join(str(r.session_date.day) for r in sess)
+        lines.append(f"• {kind.title()}: Date: {dates} {month_short} ({len(sess)}x R{rate})")
+
+    # Payment details
+    paid = _fetch_client_payments(client_name, start_d, end_d)
+    balance = totals["billable_amount"] - paid
+    lines.append("")
+    lines.append(f"Billed: R{totals['billable_amount']} | Paid: R{paid} | Balance: R{balance}")
+    if balance <= 0:
+        lines.append("✅ Paid in full")
+
+    # Footer
+    lines.append("")
+    lines.append("Banking details:")
+    lines.extend(BANKING_LINES[1:])
+    lines.append("")
+    lines.append("Notes:")
+    lines.append("• Use your name as reference")
+    lines.append("• Send POP once paid")
+    lines.append("")
+    lines.append(f"🔗 Download full invoice (PDF): {base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}")
+
+    return "\n".join(lines)
+
+
+
 def generate_invoice_html(client_name: str, month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
@@ -299,7 +354,102 @@ def generate_monthly_report_html(month_spec: str) -> str:
     return html
 
 def generate_monthly_report_pdf(month_spec: str) -> bytes:
-    """Generate a PDF report of all clients' sessions for a given month."""
     html_str = generate_monthly_report_html(month_spec)
     pdf_bytes = HTML(string=html_str).write_pdf()
     return pdf_bytes
+
+# ──────────────────────────────────────────────
+# WhatsApp-friendly report + payment summaries
+# ──────────────────────────────────────────────
+
+def generate_report_whatsapp(client_name: str, month_spec: str) -> str:
+    """Generate a WhatsApp-friendly monthly session summary for a client."""
+    start_d, end_d, label = parse_month_spec(month_spec)
+    rows = _fetch_client_rows(client_name, start_d, end_d)
+
+    if not rows:
+        return f"📊 Session Report — {client_name}\nPeriod: {label}\n\nNo sessions found."
+
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for r in rows:
+        grouped[classify_type(r.capacity)].append(str(r.session_date.day))
+
+    lines = []
+    lines.append(f"📊 Session Report — {client_name}")
+    lines.append(f"Period: {label}")
+    lines.append("")
+
+    for kind, dates in grouped.items():
+        rate = rate_for_capacity(1 if kind == "single" else (2 if kind == "duo" else 3))
+        date_str = ",".join(dates)
+        lines.append(f"• {kind.title()}: {date_str} ({len(dates)}x R{rate})")
+
+    return "\n".join(lines)
+
+
+def generate_payment_whatsapp(client_name: str, month_spec: str) -> str:
+    """Generate a WhatsApp-friendly payment status for a client."""
+    start_d, end_d, label = parse_month_spec(month_spec)
+    rows = _fetch_client_rows(client_name, start_d, end_d)
+    totals = _totals(rows)
+
+    paid = _fetch_client_payments(client_name, start_d, end_d)
+    balance = totals["billable_amount"] - paid
+
+    lines = []
+    lines.append(f"💳 Payment Status — {client_name}")
+    lines.append(f"Period: {label}")
+    lines.append("")
+    lines.append(f"Billed: R{totals['billable_amount']}")
+    lines.append(f"Paid:   R{paid}")
+    lines.append(f"Balance: R{balance}")
+
+    if balance <= 0:
+        lines.append("✅ Paid in full")
+
+    return "\n".join(lines)
+
+def generate_report_whatsapp(month_spec: str) -> str:
+    """Generate a WhatsApp-friendly monthly report for all clients."""
+    start_d, end_d, label = parse_month_spec(month_spec)
+
+    sql_clients = text("SELECT id, name FROM clients ORDER BY name")
+    with db_session() as s:
+        clients = s.execute(sql_clients).all()
+
+    if not clients:
+        return f"📊 PilatesHQ Monthly Report\nPeriod: {label}\n\nNo clients found."
+
+    lines = []
+    lines.append("📊 PilatesHQ Monthly Report")
+    lines.append(f"Period: {label}")
+    lines.append("")
+
+    month_short = label.split()[0][:3]
+
+    for cid, cname in clients:
+        rows = _fetch_client_rows(cname, start_d, end_d)
+        if not rows:
+            continue
+
+        grouped: Dict[str, List[SessionRow]] = defaultdict(list)
+        for r in rows:
+            grouped[classify_type(r.capacity)].append(r)
+
+        lines.append(f"👩 {cname}")
+        client_total = 0
+        for kind, sess in grouped.items():
+            rate = rate_for_capacity(sess[0].capacity)
+            dates = ",".join(str(r.session_date.day) for r in sess)
+            subtotal = len(sess) * rate
+            client_total += subtotal
+            lines.append(f"• {kind.title()}: Date: {dates} {month_short} ({len(sess)}x R{rate})")
+
+        paid = _fetch_payments(cid, start_d, end_d)
+        outstanding = client_total - paid
+        status = "✅ Paid in full" if outstanding <= 0 else f"Outstanding: R{outstanding}"
+
+        lines.append(f"Total: R{client_total} | Paid: R{paid} | {status}")
+        lines.append("")
+
+    return "\n".join(lines).strip()

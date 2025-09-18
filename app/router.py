@@ -1,10 +1,14 @@
 # app/router.py
+
 from flask import Blueprint, request, Response, jsonify
 from .utils import _send_to_meta
 from .invoices import generate_invoice_pdf, generate_invoice_whatsapp
 
 router_bp = Blueprint("router", __name__)
 
+# ────────────────────────────────────────────────
+# PDF endpoint (for download links)
+# ────────────────────────────────────────────────
 @router_bp.route("/diag/invoice-pdf")
 def diag_invoice_pdf():
     client = request.args.get("client", "")
@@ -17,14 +21,16 @@ def diag_invoice_pdf():
         headers={"Content-Disposition": f"inline; filename={filename}"}
     )
 
-
+# ────────────────────────────────────────────────
+# WhatsApp webhook
+# ────────────────────────────────────────────────
 @router_bp.route("/webhook", methods=["POST"])
 def webhook():
     """
     Handle incoming WhatsApp messages.
     Supports:
-      • "invoice" → current month invoice
-      • "invoice Sept" → invoice for specific month
+      • "invoice" → current month invoice (WhatsApp Lite version + PDF link)
+      • "invoice Sept" → invoice for a specific month
       • fallback → friendly help menu
     """
     data = request.get_json(force=True, silent=True) or {}
