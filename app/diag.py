@@ -4,7 +4,6 @@ from flask import Blueprint, request, jsonify, url_for, Response
 from .utils import _send_to_meta
 from .invoices import (
     generate_invoice_pdf,
-    generate_monthly_report_pdf,
 )
 
 diag_bp = Blueprint("diag", __name__)
