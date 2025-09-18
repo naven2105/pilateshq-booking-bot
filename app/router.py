@@ -1,13 +1,10 @@
 # app/router.py
-from flask import Blueprint, request, Response
-from .invoices import generate_invoice_pdf
+from flask import Blueprint, request, Response, jsonify
 from .utils import _send_to_meta
+from .invoices import generate_invoice_pdf, generate_invoice_whatsapp
 
 router_bp = Blueprint("router", __name__)
 
-# ─────────────────────────────
-# Serve invoice PDF directly
-# ─────────────────────────────
 @router_bp.route("/diag/invoice-pdf")
 def diag_invoice_pdf():
     client = request.args.get("client", "")
@@ -20,39 +17,63 @@ def diag_invoice_pdf():
         headers={"Content-Disposition": f"inline; filename={filename}"}
     )
 
-# ─────────────────────────────
-# Webhook: handle WhatsApp messages
-# ─────────────────────────────
+
 @router_bp.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
-    sender = data.get("from")  # WhatsApp number of client
-    msg_text = data.get("text", {}).get("body", "").strip().lower()
+    """
+    Handle incoming WhatsApp messages.
+    Supports:
+      • "invoice" → current month invoice
+      • "invoice Sept" → invoice for specific month
+      • fallback → friendly help menu
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        entry = data["entry"][0]
+        changes = entry["changes"][0]
+        value = changes["value"]
+        messages = value.get("messages", [])
+        if not messages:
+            return "ok"
 
-    # Simple trigger: "invoice"
-    if msg_text.startswith("invoice"):
-        client_name = sender   # fallback if phone not mapped to a client
-        month_spec = "this month"
+        msg = messages[0]
+        from_wa = msg["from"]  # client phone
+        text = msg.get("text", {}).get("body", "").strip()
+    except Exception as e:
+        return jsonify({"error": f"invalid payload {e}"}), 400
 
-        # Build WhatsApp-lite invoice message
-        pdf_url = f"{request.url_root}diag/invoice-pdf?client={client_name}&month={month_spec}"
-        message = (
-            f"📑 PilatesHQ Invoice — {client_name}\n"
-            f"Period: {month_spec}\n\n"
-            f"💳 Banking details:\n"
-            f"Pilates HQ Pty Ltd\nAbsa Bank\nCurrent Account\nAccount No: 41171518 87\n\n"
-            f"Notes:\n• Use your name as reference\n• Send POP once paid\n\n"
-            f"🔗 Download full invoice (PDF): {pdf_url}"
-        )
+    base_url = request.url_root.strip("/")
+
+    # ──────────────── Command: invoice ────────────────
+    if text.lower().startswith("invoice"):
+        parts = text.split(maxsplit=1)
+        month_spec = parts[1] if len(parts) > 1 else "this month"
+        message = generate_invoice_whatsapp(from_wa, month_spec, base_url)
 
         payload = {
             "messaging_product": "whatsapp",
-            "to": sender,
+            "to": from_wa,
             "type": "text",
             "text": {"body": message},
         }
-        ok, status, body = _send_to_meta(payload)
-        return {"ok": ok, "status": status, "body": body}
+        _send_to_meta(payload)
+        return "ok"
 
-    # Default response
-    return {"ok": True, "note": "No action"}
+    # ──────────────── Fallback ────────────────
+    fallback_msg = (
+        "🤖 Sorry, I didn’t understand that.\n"
+        "Here are some things you can ask me:\n\n"
+        "• invoice [month] → Get your invoice (e.g. 'invoice Sept')\n"
+        "• invoice → Get your invoice for this month\n"
+        "• schedule → View your weekly session schedule\n"
+        "• cancel → Cancel a session\n"
+    )
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": from_wa,
+        "type": "text",
+        "text": {"body": fallback_msg},
+    }
+    _send_to_meta(payload)
+    return "ok"
