@@ -1,13 +1,17 @@
 # app/router.py
-
 from flask import Blueprint, request, Response, jsonify
 from .utils import _send_to_meta
-from .invoices import generate_invoice_pdf, generate_invoice_whatsapp
+from .invoices import (
+    generate_invoice_pdf,
+    generate_invoice_whatsapp,
+    _fetch_client_name_by_phone,   # ✅ NEW import
+)
+import re
 
 router_bp = Blueprint("router", __name__)
 
 # ────────────────────────────────────────────────
-# PDF endpoint (for download links)
+# Invoice PDF
 # ────────────────────────────────────────────────
 @router_bp.route("/diag/invoice-pdf")
 def diag_invoice_pdf():
@@ -21,18 +25,12 @@ def diag_invoice_pdf():
         headers={"Content-Disposition": f"inline; filename={filename}"}
     )
 
+
 # ────────────────────────────────────────────────
-# WhatsApp webhook
+# Webhook (handles invoices, POP, fallback, etc.)
 # ────────────────────────────────────────────────
 @router_bp.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Handle incoming WhatsApp messages.
-    Supports:
-      • "invoice" → current month invoice (WhatsApp Lite version + PDF link)
-      • "invoice Sept" → invoice for a specific month
-      • fallback → friendly help menu
-    """
     data = request.get_json(force=True, silent=True) or {}
     try:
         entry = data["entry"][0]
@@ -43,8 +41,9 @@ def webhook():
             return "ok"
 
         msg = messages[0]
-        from_wa = msg["from"]  # client phone
+        from_wa = msg["from"]
         text = msg.get("text", {}).get("body", "").strip()
+        msg_type = msg.get("type", "text")
     except Exception as e:
         return jsonify({"error": f"invalid payload {e}"}), 400
 
@@ -65,13 +64,52 @@ def webhook():
         _send_to_meta(payload)
         return "ok"
 
+    # ──────────────── POP detection ────────────────
+    pop_keywords = ["pop", "proof of payment", "paid", "deposit", "eft", "payment"]
+    is_pop = False
+
+    if msg_type in ("image", "document"):
+        is_pop = True
+    elif any(k in text.lower() for k in pop_keywords):
+        is_pop = True
+
+    if is_pop:
+        client_name = _fetch_client_name_by_phone(from_wa)
+        # Ask client for amount + reference
+        ask_msg = (
+            "💰 Thanks for sending your payment/POP.\n"
+            "Please reply with:\n"
+            "• Amount paid\n"
+            "• Beneficiary reference used"
+        )
+        _send_to_meta({
+            "messaging_product": "whatsapp",
+            "to": from_wa,
+            "type": "text",
+            "text": {"body": ask_msg},
+        })
+
+        # Notify Nadine (admin)
+        admin_msg = (
+            f"📥 POP received from {client_name} ({from_wa}).\n"
+            f"Awaiting amount + reference confirmation."
+        )
+        _send_to_meta({
+            "messaging_product": "whatsapp",
+            "to": "27627597357",  # Nadine
+            "type": "text",
+            "text": {"body": admin_msg},
+        })
+        return "ok"
+
     # ──────────────── Fallback ────────────────
     fallback_msg = (
         "🤖 Sorry, I didn’t understand that.\n"
         "Here are some things you can ask me:\n\n"
         "• invoice [month] → Get your invoice (e.g. 'invoice Sept')\n"
         "• invoice → Get your invoice for this month\n"
-        "• schedule → View your weekly session schedule\n"
+        "• report → View your monthly session report\n"
+        "• payment → Check your payment status\n"
         "• cancel → Cancel a session\n"
     )
 

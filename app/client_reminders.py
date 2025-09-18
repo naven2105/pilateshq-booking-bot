@@ -1,10 +1,7 @@
-# app/client_reminders.py
 from __future__ import annotations
-
 import logging
 from datetime import datetime, date, time, timedelta
 from typing import List, Tuple
-
 from sqlalchemy.orm import Session as OrmSession
 
 from .db import db_session
@@ -22,16 +19,13 @@ def _fmt_hhmm(t: time) -> str:
     return t.strftime("%H:%M")
 
 def _fmt_item(d: date, t: time) -> str:
-    # Compact, single-line for WhatsApp template constraints
     return f"{d.strftime('%a %d %b')} {t.strftime('%H:%M')}"
 
 def _clean_one_line(s: str) -> str:
-    # Remove newlines/tabs and collapse spaces so Meta doesn’t reject
     return " ".join((s or "").split())
 
 def _lang_candidates(preferred: str | None) -> List[str]:
-    # Try env first, then safe fallbacks
-    cand = [x for x in [preferred, "en", "en_US", "en_ZA"] if x]
+    cand = [x for x in [preferred, "en_US"] if x]
     seen, out = set(), []
     for c in cand:
         if c not in seen:
@@ -39,28 +33,22 @@ def _lang_candidates(preferred: str | None) -> List[str]:
             seen.add(c)
     return out
 
-def _send_template_with_fallback(
-    to: str,
-    template: str,
-    variables: dict,
-    preferred_lang: str | None,
-) -> bool:
+def _send_template_with_fallback(to: str, template: str, variables: list[str], preferred_lang: str | None) -> bool:
     for lang in _lang_candidates(preferred_lang):
-        ok, status, _ = utils.send_template(to=to, template=template, lang=lang, variables=variables)
+        resp = utils.send_whatsapp_template(to=to, name=template, lang=lang, variables=variables)
+        ok = resp.get("ok", False)
+        status = resp.get("status_code")
         log.info("[tpl-send] to=%s tpl=%s lang=%s status=%s ok=%s", to, template, lang, status, ok)
         if ok:
             return True
     return False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Night-before (tomorrow) reminders — template: session_tomorrow
+# Night-before reminders
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_client_tomorrow() -> int:
-    """
-    Send 'session_tomorrow' to each booking scheduled for tomorrow (per booking),
-    only to clients with a WhatsApp number.
-    """
+    """Send 'client_session_tomorrow_us' for tomorrow’s bookings."""
     tomorrow = date.today() + timedelta(days=1)
     sent = 0
     with db_session() as s:  # type: OrmSession
@@ -79,8 +67,8 @@ def run_client_tomorrow() -> int:
         for wa, tt in rows:
             ok = _send_template_with_fallback(
                 to=wa,
-                template="session_tomorrow",
-                variables={"1": _fmt_hhmm(tt)},
+                template="client_session_tomorrow_us",
+                variables=[_fmt_hhmm(tt)],
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
@@ -88,18 +76,14 @@ def run_client_tomorrow() -> int:
     return sent
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1-hour reminders — template: session_next_hour
+# 1-hour reminders
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_client_next_hour() -> int:
-    """
-    Send 'session_next_hour' to bookings starting within the next 60 minutes today.
-    """
+    """Send 'client_session_next_hour_us' for bookings starting in next hour."""
     now = datetime.now()
     today = now.date()
     in_one_hour = (now + timedelta(hours=1)).time()
-
-    # Handle simple same-day window (no midnight wrap)
     start_t = now.time()
     end_t = in_one_hour
 
@@ -122,8 +106,8 @@ def run_client_next_hour() -> int:
         for wa, tt in rows:
             ok = _send_template_with_fallback(
                 to=wa,
-                template="session_next_hour",
-                variables={"1": _fmt_hhmm(tt)},
+                template="client_session_next_hour_us",
+                variables=[_fmt_hhmm(tt)],
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
@@ -131,18 +115,11 @@ def run_client_next_hour() -> int:
     return sent
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Weekly preview (Sunday 18:00 SAST) — template: weekly_template_message
-# NEW: send to *all* clients with WA; if no bookings, send a friendly nudge.
+# Weekly preview
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_client_weekly(window_days: int = 7) -> int:
-    """
-    For each client with a WhatsApp number:
-      - Collect confirmed bookings in the next `window_days`
-      - Send 'weekly_template_message' with either a bullet list or
-        a personalized nudge: 'No sessions booked this week — we miss you at the studio! Reply BOOK to grab a spot.'
-    Returns count of successful sends.
-    """
+    """Send 'client_weekly_schedule_us' every Sunday with 7-day preview."""
     start = date.today()
     end = start + timedelta(days=max(1, window_days) - 1)
     sent = 0
@@ -158,7 +135,6 @@ def run_client_weekly(window_days: int = 7) -> int:
         log.info("[client-weekly] clients_with_wa=%s window=%s..%s", len(clients), start, end)
 
         for c in clients:
-            # Fetch this client's bookings in the window
             bookings: List[Tuple[date, time]] = (
                 s.query(Session.session_date, Session.start_time)
                 .join(Booking, Booking.session_id == Session.id)
@@ -176,17 +152,15 @@ def run_client_weekly(window_days: int = 7) -> int:
                 items_list = [_fmt_item(d, t) for d, t in bookings]
                 items_str = " • ".join(items_list)
             else:
-                # Personalized nudge for no-bookings week
                 items_str = "No sessions booked this week — we miss you at the studio! Reply BOOK to grab a spot."
 
-            # Meta-safe & tidy
             items_str = _clean_one_line(items_str)
             name_str = _clean_one_line(c.name or "there")
 
             ok = _send_template_with_fallback(
                 to=c.wa_number,
-                template="weekly_template_message",
-                variables={"name": name_str, "items": items_str},
+                template="client_weekly_schedule_us",
+                variables=[name_str, items_str],
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
