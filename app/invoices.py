@@ -1,4 +1,3 @@
-# app/invoices.py
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -159,102 +158,21 @@ def _totals(rows: List[SessionRow]) -> Dict[str, int]:
         "billable_amount": billable_amount,
     }
 
-def _fetch_client_name(phone: str) -> str | None:
+def _fetch_client_name_by_phone(phone: str) -> str:
+    """Look up client name by WhatsApp phone number."""
     sql = text("SELECT name FROM clients WHERE phone = :phone LIMIT 1")
     with db_session() as s:
         name = s.execute(sql, {"phone": phone}).scalar()
-    return name
-
-def _fetch_client_id(client_name: str) -> int | None:
-    sql = text("SELECT id FROM clients WHERE name ILIKE :cname LIMIT 1")
-    with db_session() as s:
-        cid = s.execute(sql, {"cname": f"%{client_name}%"}).scalar()
-    return cid
-
-def _fetch_payments(client_id: int, start_d: date, end_d: date) -> float:
-    sql = text("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM payments
-        WHERE client_id = :cid
-          AND date_received >= :start_d
-          AND date_received < :end_d
-    """)
-    with db_session() as s:
-        amt = s.execute(sql, {"cid": client_id, "start_d": start_d, "end_d": end_d}).scalar()
-    return float(amt or 0)
-
-def _fetch_client_payments(client_name: str, start_d: date, end_d: date) -> float:
-    cid = _fetch_client_id(client_name)
-    if not cid:
-        return 0.0
-    return _fetch_payments(cid, start_d, end_d)
+    return name or phone  # fallback if not found
 
 # ──────────────────────────────────────────────
 # Invoice generators
 # ──────────────────────────────────────────────
-def generate_invoice_whatsapp(client_phone: str, month_spec: str, base_url: str) -> str:
-    """Generate a WhatsApp-friendly invoice for a client."""
-    start_d, end_d, label = parse_month_spec(month_spec)
-    client_name = _fetch_client_name(client_phone)
-
-    if not client_name:
-        # Fallback if phone not recognised in DB
-        return (
-            "🤖 Sorry, I don’t recognise you yet.\n"
-            "Please confirm your name with Nadine 💛"
-        )
-
-    rows = _fetch_client_rows(client_name, start_d, end_d)
-    totals = _totals(rows)
-    month_short = label.split()[0][:3]
-
-    lines = []
-    lines.append(f"📑 PilatesHQ Invoice — {client_name}")
-    lines.append(f"Period: {label}")
-    lines.append("")
-
-    if not rows:
-        # Warm friendly message if no sessions
-        lines.append("We missed you this month 💛")
-        lines.append("No sessions booked.")
-        lines.append("Hope to see you back in studio soon!")
-        return "\n".join(lines)
-
-    # Sessions grouped by type
-    grouped: Dict[str, List[SessionRow]] = defaultdict(list)
-    for r in rows:
-        grouped[classify_type(r.capacity)].append(r)
-
-    for kind, sess in grouped.items():
-        rate = rate_for_capacity(sess[0].capacity)
-        dates = ",".join(str(r.session_date.day) for r in sess)
-        lines.append(f"• {kind.title()}: Date: {dates} {month_short} ({len(sess)}x R{rate})")
-
-    paid = _fetch_client_payments(client_name, start_d, end_d)
-    balance = totals["billable_amount"] - paid
-    lines.append("")
-    lines.append(f"Total: R{totals['billable_amount']} | Paid: R{paid} | Balance: R{balance}")
-    if balance <= 0:
-        lines.append("✅ Paid in full")
-
-    lines.append("")
-    lines.append("Banking details:")
-    lines.extend(BANKING_LINES[1:])
-    lines.append("")
-    lines.append("Notes:")
-    lines.append("• Use your name as reference")
-    lines.append("• Send POP once paid")
-
-    # PDF link only if sessions exist
-    pdf_url = f"{base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
-    lines.append("")
-    lines.append(f"🔗 Download full invoice (PDF): {pdf_url}")
-
-    return "\n".join(lines)
-
 def generate_invoice_html(client_name: str, month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
+    totals = _totals(rows)
+
     rows_html = ""
     if rows:
         for r in rows:
@@ -312,62 +230,3 @@ def generate_invoice_pdf(client_name: str, month_spec: str) -> bytes:
     html_str = generate_invoice_html(client_name, month_spec)
     pdf_bytes = HTML(string=html_str).write_pdf()
     return pdf_bytes
-
-
-# ──────────────────────────────────────────────
-# Extra helpers for names
-# ──────────────────────────────────────────────
-def _fetch_client_name_by_phone(phone: str) -> str:
-    """Try to fetch client name using phone number. Fallback to phone if not found."""
-    sql = text("SELECT name FROM clients WHERE phone = :phone LIMIT 1")
-    with db_session() as s:
-        name = s.execute(sql, {"phone": phone}).scalar()
-    return name or phone
-
-# ──────────────────────────────────────────────
-# Updated WhatsApp invoice generator
-# ──────────────────────────────────────────────
-def generate_invoice_whatsapp(client_phone: str, month_spec: str, base_url: str) -> str:
-    client_name = _fetch_client_name_by_phone(client_phone)
-    start_d, end_d, label = parse_month_spec(month_spec)
-    rows = _fetch_client_rows(client_name, start_d, end_d)
-    totals = _totals(rows)
-
-    grouped: Dict[str, List[str]] = defaultdict(list)
-    for r in rows:
-        kind = classify_type(r.capacity)
-        grouped[kind].append(str(r.session_date.day))
-
-    lines = []
-    lines.append(f"📑 PilatesHQ Invoice — {client_name} ({client_phone})")
-    lines.append(f"Period: {label}")
-    lines.append("")
-
-    if not rows:
-        lines.append("No sessions booked this period. We miss you! 💜")
-    else:
-        lines.append("Sessions:")
-        for kind, dates in grouped.items():
-            rate = rate_for_capacity(1 if kind == "single" else (2 if kind == "duo" else 3))
-            date_str = ",".join(dates)
-            lines.append(f"• {kind.title()} — Date: {date_str} {label.split()[0]} ({len(dates)}xR{rate})")
-
-        paid = _fetch_client_payments(client_name, start_d, end_d)
-        balance = totals["billable_amount"] - paid
-        lines.append("")
-        lines.append(f"Billed: R{totals['billable_amount']} | Paid: R{paid} | Balance: R{balance}")
-        if balance <= 0:
-            lines.append("✅ Paid in full")
-
-    lines.append("")
-    lines.append("Banking details:")
-    lines.extend(BANKING_LINES[1:])
-    lines.append("")
-    lines.append("Notes:")
-    lines.append("• Use your name as reference")
-    lines.append("• Send POP once paid")
-
-    pdf_url = f"{base_url}/diag/invoice-pdf?client={client_phone}&month={month_spec}"
-    lines.append("")
-    lines.append(f"🔗 Download full invoice (PDF): {pdf_url}")
-    return "\n".join(lines)
