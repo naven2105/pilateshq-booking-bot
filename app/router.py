@@ -1,6 +1,6 @@
 from flask import Blueprint, request, Response, jsonify
 from .utils import _send_to_meta
-from .invoices import generate_invoice_pdf, _fetch_client_name_by_phone
+from .invoices import generate_invoice_pdf, generate_invoice_whatsapp
 
 router_bp = Blueprint("router", __name__)
 
@@ -18,6 +18,13 @@ def diag_invoice_pdf():
 
 @router_bp.route("/webhook", methods=["POST"])
 def webhook():
+    """
+    Handle incoming WhatsApp messages.
+    Supports:
+      • "invoice" → current month invoice
+      • "invoice Sept" → invoice for specific month
+      • fallback → friendly help menu
+    """
     data = request.get_json(force=True, silent=True) or {}
     try:
         entry = data["entry"][0]
@@ -35,15 +42,11 @@ def webhook():
 
     base_url = request.url_root.strip("/")
 
+    # ──────────────── Command: invoice ────────────────
     if text.lower().startswith("invoice"):
         parts = text.split(maxsplit=1)
         month_spec = parts[1] if len(parts) > 1 else "this month"
-
-        # 🔹 resolve client name from phone
-        client_name = _fetch_client_name_by_phone(from_wa)
-
-        # 🔹 construct a warm lite invoice
-        message = f"📑 PilatesHQ Invoice — {client_name}\nPeriod: {month_spec.title()}\n\n(Invoice details here…)\n\n🔗 Download PDF if needed: {base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
+        message = generate_invoice_whatsapp(from_wa, month_spec, base_url)
 
         payload = {
             "messaging_product": "whatsapp",
@@ -54,15 +57,18 @@ def webhook():
         _send_to_meta(payload)
         return "ok"
 
-    # fallback
+    # ──────────────── Fallback ────────────────
     fallback_msg = (
         "🤖 Sorry, I didn’t understand that.\n"
         "Here are some things you can ask me:\n\n"
         "• invoice [month] → Get your invoice (e.g. 'invoice Sept')\n"
         "• invoice → Get your invoice for this month\n"
-        "• report → Get your monthly report\n"
+        "• report → Get your monthly session report\n"
         "• payment → View your payment status\n"
+        "• schedule → View your weekly session schedule\n"
+        "• cancel → Cancel a session\n"
     )
+
     payload = {
         "messaging_product": "whatsapp",
         "to": from_wa,

@@ -13,7 +13,6 @@ from weasyprint import HTML
 # Banking details & notes
 # ──────────────────────────────────────────────
 BANKING_LINES = [
-    "Banking details",
     "Pilates HQ Pty Ltd",
     "Absa Bank",
     "Current Account",
@@ -21,12 +20,11 @@ BANKING_LINES = [
 ]
 
 NOTES_LINES = [
-    "Payment is due on or before the due date.",
-    "Use your name as a reference when making payment",
-    "Kindly send me your POP via WhatsApp once you have made the payment.",
-    "24 cancellation is required for your sessions to be made up",
-    "Sessions will not be carried over into the following month",
-    "Late cancellations of sessions will be charged.",
+    "Use your name as a reference when making payment.",
+    "Kindly send POP via WhatsApp once you have made the payment.",
+    "24h cancellation required for make-up sessions.",
+    "Sessions will not be carried over into the following month.",
+    "Late cancellations will be charged.",
 ]
 
 # ──────────────────────────────────────────────
@@ -113,7 +111,7 @@ def parse_month_spec(spec: str) -> Tuple[date, date, str]:
     return start, end, f"{calendar.month_name[start.month]} {start.year}"
 
 # ──────────────────────────────────────────────
-# Data fetch + helpers
+# Data fetch
 # ──────────────────────────────────────────────
 @dataclass
 class SessionRow:
@@ -146,32 +144,63 @@ def _fetch_client_rows(client_name: str, start_d: date, end_d: date) -> List[Ses
         out.append(SessionRow(d, hhmm, int(cap or 1), st))
     return out
 
-def _totals(rows: List[SessionRow]) -> Dict[str, int]:
-    confirmed = sum(1 for r in rows if r.status == "confirmed")
-    cancelled = sum(1 for r in rows if r.status == "cancelled")
-    billable_count = confirmed + cancelled
-    billable_amount = sum(rate_for_capacity(r.capacity) for r in rows)
-    return {
-        "confirmed": confirmed,
-        "cancelled": cancelled,
-        "billable_count": billable_count,
-        "billable_amount": billable_amount,
-    }
-
 def _fetch_client_name_by_phone(phone: str) -> str:
-    """Look up client name by WhatsApp phone number."""
     sql = text("SELECT name FROM clients WHERE phone = :phone LIMIT 1")
     with db_session() as s:
         name = s.execute(sql, {"phone": phone}).scalar()
-    return name or phone  # fallback if not found
+    return name or phone
 
 # ──────────────────────────────────────────────
 # Invoice generators
 # ──────────────────────────────────────────────
+def generate_invoice_whatsapp(client_phone: str, month_spec: str, base_url: str) -> str:
+    """Lite WhatsApp invoice message"""
+    start_d, end_d, label = parse_month_spec(month_spec)
+    client_name = _fetch_client_name_by_phone(client_phone)
+    rows = _fetch_client_rows(client_name, start_d, end_d)
+
+    # Case A: No sessions → friendly warm message only
+    if not rows:
+        return (
+            f"📑 PilatesHQ Invoice — {client_name}\n"
+            f"Period: {label}\n\n"
+            f"No sessions booked this period. We miss you! 💜"
+        )
+
+    # Case B: Sessions exist → group by type
+    grouped: Dict[str, List[SessionRow]] = defaultdict(list)
+    for r in rows:
+        grouped[classify_type(r.capacity)].append(r)
+
+    lines = []
+    lines.append(f"📑 PilatesHQ Invoice — {client_name}")
+    lines.append(f"Period: {label}\n")
+
+    total_amount = 0
+    for kind, sess in grouped.items():
+        rate = rate_for_capacity(sess[0].capacity)
+        dates = ", ".join(str(r.session_date.day) for r in sess)
+        subtotal = len(sess) * rate
+        total_amount += subtotal
+        lines.append(f"Date: {dates} ({len(sess)}xR{rate}) [{kind}]")
+
+    lines.append("")
+    lines.append(f"Total billed: R{total_amount}")
+    lines.append("")
+    lines.append("Banking details:")
+    for line in BANKING_LINES:
+        lines.append(line)
+
+    # PDF link only if there are sessions
+    pdf_url = f"{base_url}/diag/invoice-pdf?client={client_name}&month={month_spec}"
+    lines.append("")
+    lines.append(f"🔗 Download full invoice (PDF): {pdf_url}")
+
+    return "\n".join(lines)
+
 def generate_invoice_html(client_name: str, month_spec: str) -> str:
     start_d, end_d, label = parse_month_spec(month_spec)
     rows = _fetch_client_rows(client_name, start_d, end_d)
-    totals = _totals(rows)
 
     rows_html = ""
     if rows:
