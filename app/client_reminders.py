@@ -7,7 +7,8 @@ from typing import List, Tuple
 
 from sqlalchemy.orm import Session as OrmSession
 
-from .db import db_session
+from .db import get_session
+
 from .models import Client, Session, Booking
 from . import utils
 
