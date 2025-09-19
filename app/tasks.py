@@ -4,130 +4,94 @@ import logging
 from flask import request
 
 from .admin_reminders import run_admin_morning, run_admin_daily
-from .client_reminders import run_client_tomorrow, run_client_next_hour, run_client_weekly
-
-from datetime import date
-from .utils import _send_to_meta
-
-from . import broadcasts
-
-logger = logging.getLogger(__name__)
-
-def remind_admin_invoices():
-    """
-    Send Nadine a reminder on the 25th of each month to review invoices.
-    """
-    today = date.today()
-    if today.day != 25:
-        return "Not 25th, skipping."
-
-    # Nadine’s WhatsApp number (put in env or config ideally)
-    to = "27XXXXXXXXX"  
-
-    message = (
-        f"📝 Reminder: Please review PilatesHQ invoices for {today.strftime('%B %Y')}.\n"
-        "Use /monthly_report to view and check. Resolve discrepancies before approving."
-    )
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": message},
-    }
-
-    ok, status, body = _send_to_meta(payload)
-    if not ok:
-        logger.error("[InvoiceReminderError] status=%s body=%s", status, body)
-    else:
-        logger.info("[InvoiceReminderSent] to=%s status=%s", to, status)
-
-    return body
-
+from .client_reminders import (
+    run_client_tomorrow,
+    run_client_next_hour,
+    run_client_weekly,
+)
 
 log = logging.getLogger(__name__)
 
+
 def register_tasks(app):
+    # ─────────────────────────────────────────────
+    # Admin notifications
+    # ─────────────────────────────────────────────
+
     @app.post("/tasks/admin-morning")
     def admin_morning():
-        """One-shot admin morning brief (cron 04:00 UTC = 06:00 SAST)."""
         try:
             src = request.args.get("src", "unknown")
-            log.info("[admin-morning] src=%s", src)
+            log.info(f"[admin-morning] src={src}")
             sent = run_admin_morning()
             return f"ok morning sent={sent}", 200
         except Exception:
-            logging.exception("admin-morning failed")
+            log.exception("admin-morning failed")
             return "error", 500
 
-    @app.post("/tasks/admin-notify")
-    def admin_notify():
-        """Legacy hourly endpoint (kept for backward compatibility)."""
+    @app.post("/tasks/admin-daily")
+    def admin_daily():
         try:
             src = request.args.get("src", "unknown")
-            log.info("[admin-notify] src=%s (legacy; prefer /tasks/admin-morning)", src)
-            return "ok", 200
+            log.info(f"[admin-daily] src={src}")
+            sent = run_admin_daily()
+            return f"ok daily sent={sent}", 200
         except Exception:
-            logging.exception("admin-notify failed")
+            log.exception("admin-daily failed")
             return "error", 500
+
+    # ─────────────────────────────────────────────
+    # Client reminders
+    # ─────────────────────────────────────────────
 
     @app.post("/tasks/run-reminders")
     def run_reminders():
         """
-        Multi-purpose runner:
-          ?daily=1     → admin evening recap
-          ?tomorrow=1  → client 24h reminders
-          ?next=1      → client 1h reminders
-          ?weekly=1    → client weekly preview
+        Handles client reminders:
+          ?tomorrow=1 → send tomorrow reminders
+          ?next=1     → send 1-hour reminders
+          ?weekly=1   → send weekly schedule
         """
         try:
             src = request.args.get("src", "unknown")
-            daily = request.args.get("daily", "0") == "1"
-            tomorrow = request.args.get("tomorrow", "0") == "1"
-            next_hour = request.args.get("next", "0") == "1"
-            weekly = request.args.get("weekly", "0") == "1"
+            daily = request.args.get("daily") == "1"
+            tomorrow = request.args.get("tomorrow") == "1"
+            next_hour = request.args.get("next") == "1"
+            weekly = request.args.get("weekly") == "1"
 
-            logging.info(
-                "[run-reminders] src=%s daily=%s tomorrow=%s next=%s weekly=%s",
-                src, daily, tomorrow, next_hour, weekly
+            log.info(
+                f"[run-reminders] src={src} daily={daily} "
+                f"tomorrow={tomorrow} next={next_hour} weekly={weekly}"
             )
 
-            if daily:
-                sent = run_admin_daily()
-                return f"ok daily sent={sent}", 200
-
+            sent = 0
             if tomorrow:
                 sent = run_client_tomorrow()
                 return f"ok tomorrow sent={sent}", 200
-
-            if next_hour:
+            elif next_hour:
                 sent = run_client_next_hour()
                 return f"ok next-hour sent={sent}", 200
-
-            if weekly:
+            elif weekly:
                 sent = run_client_weekly()
                 return f"ok weekly sent={sent}", 200
-
-            return "no action", 200
+            else:
+                return "no reminders triggered", 200
 
         except Exception:
-            logging.exception("run-reminders failed")
+            log.exception("run-reminders failed")
             return "error", 500
 
-@app.route("/tasks/broadcast", methods=["POST"])
-def run_broadcast():
-    """
-    Example: curl -X POST ".../tasks/broadcast?msg=Spring%20special%20R220" 
-    """
-    msg = request.args.get("msg", "").strip()
-    if not msg:
-        return "error: msg required", 400
+    # ─────────────────────────────────────────────
+    # Broadcast (general messages)
+    # ─────────────────────────────────────────────
 
-    # For now, send to ALL clients with WhatsApp
-    from .db import db_session
-    from .models import Client
-    with db_session() as s:
-        wa_numbers = [c.wa_number for c in s.query(Client).filter(Client.wa_number.isnot(None)).all()]
-
-    sent = broadcasts.send_broadcast(wa_numbers, msg)
-    return f"ok broadcast sent={sent}", 200
+    @app.post("/tasks/broadcast")
+    def broadcast():
+        try:
+            src = request.args.get("src", "unknown")
+            log.info(f"[broadcast] src={src}")
+            # TODO: implement general broadcast logic (marketing / updates)
+            return "ok broadcast", 200
+        except Exception:
+            log.exception("broadcast failed")
+            return "error", 500
