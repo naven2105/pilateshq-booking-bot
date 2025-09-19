@@ -3,6 +3,16 @@ Flask==3.0.3
 requests==2.32.3
 gunicorn==22.0.0
 SQLAlchemy==2.0.35
-psycopg[binary]>=3.2
+
+# PostgreSQL driver
+psycopg2-binary>=2.9   # safe drop-in, matches SQLAlchemy default
+
+# AI
 openai>=1.0.0
+
+# PDF generation
 weasyprint==62.3
+
+# Optional: better logging / scheduling
+python-dotenv>=1.0.1   # load env files locally
+apscheduler>=3.10.4    # if you want scheduled tasks in-app

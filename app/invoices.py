@@ -1,3 +1,4 @@
+# app/invoices.py
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -6,7 +7,7 @@ from collections import defaultdict
 import calendar, re
 
 from sqlalchemy import text
-from .db import db_session
+from .db import get_session        # ✅ FIXED: use get_session, not db_session
 from weasyprint import HTML
 
 # ──────────────────────────────────────────────
@@ -106,6 +107,7 @@ def parse_month_spec(spec: str) -> Tuple[date, date, str]:
         end = _first_of_next_month(start)
         return start, end, f"{calendar.month_name[mnum]} {y}"
 
+    # default = this month
     start = date(today.year, today.month, 1)
     end = _first_of_next_month(start)
     return start, end, f"{calendar.month_name[start.month]} {start.year}"
@@ -132,7 +134,7 @@ def _fetch_client_rows(client_name: str, start_d: date, end_d: date) -> List[Ses
           AND s.session_date <  :end_d
         ORDER BY s.session_date, s.start_time
     """)
-    with db_session() as s:
+    with get_session() as s:   # ✅ FIXED
         rows = s.execute(sql, {
             "client_name": f"%{client_name}%",
             "start_d": start_d,
@@ -146,7 +148,7 @@ def _fetch_client_rows(client_name: str, start_d: date, end_d: date) -> List[Ses
 
 def _fetch_client_name_by_phone(phone: str) -> str:
     sql = text("SELECT name FROM clients WHERE phone = :phone LIMIT 1")
-    with db_session() as s:
+    with get_session() as s:   # ✅ FIXED
         name = s.execute(sql, {"phone": phone}).scalar()
     return name or phone
 
