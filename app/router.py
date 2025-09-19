@@ -10,18 +10,7 @@ import os
 
 router_bp = Blueprint("router", __name__)
 
-# Admin numbers list (comma-separated in env)
-ADMIN_WA_LIST = os.getenv("ADMIN_WA_LIST", "").split(",")
-
-
-def _is_client(wa: str) -> bool:
-    """Return True if wa_number exists in clients table."""
-    with get_session() as s:
-        row = s.execute(
-            text("SELECT id FROM clients WHERE wa_number=:wa"),
-            {"wa": wa},
-        ).first()
-        return row is not None
+ADMIN_NUMBER = os.getenv("ADMIN_NUMBER", "")  # e.g. 27843131635
 
 
 @router_bp.route("/diag/invoice-pdf")
@@ -41,10 +30,10 @@ def diag_invoice_pdf():
 def webhook():
     """
     Handle incoming WhatsApp messages.
-    Routes:
-      • Admin → admin actions
-      • Existing client → invoices/schedule/etc.
-      • Unknown number → prospect onboarding
+    Routing:
+      - Admin → admin.py
+      - Known client → client features (invoice/report/etc.)
+      - Unknown → prospect.py onboarding
     """
     data = request.get_json(force=True, silent=True) or {}
     try:
@@ -56,23 +45,29 @@ def webhook():
             return "ok"
 
         msg = messages[0]
-        from_wa = normalize_wa(msg["from"])
-        text = msg.get("text", {}).get("body", "").strip()
-        msg_id = msg.get("id")
+        from_wa = normalize_wa(msg["from"])  # sender WA number
+        text_in = msg.get("text", {}).get("body", "").strip()
     except Exception as e:
         return jsonify({"error": f"invalid payload {e}"}), 400
 
     base_url = request.url_root.strip("/")
 
-    # ──────────────── Admin ────────────────
-    if from_wa in ADMIN_WA_LIST:
-        handle_admin_action(from_wa, msg_id, text)
+    # ─────────────── Admin ───────────────
+    if from_wa == normalize_wa(ADMIN_NUMBER):
+        handle_admin_action(from_wa, msg.get("id"), text_in, None)
         return "ok"
 
-    # ──────────────── Existing Client ────────────────
-    if _is_client(from_wa):
-        if text.lower().startswith("invoice"):
-            parts = text.split(maxsplit=1)
+    # ─────────────── Known Client ───────────────
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT id FROM clients WHERE wa_number=:wa"),
+            {"wa": from_wa},
+        ).first()
+
+    if row:
+        # Commands for existing clients
+        if text_in.lower().startswith("invoice"):
+            parts = text_in.split(maxsplit=1)
             month_spec = parts[1] if len(parts) > 1 else "this month"
             message = generate_invoice_whatsapp(from_wa, month_spec, base_url)
 
@@ -85,7 +80,9 @@ def webhook():
             _send_to_meta(payload)
             return "ok"
 
-        # fallback client menu
+        # (future: report, payment, schedule, cancel)
+
+        # fallback for clients
         fallback_msg = (
             "🤖 Sorry, I didn’t understand that.\n"
             "Here are some things you can ask me:\n\n"
@@ -96,7 +93,6 @@ def webhook():
             "• schedule → View your weekly session schedule\n"
             "• cancel → Cancel a session\n"
         )
-
         payload = {
             "messaging_product": "whatsapp",
             "to": from_wa,
@@ -106,6 +102,6 @@ def webhook():
         _send_to_meta(payload)
         return "ok"
 
-    # ──────────────── Prospect (new number) ────────────────
-    start_or_resume(from_wa, text)
+    # ─────────────── Prospect (unknown) ───────────────
+    start_or_resume(from_wa, text_in)
     return "ok"

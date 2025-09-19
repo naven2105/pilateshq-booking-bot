@@ -79,3 +79,16 @@ def send_whatsapp_text(to: str, text: str) -> dict:
         "text": {"body": text},
     }
     return _send_to_meta(payload)
+
+def normalize_wa(number: str) -> str:
+    """
+    Normalize WhatsApp numbers into international format (South Africa default).
+    - Removes spaces, dashes, plus.
+    - Converts leading 0 to 27 (South Africa country code).
+    """
+    if not number:
+        return number
+    n = str(number).replace(" ", "").replace("-", "").replace("+", "")
+    if n.startswith("0"):
+        n = "27" + n[1:]
+    return n
