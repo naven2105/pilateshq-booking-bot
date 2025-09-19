@@ -1,35 +1,52 @@
 # app/db.py
+from contextlib import contextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
-import contextlib
 
-# ── Database URL ────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# ── Database config ──────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# ── Engine and Session factory ──────────────────────────────────
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+)
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    future=True,
+)
 
-# ── Declarative Base for ORM models ─────────────────────────────
 Base = declarative_base()
 
-# ── Session helper ──────────────────────────────────────────────
-@contextlib.contextmanager
+# ── Context managers ─────────────────────────────
+@contextmanager
 def get_session():
-    """
-    Provide a transactional scope around a series of operations.
-    Usage:
-        with get_session() as s:
-            s.execute(...)
-    """
-    db = SessionLocal()
+    """Provide a transactional scope for raw SQL usage."""
+    session = SessionLocal()
     try:
-        yield db
-        db.commit()
+        yield session
+        session.commit()
     except Exception:
-        db.rollback()
+        session.rollback()
         raise
     finally:
-        db.close()
+        session.close()
+
+@contextmanager
+def db_session():
+    """Alias for compatibility (same as get_session)."""
+    with get_session() as s:
+        yield s
+
+# ── Initialisation helper ────────────────────────
+def init_db():
+    """
+    Create all tables based on ORM models.
+    Safe to call at app startup.
+    """
+    import app.models  # ensure models are imported
+    Base.metadata.create_all(bind=engine)
