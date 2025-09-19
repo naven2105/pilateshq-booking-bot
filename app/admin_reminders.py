@@ -1,14 +1,14 @@
 # app/admin_reminders.py
 from __future__ import annotations
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict
 
 from sqlalchemy import text
 
 from .config import ADMIN_NUMBERS
-from .db import db_session
+from .db import get_session
 from . import utils
 
 log = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ def _fetch_today_hourly_names() -> Dict[str, List[str]]:
         ORDER BY s.start_time, c.name
     """)
     by_hour: Dict[str, List[str]] = {}
-    with db_session() as s:
+    with get_session() as s:  # ✅ FIXED
         rows = s.execute(sql, {"today": today}).all()
     for hhmm, name in rows:
         by_hour.setdefault(hhmm, []).append(name)
@@ -41,7 +41,7 @@ def _fetch_tomorrow_hourly_names() -> Dict[str, List[str]]:
     """
     Dict 'HH:MM' -> [client names...] for tomorrow’s confirmed bookings.
     """
-    tomorrow = datetime.now(TZ).date().replace(day=datetime.now(TZ).day + 1)
+    tomorrow = datetime.now(TZ).date() + timedelta(days=1)
     sql = text("""
         SELECT to_char(s.start_time, 'HH24:MI') AS hhmm, c.name AS client_name
         FROM sessions s
@@ -52,7 +52,7 @@ def _fetch_tomorrow_hourly_names() -> Dict[str, List[str]]:
         ORDER BY s.start_time, c.name
     """)
     by_hour: Dict[str, List[str]] = {}
-    with db_session() as s:
+    with get_session() as s:  # ✅ FIXED
         rows = s.execute(sql, {"tomorrow": tomorrow}).all()
     for hhmm, name in rows:
         by_hour.setdefault(hhmm, []).append(name)
