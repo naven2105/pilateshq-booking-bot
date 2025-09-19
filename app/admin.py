@@ -27,7 +27,6 @@ def _find_or_create_client(name: str, wa_number: str | None = None) -> tuple[int
                 {"n": name, "wa": wa_number},
             )
             cid, wnum = r.first()
-            s.commit()
             return cid, wnum
     return None, None
 
@@ -64,7 +63,6 @@ def _cancel_next_booking(client_id: int) -> bool:
             return False
         bid = row[0]
         s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:bid"), {"bid": bid})
-        s.commit()
         return True
 
 
@@ -85,15 +83,30 @@ def _mark_today_booking(client_id: int, new_status: str) -> bool:
             return False
         bid = row[0]
         s.execute(text("UPDATE bookings SET status=:st WHERE id=:bid"), {"st": new_status, "bid": bid})
-        s.commit()
         return True
 
+#table notifications_log for audit logs
+def _log_notification(client_id: int, message: str):
+    """Insert a record into notifications_log audit table."""
+    with get_session() as s:
+        s.execute(
+            text("INSERT INTO notifications_log (client_id, message, created_at) VALUES (:cid, :msg, now())"),
+            {"cid": client_id, "msg": message},
+        )
 
 def _notify_client(wa_number: str, message: str):
-    """Send WhatsApp text to a client."""
+    """Send WhatsApp text to a client and log it."""
     if not wa_number:
         return
     send_whatsapp_text(normalize_wa(wa_number), message)
+    # Try to log notification if client exists
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT id FROM clients WHERE wa_number=:wa"),
+            {"wa": normalize_wa(wa_number)},
+        ).first()
+        if row:
+            _log_notification(row[0], message)
 
 
 def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: Optional[str] = None):
@@ -234,3 +247,4 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
 
     # ─────────────── Fallback ───────────────
     send_whatsapp_text(wa, "⚠ Unknown admin command. Reply 'menu' for options.")
+
