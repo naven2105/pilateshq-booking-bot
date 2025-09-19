@@ -9,6 +9,8 @@ from .client_reminders import run_client_tomorrow, run_client_next_hour, run_cli
 from datetime import date
 from .utils import _send_to_meta
 
+from . import broadcasts
+
 logger = logging.getLogger(__name__)
 
 def remind_admin_invoices():
@@ -111,3 +113,21 @@ def register_tasks(app):
         except Exception:
             logging.exception("run-reminders failed")
             return "error", 500
+
+@app.route("/tasks/broadcast", methods=["POST"])
+def run_broadcast():
+    """
+    Example: curl -X POST ".../tasks/broadcast?msg=Spring%20special%20R220" 
+    """
+    msg = request.args.get("msg", "").strip()
+    if not msg:
+        return "error: msg required", 400
+
+    # For now, send to ALL clients with WhatsApp
+    from .db import db_session
+    from .models import Client
+    with db_session() as s:
+        wa_numbers = [c.wa_number for c in s.query(Client).filter(Client.wa_number.isnot(None)).all()]
+
+    sent = broadcasts.send_broadcast(wa_numbers, msg)
+    return f"ok broadcast sent={sent}", 200
