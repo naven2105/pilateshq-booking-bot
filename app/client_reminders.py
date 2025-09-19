@@ -1,13 +1,16 @@
+# app/client_reminders.py
 from __future__ import annotations
+
 import logging
 from datetime import datetime, date, time, timedelta
 from typing import List, Tuple
+
 from sqlalchemy.orm import Session as OrmSession
 
 from .db import db_session
 from .models import Client, Session, Booking
 from . import utils
-from .config import TEMPLATE_LANG
+from .config import TEMPLATE_LANG, ADMIN_NUMBERS
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +28,7 @@ def _clean_one_line(s: str) -> str:
     return " ".join((s or "").split())
 
 def _lang_candidates(preferred: str | None) -> List[str]:
-    cand = [x for x in [preferred, "en_US"] if x]
+    cand = [x for x in [preferred, "en", "en_US", "en_ZA"] if x]
     seen, out = set(), []
     for c in cand:
         if c not in seen:
@@ -33,22 +36,24 @@ def _lang_candidates(preferred: str | None) -> List[str]:
             seen.add(c)
     return out
 
-def _send_template_with_fallback(to: str, template: str, variables: list[str], preferred_lang: str | None) -> bool:
+def _send_template_with_fallback(
+    to: str,
+    template: str,
+    variables: dict,
+    preferred_lang: str | None,
+) -> bool:
     for lang in _lang_candidates(preferred_lang):
-        resp = utils.send_whatsapp_template(to=to, name=template, lang=lang, variables=variables)
-        ok = resp.get("ok", False)
-        status = resp.get("status_code")
+        ok, status, _ = utils.send_template(to=to, template=template, lang=lang, variables=variables)
         log.info("[tpl-send] to=%s tpl=%s lang=%s status=%s ok=%s", to, template, lang, status, ok)
         if ok:
             return True
     return False
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Night-before reminders
+# Night-before (tomorrow) reminders
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_client_tomorrow() -> int:
-    """Send 'client_session_tomorrow_us' for tomorrow’s bookings."""
     tomorrow = date.today() + timedelta(days=1)
     sent = 0
     with db_session() as s:  # type: OrmSession
@@ -60,6 +65,7 @@ def run_client_tomorrow() -> int:
                 Booking.status == "confirmed",
                 Session.session_date == tomorrow,
                 Client.wa_number.isnot(None),
+                ~Client.wa_number.in_(ADMIN_NUMBERS),   # exclude admins
             )
             .order_by(Session.start_time.asc())
             .all()
@@ -68,7 +74,7 @@ def run_client_tomorrow() -> int:
             ok = _send_template_with_fallback(
                 to=wa,
                 template="client_session_tomorrow_us",
-                variables=[_fmt_hhmm(tt)],
+                variables={"1": _fmt_hhmm(tt)},
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
@@ -80,7 +86,6 @@ def run_client_tomorrow() -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_client_next_hour() -> int:
-    """Send 'client_session_next_hour_us' for bookings starting in next hour."""
     now = datetime.now()
     today = now.date()
     in_one_hour = (now + timedelta(hours=1)).time()
@@ -99,6 +104,7 @@ def run_client_next_hour() -> int:
                 Session.start_time >= start_t,
                 Session.start_time <= end_t,
                 Client.wa_number.isnot(None),
+                ~Client.wa_number.in_(ADMIN_NUMBERS),   # exclude admins
             )
             .order_by(Session.start_time.asc())
             .all()
@@ -107,7 +113,7 @@ def run_client_next_hour() -> int:
             ok = _send_template_with_fallback(
                 to=wa,
                 template="client_session_next_hour_us",
-                variables=[_fmt_hhmm(tt)],
+                variables={"1": _fmt_hhmm(tt)},
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
@@ -115,11 +121,10 @@ def run_client_next_hour() -> int:
     return sent
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Weekly preview
+# Weekly preview (Sunday 18:00 SAST)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_client_weekly(window_days: int = 7) -> int:
-    """Send 'client_weekly_schedule_us' every Sunday with 7-day preview."""
     start = date.today()
     end = start + timedelta(days=max(1, window_days) - 1)
     sent = 0
@@ -127,7 +132,10 @@ def run_client_weekly(window_days: int = 7) -> int:
     with db_session() as s:  # type: OrmSession
         clients: List[Client] = (
             s.query(Client)
-            .filter(Client.wa_number.isnot(None))
+            .filter(
+                Client.wa_number.isnot(None),
+                ~Client.wa_number.in_(ADMIN_NUMBERS),   # exclude admins
+            )
             .order_by(Client.name.asc())
             .all()
         )
@@ -160,7 +168,7 @@ def run_client_weekly(window_days: int = 7) -> int:
             ok = _send_template_with_fallback(
                 to=c.wa_number,
                 template="client_weekly_schedule_us",
-                variables=[name_str, items_str],
+                variables={"1": name_str, "2": items_str},
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
