@@ -1,11 +1,13 @@
+# app/admin_reminders.py
 from __future__ import annotations
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Dict
+
 from sqlalchemy import text
 
-from .config import ADMIN_NUMBERS, TEMPLATE_LANG
+from .config import ADMIN_NUMBERS
 from .db import db_session
 from . import utils
 
@@ -36,7 +38,9 @@ def _fetch_today_hourly_names() -> Dict[str, List[str]]:
 
 
 def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
-    """One-line summary string for admin templates."""
+    """
+    One-line summary: '06:00(3): A, B, C • 07:00(2): D, E'
+    """
     if not by_hour:
         return "No sessions today — we’re missing you."
     parts: List[str] = []
@@ -48,43 +52,36 @@ def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
 
 def _send_to_admins(tpl_name: str, count: int, details: str, context_label: str) -> int:
     """
-    Shared sender for morning/evening admin notifications.
+    Send only using US-approved templates.
     """
     sent_ok = 0
-    langs = [TEMPLATE_LANG or "en", "en_US"]
 
     for admin in ADMIN_NUMBERS:
-        ok = False
-        last_status = None
-        for lang in langs:
-            resp = utils.send_whatsapp_template(
-                to=admin,
-                name=tpl_name,
-                lang=lang,
-                variables=[str(count), details],
-            )
-            status = resp.get("status_code")
-            ok = resp.get("ok", False)
-            log.info(
-                "[%s][send] to=%s tpl=%s lang=%s status=%s ok=%s count=%s",
-                context_label, admin, tpl_name, lang, status, ok, count
-            )
-            if ok:
-                sent_ok += 1
-                break
-
-        if not ok:
-            # fallback text
-            title = "Morning Brief" if context_label == "admin-morning" else "20h Recap"
-            body = f"PilatesHQ {title}\nTotal time slots today: {count}\n{details}"
+        ok, status, _ = utils.send_whatsapp_template(
+            admin,
+            tpl_name,
+            "en_US",   # ✅ only US language
+            [str(count), details],
+        )
+        log.info(
+            "[%s][send] to=%s tpl=%s lang=en_US status=%s ok=%s count=%s",
+            context_label, admin, tpl_name, status, ok, count
+        )
+        if ok:
+            sent_ok += 1
+        else:
+            # fallback plain text if template fails
+            body = f"PilatesHQ {context_label}\nTotal sessions today: {count}\n{details}"
             utils.send_whatsapp_text(admin, body)
-            log.warning("[%s] fallback text → %s", context_label, admin)
+            log.warning("[%s] template fallback → text for %s", context_label, admin)
 
     return sent_ok
 
 
 def run_admin_morning() -> int:
-    """06:00 SAST morning brief (admin_20h00_us template)."""
+    """
+    06:00 SAST morning brief using 'admin_20h00_us' template.
+    """
     by_hour = _fetch_today_hourly_names()
     details = _format_admin_summary_line(by_hour)
     count = len(by_hour)
@@ -92,8 +89,11 @@ def run_admin_morning() -> int:
 
 
 def run_admin_daily() -> int:
-    """20:00 SAST recap (admin_20h00_us template)."""
+    """
+    20:00 SAST recap using 'admin_20h00_us' template.
+    """
     by_hour = _fetch_today_hourly_names()
     details = _format_admin_summary_line(by_hour)
     count = len(by_hour)
     return _send_to_admins("admin_20h00_us", count, details, "admin-daily")
+    

@@ -10,13 +10,12 @@ from sqlalchemy.orm import Session as OrmSession
 from .db import db_session
 from .models import Client, Session, Booking
 from . import utils
-from .config import TEMPLATE_LANG, ADMIN_NUMBERS
 
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def _fmt_hhmm(t: time) -> str:
     return t.strftime("%H:%M")
@@ -27,31 +26,9 @@ def _fmt_item(d: date, t: time) -> str:
 def _clean_one_line(s: str) -> str:
     return " ".join((s or "").split())
 
-def _lang_candidates(preferred: str | None) -> List[str]:
-    cand = [x for x in [preferred, "en", "en_US", "en_ZA"] if x]
-    seen, out = set(), []
-    for c in cand:
-        if c not in seen:
-            out.append(c)
-            seen.add(c)
-    return out
-
-def _send_template_with_fallback(
-    to: str,
-    template: str,
-    variables: dict,
-    preferred_lang: str | None,
-) -> bool:
-    for lang in _lang_candidates(preferred_lang):
-        ok, status, _ = utils.send_template(to=to, template=template, lang=lang, variables=variables)
-        log.info("[tpl-send] to=%s tpl=%s lang=%s status=%s ok=%s", to, template, lang, status, ok)
-        if ok:
-            return True
-    return False
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Night-before (tomorrow) reminders
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Tomorrow reminders — template: client_session_tomorrow_us
+# ─────────────────────────────────────────────
 
 def run_client_tomorrow() -> int:
     tomorrow = date.today() + timedelta(days=1)
@@ -65,30 +42,31 @@ def run_client_tomorrow() -> int:
                 Booking.status == "confirmed",
                 Session.session_date == tomorrow,
                 Client.wa_number.isnot(None),
-                ~Client.wa_number.in_(ADMIN_NUMBERS),   # exclude admins
             )
             .order_by(Session.start_time.asc())
             .all()
         )
         for wa, tt in rows:
-            ok = _send_template_with_fallback(
-                to=wa,
-                template="client_session_tomorrow_us",
-                variables={"1": _fmt_hhmm(tt)},
-                preferred_lang=TEMPLATE_LANG,
+            ok, status, _ = utils.send_whatsapp_template(
+                wa,
+                "client_session_tomorrow_us",
+                "en_US",   # ✅ only US
+                [_fmt_hhmm(tt)],
             )
+            log.info("[client-tomorrow] to=%s status=%s ok=%s", wa, status, ok)
             sent += 1 if ok else 0
-    log.info("[client-tomorrow] date=%s candidates=%s sent=%s", tomorrow.isoformat(), len(rows), sent)
+    log.info("[client-tomorrow] sent=%s", sent)
     return sent
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1-hour reminders
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Next-hour reminders — template: client_session_next_hour_us
+# ─────────────────────────────────────────────
 
 def run_client_next_hour() -> int:
     now = datetime.now()
     today = now.date()
     in_one_hour = (now + timedelta(hours=1)).time()
+
     start_t = now.time()
     end_t = in_one_hour
 
@@ -104,25 +82,25 @@ def run_client_next_hour() -> int:
                 Session.start_time >= start_t,
                 Session.start_time <= end_t,
                 Client.wa_number.isnot(None),
-                ~Client.wa_number.in_(ADMIN_NUMBERS),   # exclude admins
             )
             .order_by(Session.start_time.asc())
             .all()
         )
         for wa, tt in rows:
-            ok = _send_template_with_fallback(
-                to=wa,
-                template="client_session_next_hour_us",
-                variables={"1": _fmt_hhmm(tt)},
-                preferred_lang=TEMPLATE_LANG,
+            ok, status, _ = utils.send_whatsapp_template(
+                wa,
+                "client_session_next_hour_us",
+                "en_US",
+                [_fmt_hhmm(tt)],
             )
+            log.info("[client-next-hour] to=%s status=%s ok=%s", wa, status, ok)
             sent += 1 if ok else 0
-    log.info("[client-next-hour] window=%s-%s candidates=%s sent=%s", start_t, end_t, len(rows), sent)
+    log.info("[client-next-hour] sent=%s", sent)
     return sent
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Weekly preview (Sunday 18:00 SAST)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Weekly preview — template: client_weekly_schedule_us
+# ─────────────────────────────────────────────
 
 def run_client_weekly(window_days: int = 7) -> int:
     start = date.today()
@@ -132,15 +110,10 @@ def run_client_weekly(window_days: int = 7) -> int:
     with db_session() as s:  # type: OrmSession
         clients: List[Client] = (
             s.query(Client)
-            .filter(
-                Client.wa_number.isnot(None),
-                ~Client.wa_number.in_(ADMIN_NUMBERS),   # exclude admins
-            )
+            .filter(Client.wa_number.isnot(None))
             .order_by(Client.name.asc())
             .all()
         )
-
-        log.info("[client-weekly] clients_with_wa=%s window=%s..%s", len(clients), start, end)
 
         for c in clients:
             bookings: List[Tuple[date, time]] = (
@@ -160,18 +133,19 @@ def run_client_weekly(window_days: int = 7) -> int:
                 items_list = [_fmt_item(d, t) for d, t in bookings]
                 items_str = " • ".join(items_list)
             else:
-                items_str = "No sessions booked this week — we miss you at the studio! Reply BOOK to grab a spot."
+                items_str = "No sessions booked this week — we miss you! Reply BOOK to grab a spot."
 
             items_str = _clean_one_line(items_str)
             name_str = _clean_one_line(c.name or "there")
 
-            ok = _send_template_with_fallback(
-                to=c.wa_number,
-                template="client_weekly_schedule_us",
-                variables={"1": name_str, "2": items_str},
-                preferred_lang=TEMPLATE_LANG,
+            ok, status, _ = utils.send_whatsapp_template(
+                c.wa_number,
+                "client_weekly_schedule_us",
+                "en_US",
+                [name_str, items_str],
             )
+            log.info("[client-weekly] to=%s status=%s ok=%s", c.wa_number, status, ok)
             sent += 1 if ok else 0
 
-    log.info("[client-weekly] sent=%s window=%s days", sent, window_days)
+    log.info("[client-weekly] sent=%s", sent)
     return sent
