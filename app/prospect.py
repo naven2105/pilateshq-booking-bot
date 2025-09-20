@@ -14,11 +14,9 @@ WELCOME = (
 
 INTEREST_PROMPT = (
     "Great to meet you, {name}! Would you like to:\n"
-    "1) Book a trial/assessment session\n"
-    "2) Join a group class\n"
-    "3) Book a private (1:1)\n"
-    "4) Just browse FAQs\n\n"
-    "Reply with 1–4."
+    "1) More about PilatesHQ\n"
+    "2) Book a session\n\n"
+    "Reply with 1 or 2."
 )
 
 
@@ -72,6 +70,8 @@ def start_or_resume(wa_number: str, incoming_text: str):
     lead = _lead_get_or_create(wa)
 
     msg = (incoming_text or "").strip()
+
+    # ─────────────── Ask for name first ───────────────
     if not lead.get("name"):
         if msg:
             _lead_update(wa, name=msg)
@@ -80,48 +80,30 @@ def start_or_resume(wa_number: str, incoming_text: str):
         send_whatsapp_text(wa, WELCOME)
         return
 
-    lower = msg.lower()
-    if any(k in lower for k in ["faq", "questions", "info", "help", "menu"]):
-        send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
-        return
-
+    # ─────────────── Interest options ───────────────
     if msg.isdigit():
         n = int(msg)
-        if 1 <= n <= 3:
-            choices = {
-                1: ("trial", "a *trial session*"),
-                2: ("group", "a *group class*"),
-                3: ("private", "a *private session*"),
-            }
-            interest, friendly = choices[n]
-            _lead_update(wa, interest=interest, status="new")
+        if n == 1:
+            send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
+            return
+        if n == 2:
+            _lead_update(wa, interest="booking", status="new")
             send_whatsapp_text(
                 wa,
-                f"Awesome! I’ve noted your interest in {friendly}.\n"
-                "An instructor will contact you shortly to schedule. 🙌\n\n"
-                "Meanwhile, would you like the FAQ menu? (Reply YES/NO)"
+                "Awesome! I’ve noted your interest in booking a session. "
+                "Nadine will contact you shortly to discuss your Pilates experience and schedule 💜"
             )
-            _notify_admin(f"📥 New lead: {lead.get('name') or wa} wants {friendly}.")
-            return
-        if n == 4:
-            send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
+            _notify_admin(f"📥 New lead: {lead.get('name') or wa} wants to book a session.")
             return
         if n == 0:
             send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
             return
 
-    if lower in ("yes", "y"):
+    # ─────────────── FAQ keywords ───────────────
+    lower = msg.lower()
+    if any(k in lower for k in ["faq", "questions", "info", "help", "menu"]):
         send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
         return
-    if lower in ("no", "n"):
-        send_whatsapp_text(wa, "No problem! If you change your mind, just say “FAQ” or a number 1–3 anytime.")
-        return
 
-    if len(msg) == 1 and msg.isdigit():
-        idx = int(msg) - 1
-        if 0 <= idx < len(FAQ_ITEMS):
-            title, answer = FAQ_ITEMS[idx]
-            send_whatsapp_text(wa, f"*{title}*\n{answer}\n\nReply 0 for main menu.")
-            return
-
+    # ─────────────── Default fallback ───────────────
     send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
