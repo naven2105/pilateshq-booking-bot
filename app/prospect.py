@@ -14,7 +14,7 @@ WELCOME = (
 
 INTEREST_PROMPT = (
     "Great to meet you, {name}! Would you like to:\n"
-    "1) Book a taster/assessment\n"
+    "1) Book a trial/assessment session\n"
     "2) Join a group class\n"
     "3) Book a private (1:1)\n"
     "4) Just browse FAQs\n\n"
@@ -88,16 +88,20 @@ def start_or_resume(wa_number: str, incoming_text: str):
     if msg.isdigit():
         n = int(msg)
         if 1 <= n <= 3:
-            choices = {1: "taster", 2: "group", 3: "private"}
-            interest = choices[n]
+            choices = {
+                1: ("trial", "a *trial session*"),
+                2: ("group", "a *group class*"),
+                3: ("private", "a *private session*"),
+            }
+            interest, friendly = choices[n]
             _lead_update(wa, interest=interest, status="new")
             send_whatsapp_text(
                 wa,
-                f"Awesome! I’ve noted your interest in {interest}.\n"
+                f"Awesome! I’ve noted your interest in {friendly}.\n"
                 "An instructor will contact you shortly to schedule. 🙌\n\n"
                 "Meanwhile, would you like the FAQ menu? (Reply YES/NO)"
             )
-            _notify_admin(f"📥 New lead: {lead.get('name') or wa} wants {interest}.")
+            _notify_admin(f"📥 New lead: {lead.get('name') or wa} wants {friendly}.")
             return
         if n == 4:
             send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
