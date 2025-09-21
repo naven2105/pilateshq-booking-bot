@@ -25,27 +25,19 @@ INTEREST_PROMPT = (
 def _lead_get_or_create(wa: str):
     with get_session() as s:
         row = s.execute(
-            text("SELECT id, name, interest, status FROM leads WHERE wa_number=:wa"),
+            text("SELECT id, name, interest FROM leads WHERE wa_number=:wa"),
             {"wa": wa},
         ).mappings().first()
 
         if row:
-            # If stale row exists with no name or wrong status → fix it
-            if not row["name"] or row["status"] not in ("awaiting_name", "named"):
-                s.execute(
-                    text("UPDATE leads SET status='awaiting_name', name=NULL WHERE wa_number=:wa"),
-                    {"wa": wa},
-                )
-                return {"id": row["id"], "name": None, "interest": None, "status": "awaiting_name"}
             return dict(row)
 
-        # brand new lead → always insert awaiting_name
+        # brand new lead
         s.execute(
-            text("INSERT INTO leads (wa_number, status) VALUES (:wa, 'awaiting_name') ON CONFLICT DO NOTHING"),
+            text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
-        return {"id": None, "name": None, "interest": None, "status": "awaiting_name"}
-
+        return {"id": None, "name": None, "interest": None}
 
 def _lead_update(wa: str, **fields):
     if not fields:
@@ -57,7 +49,6 @@ def _lead_update(wa: str, **fields):
             text(f"UPDATE leads SET {sets}, last_contact=now() WHERE wa_number=:wa"),
             fields,
         )
-
 
 def _notify_admin(text_msg: str):
     try:
@@ -75,28 +66,27 @@ def start_or_resume(wa_number: str, incoming_text: str):
 
     # ── Step 1: ask for name until provided ──
     if not lead.get("name"):
-        if lead.get("status") == "awaiting_name":
-            # They replied after we asked → save as name
-            _lead_update(wa, name=msg, status="named")
+        if msg:  # any reply is taken as their name
+            _lead_update(wa, name=msg)
             _notify_admin(f"📥 New lead: {msg} (wa={wa})")
             send_whatsapp_text(wa, INTEREST_PROMPT.format(name=msg))
             return
-        # Always request name first time
-        _lead_update(wa, status="awaiting_name")
-        send_whatsapp_text(wa, WELCOME)
-        return
+        else:
+            send_whatsapp_text(wa, WELCOME)
+            return
 
     # ── Step 2: menu navigation ──
-    lower = msg.lower()
     if msg == "1":
         send_whatsapp_text(
             wa,
             "Great! Nadine will contact you directly to arrange your booking. 💜"
         )
         return
+
     if msg == "2":
         send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
         return
+
     if msg == "0":
         send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
         return
