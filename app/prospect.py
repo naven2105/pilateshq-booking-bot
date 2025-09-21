@@ -7,14 +7,13 @@ from .utils import send_whatsapp_text, normalize_wa
 from .faqs import FAQ_ITEMS, FAQ_MENU_TEXT
 from .config import NADINE_WA
 
-log = logging.getLogger(__name__)
-
 WELCOME = (
-    "Hi 👋 I’m PilatesHQ’s assistant.\n"
-    "Before we continue, what’s your name?"
+    "Hi! 👋 I’m PilatesHQ’s assistant.\n"
+    "Before we continue, what’s your *name*?"
 )
 
-MENU_PROMPT = (
+INTEREST_PROMPT = (
+    "Hi {name}, thanks for your enquiry! Nadine has received your details and will contact you very soon. 🙌\n\n"
     "Meanwhile, would you like to:\n"
     "1) Book a session (Nadine will contact you)\n"
     "2) Learn more about PilatesHQ\n\n"
@@ -22,9 +21,6 @@ MENU_PROMPT = (
 )
 
 
-# ─────────────────────────────────────────────
-# DB helpers
-# ─────────────────────────────────────────────
 def _lead_get_or_create(wa: str):
     with get_session() as s:
         row = s.execute(
@@ -34,8 +30,7 @@ def _lead_get_or_create(wa: str):
         if row:
             return dict(row)
         s.execute(
-            text("INSERT INTO leads (wa_number, status) VALUES (:wa, 'new') "
-                 "ON CONFLICT DO NOTHING"),
+            text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
         return {"id": None, "name": None, "interest": None, "status": "new"}
@@ -53,17 +48,24 @@ def _lead_update(wa: str, **fields):
         )
 
 
-def _notify_admin(text_msg: str):
-    try:
-        if NADINE_WA:
-            send_whatsapp_text(normalize_wa(NADINE_WA), text_msg)
-    except Exception:
-        logging.exception("Failed to notify admin")
+def _notify_admin_newlead(name: str, wa: str, interest: str | None = None):
+    """Notify Nadine of a *new lead* when we first get the name."""
+    if not NADINE_WA:
+        return
+    msg = f"📥 New lead: {name} ({wa})"
+    if interest:
+        msg += f" wants {interest}"
+    send_whatsapp_text(normalize_wa(NADINE_WA), msg)
 
 
-# ─────────────────────────────────────────────
-# Main entry point
-# ─────────────────────────────────────────────
+def _notify_admin_update(name: str, detail: str):
+    """Notify Nadine when the same lead shares extra info later."""
+    if not NADINE_WA:
+        return
+    msg = f"📥 Lead update – {name}: {detail}"
+    send_whatsapp_text(normalize_wa(NADINE_WA), msg)
+
+
 def start_or_resume(wa_number: str, incoming_text: str):
     """Entry point for unknown numbers from router."""
     wa = normalize_wa(wa_number)
@@ -71,52 +73,37 @@ def start_or_resume(wa_number: str, incoming_text: str):
 
     msg = (incoming_text or "").strip()
 
-    # ── Case 1: No name stored yet → always ask for name first
+    # ── Always request name first if not known ──
     if not lead.get("name"):
-        if not msg:  # blank or emoji etc → re-ask
-            send_whatsapp_text(wa, WELCOME)
+        if msg:
+            _lead_update(wa, name=msg)
+            _notify_admin_newlead(msg, wa)  # notify Nadine right here
+            send_whatsapp_text(wa, INTEREST_PROMPT.format(name=msg))
             return
-
-        # This is the *first meaningful reply*, treat it as their name
-        name_clean = msg.strip().title()
-        _lead_update(wa, name=name_clean)
-
-        # Greet + Nadine referral
-        send_whatsapp_text(
-            wa,
-            f"Hi {name_clean}, thanks for your enquiry! "
-            "Nadine has received your details and will contact you very soon. 🙌"
-        )
-
-        # Offer menu right after
-        send_whatsapp_text(wa, MENU_PROMPT)
-
-        # Notify Nadine
-        _notify_admin(f"📥 New lead: {name_clean} ({wa})")
+        send_whatsapp_text(wa, WELCOME)
         return
 
-    # ── Case 2: Already has name → continue with menu logic
+    # ── Interpret menu responses ──
     lower = msg.lower()
 
     if msg == "1":
-        _lead_update(wa, interest="session")
+        _lead_update(wa, interest="book_session")
+        _notify_admin_update(lead["name"], "Wants to book a session")
         send_whatsapp_text(
             wa,
-            "Perfect 👍 Nadine will reach out shortly to arrange your booking."
+            "Great! Nadine will contact you shortly to arrange your booking. 💜"
         )
         return
 
     if msg == "2":
+        _lead_update(wa, interest="learn_more")
+        _notify_admin_update(lead["name"], "Wants to learn more")
         send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
         return
 
     if msg == "0":
-        send_whatsapp_text(wa, MENU_PROMPT)
+        send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
         return
 
-    if any(k in lower for k in ["faq", "info", "help"]):
-        send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
-        return
-
-    # Fallback → re-show menu
-    send_whatsapp_text(wa, MENU_PROMPT)
+    # Fallback → re-offer menu
+    send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
