@@ -7,7 +7,6 @@ from .utils import send_whatsapp_text, normalize_wa
 from .admin_nlp import parse_admin_command, parse_admin_client_command
 from .booking import admin_reserve, create_recurring_bookings, create_multi_recurring_bookings
 from .db import get_session
-from .prospect import _mark_lead_converted
 
 
 def _find_or_create_client(name: str, wa_number: str | None = None) -> tuple[int, str] | tuple[None, None]:
