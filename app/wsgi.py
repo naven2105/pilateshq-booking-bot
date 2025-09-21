@@ -5,7 +5,6 @@ from flask import Flask
 from app.router import router_bp
 from app.diag import diag_bp
 from app.tasks import register_tasks
-from app.db import init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,13 +21,5 @@ app.register_blueprint(diag_bp)
 
 # Register task routes
 register_tasks(app)
-
-# Initialise DB tables at startup
-with app.app_context():
-    try:
-        init_db()
-        logging.info("[DB] Tables created / verified")
-    except Exception:
-        logging.exception("[DB] Failed to initialise")
 
 logging.info("WSGI startup complete; Flask app created.")

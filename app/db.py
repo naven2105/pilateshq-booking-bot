@@ -36,17 +36,9 @@ def get_session():
     finally:
         session.close()
 
+
 @contextmanager
 def db_session():
     """Alias for compatibility (same as get_session)."""
     with get_session() as s:
         yield s
-
-# ── Initialisation helper ────────────────────────
-def init_db():
-    """
-    Create all tables based on ORM models.
-    Safe to call at app startup.
-    """
-    import app.models  # ensure models are imported
-    Base.metadata.create_all(bind=engine)
