@@ -9,7 +9,7 @@ from .config import NADINE_WA
 
 WELCOME = (
     "Hi! 👋 I’m PilatesHQ’s assistant.\n"
-    "Before we continue, what’s your *name*?"
+    "Before we continue, what’s your name?"
 )
 
 INTEREST_PROMPT = (
@@ -29,11 +29,12 @@ def _lead_get_or_create(wa: str):
         ).mappings().first()
         if row:
             return dict(row)
+        # brand new lead → mark awaiting_name
         s.execute(
-            text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
+            text("INSERT INTO leads (wa_number, status) VALUES (:wa, 'awaiting_name') ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
-        return {"id": None, "name": None, "interest": None, "status": "new"}
+        return {"id": None, "name": None, "interest": None, "status": "awaiting_name"}
 
 
 def _lead_update(wa: str, **fields):
@@ -48,62 +49,48 @@ def _lead_update(wa: str, **fields):
         )
 
 
-def _notify_admin_newlead(name: str, wa: str, interest: str | None = None):
-    """Notify Nadine of a *new lead* when we first get the name."""
-    if not NADINE_WA:
-        return
-    msg = f"📥 New lead: {name} ({wa})"
-    if interest:
-        msg += f" wants {interest}"
-    send_whatsapp_text(normalize_wa(NADINE_WA), msg)
-
-
-def _notify_admin_update(name: str, detail: str):
-    """Notify Nadine when the same lead shares extra info later."""
-    if not NADINE_WA:
-        return
-    msg = f"📥 Lead update – {name}: {detail}"
-    send_whatsapp_text(normalize_wa(NADINE_WA), msg)
+def _notify_admin(text_msg: str):
+    try:
+        if NADINE_WA:
+            send_whatsapp_text(normalize_wa(NADINE_WA), text_msg)
+    except Exception:
+        logging.exception("Failed to notify admin")
 
 
 def start_or_resume(wa_number: str, incoming_text: str):
     """Entry point for unknown numbers from router."""
     wa = normalize_wa(wa_number)
     lead = _lead_get_or_create(wa)
-
     msg = (incoming_text or "").strip()
 
-    # ── Always request name first if not known ──
+    # ── Step 1: ask for name until provided ──
     if not lead.get("name"):
-        if msg:
-            _lead_update(wa, name=msg)
-            _notify_admin_newlead(msg, wa)  # notify Nadine right here
+        if lead.get("status") == "awaiting_name":
+            # we already asked → now save this as their name
+            _lead_update(wa, name=msg, status="named")
+            _notify_admin(f"📥 New lead: {msg} (wa={wa})")
             send_whatsapp_text(wa, INTEREST_PROMPT.format(name=msg))
             return
-        send_whatsapp_text(wa, WELCOME)
-        return
+        else:
+            # first ever contact → always request name
+            _lead_update(wa, status="awaiting_name")
+            send_whatsapp_text(wa, WELCOME)
+            return
 
-    # ── Interpret menu responses ──
+    # ── Step 2: menu navigation ──
     lower = msg.lower()
-
     if msg == "1":
-        _lead_update(wa, interest="book_session")
-        _notify_admin_update(lead["name"], "Wants to book a session")
         send_whatsapp_text(
             wa,
-            "Great! Nadine will contact you shortly to arrange your booking. 💜"
+            "Great! Nadine will contact you directly to arrange your booking. 💜"
         )
         return
-
     if msg == "2":
-        _lead_update(wa, interest="learn_more")
-        _notify_admin_update(lead["name"], "Wants to learn more")
         send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
         return
-
     if msg == "0":
         send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
         return
 
-    # Fallback → re-offer menu
+    # fallback → repeat menu
     send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
