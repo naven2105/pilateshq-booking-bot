@@ -7,6 +7,7 @@ from .utils import send_whatsapp_text, normalize_wa
 from .faqs import FAQ_ITEMS, FAQ_MENU_TEXT
 from .config import NADINE_WA
 
+# ── Messages ─────────────────────────────────────────────
 WELCOME = (
     "Hi! 👋 I’m PilatesHQ’s assistant.\n"
     "Before we continue, what’s your name?"
@@ -20,7 +21,7 @@ INTEREST_PROMPT = (
     "Reply with 1–2."
 )
 
-
+# ── DB helpers ───────────────────────────────────────────
 def _lead_get_or_create(wa: str):
     with get_session() as s:
         row = s.execute(
@@ -29,7 +30,7 @@ def _lead_get_or_create(wa: str):
         ).mappings().first()
         if row:
             return dict(row)
-        # brand new lead → mark awaiting_name
+        # brand new lead → insert awaiting_name
         s.execute(
             text("INSERT INTO leads (wa_number, status) VALUES (:wa, 'awaiting_name') ON CONFLICT DO NOTHING"),
             {"wa": wa},
@@ -56,7 +57,7 @@ def _notify_admin(text_msg: str):
     except Exception:
         logging.exception("Failed to notify admin")
 
-
+# ── Main entry ──────────────────────────────────────────
 def start_or_resume(wa_number: str, incoming_text: str):
     """Entry point for unknown numbers from router."""
     wa = normalize_wa(wa_number)
@@ -66,16 +67,15 @@ def start_or_resume(wa_number: str, incoming_text: str):
     # ── Step 1: ask for name until provided ──
     if not lead.get("name"):
         if lead.get("status") == "awaiting_name":
-            # we already asked → now save this as their name
+            # They replied after we asked → save as name
             _lead_update(wa, name=msg, status="named")
             _notify_admin(f"📥 New lead: {msg} (wa={wa})")
             send_whatsapp_text(wa, INTEREST_PROMPT.format(name=msg))
             return
-        else:
-            # first ever contact → always request name
-            _lead_update(wa, status="awaiting_name")
-            send_whatsapp_text(wa, WELCOME)
-            return
+        # Always request name first time
+        _lead_update(wa, status="awaiting_name")
+        send_whatsapp_text(wa, WELCOME)
+        return
 
     # ── Step 2: menu navigation ──
     lower = msg.lower()
