@@ -1,4 +1,4 @@
-# app/prospect.py
+    # app/prospect.py
 from __future__ import annotations
 import logging
 from sqlalchemy import text
@@ -7,25 +7,19 @@ from .utils import send_whatsapp_text, normalize_wa
 from .faqs import FAQ_ITEMS, FAQ_MENU_TEXT
 from .config import NADINE_WA
 
-# ───────────────────────────────────────────────
-# Prompts
-# ───────────────────────────────────────────────
 WELCOME = (
     "Hi! 👋 I’m PilatesHQ’s assistant.\n"
-    "Before we continue, may I have your *first name*?"
+    "Before we continue, what’s your *full name*?"
 )
 
 INTEREST_PROMPT = (
-    "Hi {name}, thanks for your enquiry! Nadine has received your details and will contact you very soon. 🙌\n\n"
     "Meanwhile, would you like to:\n"
     "1) Learn more about PilatesHQ\n"
     "2) Book a session\n\n"
     "Reply with 1–2."
 )
 
-# ───────────────────────────────────────────────
-# DB helpers
-# ───────────────────────────────────────────────
+
 def _lead_get_or_create(wa: str):
     with get_session() as s:
         row = s.execute(
@@ -34,13 +28,12 @@ def _lead_get_or_create(wa: str):
         ).mappings().first()
         if row:
             return dict(row)
-        # brand new number
         s.execute(
-            text("INSERT INTO leads (wa_number, status) VALUES (:wa, 'new') ON CONFLICT DO NOTHING"),
+            text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
-        s.commit()
         return {"id": None, "name": None, "interest": None, "status": "new"}
+
 
 def _lead_update(wa: str, **fields):
     if not fields:
@@ -52,7 +45,7 @@ def _lead_update(wa: str, **fields):
             text(f"UPDATE leads SET {sets}, last_contact=now() WHERE wa_number=:wa"),
             fields,
         )
-        s.commit()
+
 
 def _notify_admin(text_msg: str):
     try:
@@ -61,9 +54,7 @@ def _notify_admin(text_msg: str):
     except Exception:
         logging.exception("Failed to notify admin")
 
-# ───────────────────────────────────────────────
-# Main flow
-# ───────────────────────────────────────────────
+
 def start_or_resume(wa_number: str, incoming_text: str):
     """Entry point for unknown numbers from router."""
     wa = normalize_wa(wa_number)
@@ -71,28 +62,31 @@ def start_or_resume(wa_number: str, incoming_text: str):
 
     msg = (incoming_text or "").strip()
 
-    # ── Step 1: If no name yet, *always* greet and request it
+    # ─────────────── Step 1: If no name yet, always ask ───────────────
     if not lead.get("name"):
-        if msg and lead.get("status") == "asked_name":
-            # This is their reply after being asked → save it as name
-            first_word = msg.split()[0].title()
-            _lead_update(wa, name=first_word, status="named")
-            send_whatsapp_text(wa, INTEREST_PROMPT.format(name=first_word))
-            _notify_admin(f"📥 New lead: {first_word} has enquired.")
+        if msg:
+            clean_name = " ".join(msg.split()).title()  # full name, cleaned
+            _lead_update(wa, name=clean_name)
+            send_whatsapp_text(
+                wa,
+                f"Hi {clean_name}, thanks for your enquiry! "
+                "Nadine has received your details and will contact you very soon. 🙌\n\n"
+                + INTEREST_PROMPT
+            )
+            _notify_admin(f"📥 New lead: {clean_name} (wa={wa})")
             return
         else:
-            # First ever time → ask for name
-            _lead_update(wa, status="asked_name")
             send_whatsapp_text(wa, WELCOME)
             return
 
-    # ── Step 2: They already have a name → normal flow
     lower = msg.lower()
 
+    # ─────────────── FAQ keywords ───────────────
     if any(k in lower for k in ["faq", "questions", "info", "help", "menu"]):
         send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
         return
 
+    # ─────────────── Interest choices ───────────────
     if msg.isdigit():
         n = int(msg)
         if n == 1:
@@ -101,12 +95,27 @@ def start_or_resume(wa_number: str, incoming_text: str):
         if n == 2:
             send_whatsapp_text(
                 wa,
-                "Awesome! Nadine will reach out shortly to schedule your session. 💜"
+                "Great! Nadine will contact you shortly to arrange your first session. 🙌"
             )
             return
         if n == 0:
-            send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
+            send_whatsapp_text(wa, INTEREST_PROMPT)
             return
 
-    # fallback → re-show interest prompt
-    send_whatsapp_text(wa, INTEREST_PROMPT.format(name=lead.get("name", "there")))
+    if lower in ("yes", "y"):
+        send_whatsapp_text(wa, FAQ_MENU_TEXT + "\n\nReply 0 to go back.")
+        return
+    if lower in ("no", "n"):
+        send_whatsapp_text(wa, "No problem! If you change your mind, just say “FAQ” or reply with 1–2 anytime.")
+        return
+
+    # ─────────────── FAQ numbered items ───────────────
+    if len(msg) == 1 and msg.isdigit():
+        idx = int(msg) - 1
+        if 0 <= idx < len(FAQ_ITEMS):
+            title, answer = FAQ_ITEMS[idx]
+            send_whatsapp_text(wa, f"*{title}*\n{answer}\n\nReply 0 for main menu.")
+            return
+
+    # ─────────────── Default fallback ───────────────
+    send_whatsapp_text(wa, INTEREST_PROMPT)
