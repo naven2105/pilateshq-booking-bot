@@ -11,7 +11,7 @@ psycopg2-binary>=2.9   # safe drop-in, matches SQLAlchemy default
 openai>=1.0.0
 
 # PDF generation
-weasyprint==62.3
+reportlab>=4.0.0
 
 # Optional: better logging / scheduling
 python-dotenv>=1.0.1   # load env files locally
