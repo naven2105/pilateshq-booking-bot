@@ -1,4 +1,4 @@
-# app/faq.py
+# app/faqs.py
 from .utils import send_whatsapp_text
 
 FAQ_TEXT = (
