@@ -1,7 +1,7 @@
 # app/router.py
 from flask import Blueprint, request, Response, jsonify
 from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
-from .invoices import generate_invoice_pdf, generate_invoice_whatsapp, send_invoice
+from .invoices import generate_invoice_pdf, send_invoice
 from .admin import handle_admin_action
 from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session
@@ -51,8 +51,6 @@ def webhook():
         text_in = msg.get("text", {}).get("body", "").strip()
     except Exception as e:
         return jsonify({"error": f"invalid payload {e}"}), 400
-
-    base_url = request.url_root.strip("/")
 
     # ─────────────── Admin ───────────────
     if from_wa == normalize_wa(ADMIN_NUMBER):
@@ -110,10 +108,8 @@ def webhook():
         client = _client_get(from_wa)
         name = client.get("name", "there") if client else "there"
 
-        # Notify client
         send_whatsapp_text(from_wa, "🤖 Thanks for your message! Nadine will follow up with you shortly.")
 
-        # Forward to Nadine
         if NADINE_WA:
             forward_msg = (
                 f"📩 *Client message*\n"
