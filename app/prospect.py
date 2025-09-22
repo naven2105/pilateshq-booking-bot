@@ -1,6 +1,7 @@
 # app/prospect.py
 from __future__ import annotations
 import logging
+from datetime import datetime
 from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa
@@ -17,24 +18,38 @@ AFTER_NAME_MSG = (
     "🌐 In the meantime, you can learn more about us here: https://www.pilateshq.co.za"
 )
 
+REENGAGED_MSG = (
+    "Hi {name}, welcome back! Nadine will follow up with you shortly. 🙌\n\n"
+    "🌐 In the meantime, you can explore more here: https://www.pilateshq.co.za"
+)
+
+CLIENT_MENU = (
+    "💜 Welcome back, {name}!\n"
+    "Here’s what I can help you with:\n\n"
+    "1️⃣ Book a session\n"
+    "2️⃣ View my bookings\n"
+    "3️⃣ Get my invoice\n"
+    "4️⃣ FAQs\n\n"
+    "Please reply with a number to continue."
+)
+
 
 # ── DB helpers ───────────────────────────────────────────
-def _lead_get_or_create(wa: str):
+def _lead_get(wa: str):
     with get_session() as s:
         row = s.execute(
             text("SELECT id, name FROM leads WHERE wa_number=:wa"),
             {"wa": wa},
         ).mappings().first()
+        return dict(row) if row else None
 
-        if row:
-            return dict(row)
 
-        # brand new lead
+def _lead_insert(wa: str):
+    with get_session() as s:
         s.execute(
             text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
-        return {"id": None, "name": None}
 
 
 def _lead_update(wa: str, **fields):
@@ -49,31 +64,78 @@ def _lead_update(wa: str, **fields):
         )
 
 
-def _notify_admin(text_msg: str):
+def _client_get(wa: str):
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT id, name FROM clients WHERE wa_number=:wa"),
+            {"wa": wa},
+        ).mappings().first()
+        return dict(row) if row else None
+
+
+def _notify_admin_new(name: str | None, wa: str):
     try:
-        if NADINE_WA:
-            send_whatsapp_text(normalize_wa(NADINE_WA), text_msg)
+        if not NADINE_WA:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        msg = (
+            "📌 *New Lead Captured*\n"
+            f"👤 Name: {name or '(not provided)'}\n"
+            f"📱 WhatsApp: {wa}\n"
+            f"🕒 Time: {ts}"
+        )
+        send_whatsapp_text(normalize_wa(NADINE_WA), msg)
     except Exception:
-        logging.exception("Failed to notify admin")
+        logging.exception("Failed to notify admin of new lead")
+
+
+def _notify_admin_reengaged(name: str | None, wa: str):
+    try:
+        if not NADINE_WA:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        msg = (
+            "🔄 *Lead Re-engaged*\n"
+            f"👤 Name: {name or '(not provided)'}\n"
+            f"📱 WhatsApp: {wa}\n"
+            f"🕒 Time: {ts}"
+        )
+        send_whatsapp_text(normalize_wa(NADINE_WA), msg)
+    except Exception:
+        logging.exception("Failed to notify admin of re-engaged lead")
 
 
 # ── Main entry ──────────────────────────────────────────
 def start_or_resume(wa_number: str, incoming_text: str):
     """Entry point for unknown numbers from router."""
     wa = normalize_wa(wa_number)
-    lead = _lead_get_or_create(wa)
     msg = (incoming_text or "").strip()
 
-    # ── Step 1: ask for name if not provided ──
-    if not lead.get("name"):
-        # Save the first free-text response as their name
+    # Case 1: Already a client → route to client services
+    client = _client_get(wa)
+    if client:
+        send_whatsapp_text(wa, CLIENT_MENU.format(name=client.get("name", "there")))
+        return
+
+    # Case 2: Not in leads yet → new prospect
+    lead = _lead_get(wa)
+    if not lead:
+        _lead_insert(wa)
         _lead_update(wa, name=msg)
-        _notify_admin(f"📥 New lead: {msg} (wa={wa})")
+        _notify_admin_new(msg, wa)
         send_whatsapp_text(wa, AFTER_NAME_MSG.format(name=msg))
         return
 
-    # ── Step 2: all future messages → same polite reply ──
-    send_whatsapp_text(
-        wa,
-        AFTER_NAME_MSG.format(name=lead.get("name", "there"))
-    )
+    # Case 3: Lead exists but not converted → re-engaged
+    if lead.get("name"):
+        _lead_update(wa)  # just update last_contact timestamp
+        _notify_admin_reengaged(lead.get("name"), wa)
+        send_whatsapp_text(wa, REENGAGED_MSG.format(name=lead.get("name")))
+        return
+
+    # Case 4: Lead exists but no name captured yet → ask name
+    if not lead.get("name"):
+        _lead_update(wa, name=msg)
+        _notify_admin_new(msg, wa)
+        send_whatsapp_text(wa, AFTER_NAME_MSG.format(name=msg))
+        return

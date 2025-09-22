@@ -1,16 +1,18 @@
 # app/router.py
 from flask import Blueprint, request, Response, jsonify
-from .utils import _send_to_meta, normalize_wa
-from .invoices import generate_invoice_pdf, generate_invoice_whatsapp
+from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
+from .invoices import generate_invoice_pdf, generate_invoice_whatsapp, send_invoice
 from .admin import handle_admin_action
-from .prospect import start_or_resume
+from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session
+from . import booking, faq, client_nlp
 from sqlalchemy import text
 import os
 
 router_bp = Blueprint("router", __name__)
 
 ADMIN_NUMBER = os.getenv("ADMIN_NUMBER", "")  # e.g. 27843131635
+NADINE_WA = os.getenv("NADINE_WA", "")
 
 
 @router_bp.route("/diag/invoice-pdf")
@@ -32,7 +34,7 @@ def webhook():
     Handle incoming WhatsApp messages.
     Routing:
       - Admin → admin.py
-      - Known client → client features (invoice/report/etc.)
+      - Known client → client features (invoice/bookings/etc.)
       - Unknown → prospect.py onboarding
     """
     data = request.get_json(force=True, silent=True) or {}
@@ -65,41 +67,61 @@ def webhook():
         ).first()
 
     if row:
-        # Commands for existing clients
-        if text_in.lower().startswith("invoice"):
-            parts = text_in.split(maxsplit=1)
-            month_spec = parts[1] if len(parts) > 1 else "this month"
-            message = generate_invoice_whatsapp(from_wa, month_spec, base_url)
+        # Try NLP first
+        parsed = client_nlp.parse_client_command(text_in)
+        if parsed:
+            intent = parsed["intent"]
+            if intent == "show_bookings":
+                booking.show_bookings(from_wa)
+                return "ok"
+            if intent == "get_invoice":
+                send_invoice(from_wa)
+                return "ok"
+            if intent == "faq":
+                faq.show_faq(from_wa)
+                return "ok"
+            if intent == "contact_admin":
+                client = _client_get(from_wa)
+                name = client.get("name", "there") if client else "there"
+                send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
+                if NADINE_WA:
+                    send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
+                return "ok"
 
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": from_wa,
-                "type": "text",
-                "text": {"body": message},
-            }
-            _send_to_meta(payload)
+        # Also allow menu numbers
+        if text_in == "1":
+            booking.show_bookings(from_wa)
+            return "ok"
+        if text_in == "2":
+            send_invoice(from_wa)
+            return "ok"
+        if text_in == "3":
+            faq.show_faq(from_wa)
+            return "ok"
+        if text_in == "0":
+            client = _client_get(from_wa)
+            name = client.get("name", "there") if client else "there"
+            send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
+            if NADINE_WA:
+                send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
             return "ok"
 
-        # (future: report, payment, schedule, cancel)
+        # ─────────────── Fallback: Forward to Nadine ───────────────
+        client = _client_get(from_wa)
+        name = client.get("name", "there") if client else "there"
 
-        # fallback for clients
-        fallback_msg = (
-            "🤖 Sorry, I didn’t understand that.\n"
-            "Here are some things you can ask me:\n\n"
-            "• invoice [month] → Get your invoice (e.g. 'invoice Sept')\n"
-            "• invoice → Get your invoice for this month\n"
-            "• report → Get your monthly session report\n"
-            "• payment → View your payment status\n"
-            "• schedule → View your weekly session schedule\n"
-            "• cancel → Cancel a session\n"
-        )
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": from_wa,
-            "type": "text",
-            "text": {"body": fallback_msg},
-        }
-        _send_to_meta(payload)
+        # Notify client
+        send_whatsapp_text(from_wa, "🤖 Thanks for your message! Nadine will follow up with you shortly.")
+
+        # Forward to Nadine
+        if NADINE_WA:
+            forward_msg = (
+                f"📩 *Client message*\n"
+                f"👤 {name} ({from_wa})\n"
+                f"💬 \"{text_in}\""
+            )
+            send_whatsapp_text(NADINE_WA, forward_msg)
+
         return "ok"
 
     # ─────────────── Prospect (unknown) ───────────────
