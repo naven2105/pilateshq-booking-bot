@@ -29,9 +29,10 @@ CLIENT_MENU = (
 
 # ── DB helpers ───────────────────────────────────────────
 def _lead_get_or_create(wa: str):
+    """Fetch or create a lead record by WhatsApp number."""
     with get_session() as s:
         row = s.execute(
-            text("SELECT id, name, status FROM leads WHERE wa_number=:wa"),
+            text("SELECT id, name FROM leads WHERE wa_number=:wa"),
             {"wa": wa},
         ).mappings().first()
 
@@ -40,14 +41,10 @@ def _lead_get_or_create(wa: str):
 
         # brand new lead
         s.execute(
-            text("""
-                INSERT INTO leads (wa_number, status)
-                VALUES (:wa, 'open')
-                ON CONFLICT DO NOTHING
-            """),
+            text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
-        return {"id": None, "name": None, "status": "open"}
+        return {"id": None, "name": None}
 
 
 def _lead_update(wa: str, **fields):
@@ -63,6 +60,7 @@ def _lead_update(wa: str, **fields):
 
 
 def _client_get(wa: str):
+    """Return client record if number exists in clients table."""
     with get_session() as s:
         row = s.execute(
             text("SELECT id, name FROM clients WHERE wa_number=:wa"),
@@ -72,6 +70,7 @@ def _client_get(wa: str):
 
 
 def _notify_admin(text_msg: str):
+    """Send a WhatsApp notification to Nadine (admin)."""
     try:
         if NADINE_WA:
             send_whatsapp_text(normalize_wa(NADINE_WA), text_msg)
@@ -81,19 +80,31 @@ def _notify_admin(text_msg: str):
 
 # ── Main entry ──────────────────────────────────────────
 def start_or_resume(wa_number: str, incoming_text: str):
-    """Entry point for unknown numbers from router."""
+    """
+    Entry point for inbound messages.
+    - If number exists in clients → show client menu.
+    - If not, handle as a prospect (ask name → thank-you → polite repeat).
+    """
     wa = normalize_wa(wa_number)
-    lead = _lead_get_or_create(wa)
+    client = _client_get(wa)
     msg = (incoming_text or "").strip()
 
-    # ── Step 1: ask for name if not provided ──
+    # ── Clients get client menu ──
+    if client:
+        send_whatsapp_text(wa, CLIENT_MENU.format(name=client.get("name", "there")))
+        return
+
+    # ── Prospects flow ──
+    lead = _lead_get_or_create(wa)
+
+    # Step 1: ask for name if not provided
     if not lead.get("name"):
         _lead_update(wa, name=msg)
         _notify_admin(f"📥 New lead: {msg} (wa={wa})")
         send_whatsapp_text(wa, AFTER_NAME_MSG.format(name=msg))
         return
 
-    # ── Step 2: all future messages from leads → polite reply ──
+    # Step 2: all future messages → same polite thank-you
     send_whatsapp_text(
         wa,
         AFTER_NAME_MSG.format(name=lead.get("name", "there"))
