@@ -1,6 +1,6 @@
 # app/prospect.py
 from __future__ import annotations
-import logging
+import logging, re
 from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa
@@ -29,23 +29,18 @@ CLIENT_MENU = (
 
 # ── DB helpers ───────────────────────────────────────────
 def _lead_get_or_create(wa: str):
-    """Fetch or create a lead record by WhatsApp number."""
     with get_session() as s:
         row = s.execute(
             text("SELECT id, name FROM leads WHERE wa_number=:wa"),
             {"wa": wa},
         ).mappings().first()
-
         if row:
             return dict(row)
-
-        # brand new lead
         s.execute(
             text("INSERT INTO leads (wa_number) VALUES (:wa) ON CONFLICT DO NOTHING"),
             {"wa": wa},
         )
         return {"id": None, "name": None}
-
 
 def _lead_update(wa: str, **fields):
     if not fields:
@@ -58,9 +53,7 @@ def _lead_update(wa: str, **fields):
             fields,
         )
 
-
 def _client_get(wa: str):
-    """Return client record if number exists in clients table."""
     with get_session() as s:
         row = s.execute(
             text("SELECT id, name FROM clients WHERE wa_number=:wa"),
@@ -68,23 +61,29 @@ def _client_get(wa: str):
         ).mappings().first()
         return dict(row) if row else None
 
-
 def _notify_admin(text_msg: str):
-    """Send a WhatsApp notification to Nadine (admin)."""
     try:
         if NADINE_WA:
             send_whatsapp_text(normalize_wa(NADINE_WA), text_msg)
     except Exception:
         logging.exception("Failed to notify admin")
 
+# ── Helper: check if text is valid name ──────────────────
+def _looks_like_name(msg: str) -> bool:
+    if not msg:
+        logging.info("[prospect] Empty message ignored as name")
+        return False
+    m = msg.strip().lower()
+    if m in {"hi", "hello", "hey", "howzit"}:
+        logging.info(f"[prospect] Greeting ignored as name: {msg!r}")
+        return False
+    if re.fullmatch(r"[\W_]+", msg, flags=re.UNICODE):
+        logging.info(f"[prospect] Emoji/symbol ignored as name: {msg!r}")
+        return False
+    return True
 
 # ── Main entry ──────────────────────────────────────────
 def start_or_resume(wa_number: str, incoming_text: str):
-    """
-    Entry point for inbound messages.
-    - If number exists in clients → show client menu.
-    - If not, handle as a prospect (ask name → thank-you → polite repeat).
-    """
     wa = normalize_wa(wa_number)
     client = _client_get(wa)
     msg = (incoming_text or "").strip()
@@ -97,14 +96,15 @@ def start_or_resume(wa_number: str, incoming_text: str):
     # ── Prospects flow ──
     lead = _lead_get_or_create(wa)
 
-    # Step 1: ask for name if not provided
     if not lead.get("name"):
+        if not _looks_like_name(msg):
+            send_whatsapp_text(wa, WELCOME)
+            return
         _lead_update(wa, name=msg)
         _notify_admin(f"📥 New lead: {msg} (wa={wa})")
         send_whatsapp_text(wa, AFTER_NAME_MSG.format(name=msg))
         return
 
-    # Step 2: all future messages → same polite thank-you
     send_whatsapp_text(
         wa,
         AFTER_NAME_MSG.format(name=lead.get("name", "there"))
