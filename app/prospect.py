@@ -4,6 +4,7 @@ import logging
 from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa
+from .config import NADINE_WA
 from . import admin_nudge
 
 # ── Messages ─────────────────────────────────────────────
@@ -85,11 +86,15 @@ def start_or_resume(wa_number: str, incoming_text: str):
     if not lead.get("name"):
         bad_inputs = {"hi", "hello", "hey", "test"}
         if not msg or msg.lower() in bad_inputs or len(msg) < 2:
+            logging.info(f"[prospect] bad/empty input={msg!r}, sending welcome")
             send_whatsapp_text(wa, WELCOME)
             return
 
         _lead_update(wa, name=msg)
-        admin_nudge.notify_admin_new_lead(msg, wa)  # ✅ corrected function
+        try:
+            admin_nudge.notify_new_lead(msg, wa)
+        except Exception:
+            logging.exception("Failed to send admin nudge for new lead")
         send_whatsapp_text(wa, AFTER_NAME_MSG.format(name=msg))
         return
 
