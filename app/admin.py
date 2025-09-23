@@ -1,4 +1,9 @@
 # app/admin.py
+"""
+Handles admin commands (bookings, clients, attendance).
+Business logic only. Notifications are handled in admin_nudge.py.
+"""
+
 from __future__ import annotations
 import logging
 from typing import Optional
@@ -7,6 +12,7 @@ from .utils import send_whatsapp_text, normalize_wa
 from .admin_nlp import parse_admin_command, parse_admin_client_command
 from .booking import admin_reserve, create_recurring_bookings, create_multi_recurring_bookings
 from .db import get_session
+from . import admin_nudge
 
 
 def _find_or_create_client(name: str, wa_number: str | None = None) -> tuple[int, str] | tuple[None, None]:
@@ -95,30 +101,6 @@ def _mark_today_booking(client_id: int, new_status: str) -> bool:
         return True
 
 
-# table notifications_log for audit logs
-def _log_notification(client_id: int, message: str):
-    """Insert a record into notifications_log audit table."""
-    with get_session() as s:
-        s.execute(
-            text("INSERT INTO notifications_log (client_id, message, created_at) VALUES (:cid, :msg, now())"),
-            {"cid": client_id, "msg": message},
-        )
-
-
-def _notify_client(wa_number: str, message: str):
-    """Send WhatsApp text to a client and log it."""
-    if not wa_number:
-        return
-    send_whatsapp_text(normalize_wa(wa_number), message)
-    with get_session() as s:
-        row = s.execute(
-            text("SELECT id FROM clients WHERE wa_number=:wa"),
-            {"wa": normalize_wa(wa_number)},
-        ).first()
-        if row:
-            _log_notification(row[0], message)
-
-
 def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: Optional[str] = None):
     """Handle inbound admin actions from WhatsApp."""
     logging.info(f"[ADMIN] from={from_wa} body={body!r} btn_id={btn_id!r}")
@@ -202,7 +184,7 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                 return
             ok = _cancel_next_booking(cid)
             if ok:
-                _notify_client(wnum, "Hi! Your next session has been cancelled by the studio. Please contact us to reschedule 💜")
+                admin_nudge.notify_cancel(parsed["name"], wnum)
                 send_whatsapp_text(wa, f"✅ Next session for {parsed['name']} cancelled and client notified.")
             else:
                 send_whatsapp_text(wa, f"⚠ No active future booking found for {parsed['name']}.")
@@ -215,7 +197,7 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                 return
             ok = _mark_today_booking(cid, "sick")
             if ok:
-                _notify_client(wnum, "Hi! We’ve marked you as sick for today’s session. Wishing you a speedy recovery 🌸")
+                admin_nudge.notify_sick(parsed["name"], wnum)
                 send_whatsapp_text(wa, f"🤒 Marked {parsed['name']} as sick today and client notified.")
             else:
                 send_whatsapp_text(wa, f"⚠ No active booking today for {parsed['name']}.")
@@ -228,7 +210,7 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                 return
             ok = _mark_today_booking(cid, "no_show")
             if ok:
-                _notify_client(wnum, "Hi! You missed today’s session. Please reach out if you’d like to rebook.")
+                admin_nudge.notify_no_show(parsed["name"], wnum)
                 send_whatsapp_text(wa, f"🚫 Marked {parsed['name']} as no-show and client notified.")
             else:
                 send_whatsapp_text(wa, f"⚠ No active booking today for {parsed['name']}.")

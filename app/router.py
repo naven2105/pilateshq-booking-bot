@@ -1,13 +1,14 @@
 # app/router.py
 from flask import Blueprint, request, Response, jsonify
+from sqlalchemy import text
+import os
+
 from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
 from .invoices import generate_invoice_pdf, send_invoice
 from .admin import handle_admin_action
 from .prospect import start_or_resume, _client_get, CLIENT_MENU, handle_admin_reply
 from .db import get_session
-from . import booking, faq, client_nlp
-from sqlalchemy import text
-import os
+from . import booking, faq, client_nlp, admin_nudge
 
 router_bp = Blueprint("router", __name__)
 
@@ -88,8 +89,7 @@ def webhook():
                 client = _client_get(from_wa)
                 name = client.get("name", "there") if client else "there"
                 send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
-                if NADINE_WA:
-                    send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
+                admin_nudge.notify_client_contact_request(name, from_wa)
                 return "ok"
 
         # Also allow menu numbers
@@ -106,24 +106,14 @@ def webhook():
             client = _client_get(from_wa)
             name = client.get("name", "there") if client else "there"
             send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
-            if NADINE_WA:
-                send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
+            admin_nudge.notify_client_contact_request(name, from_wa)
             return "ok"
 
         # ─────────────── Fallback: Forward to Nadine ───────────────
         client = _client_get(from_wa)
         name = client.get("name", "there") if client else "there"
-
         send_whatsapp_text(from_wa, "🤖 Thanks for your message! Nadine will follow up with you shortly.")
-
-        if NADINE_WA:
-            forward_msg = (
-                f"📩 *Client message*\n"
-                f"👤 {name} ({from_wa})\n"
-                f"💬 \"{text_in}\""
-            )
-            send_whatsapp_text(NADINE_WA, forward_msg)
-
+        admin_nudge.notify_client_message(name, from_wa, text_in)
         return "ok"
 
     # ─────────────── Prospect (unknown) ───────────────
