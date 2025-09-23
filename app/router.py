@@ -1,21 +1,19 @@
-#app/router.py
+# app/router.py
 from flask import Blueprint, request, Response, jsonify
 from sqlalchemy import text
-import os
-import logging
+import os, logging
 
-from .utils import _send_to_meta, normalize_wa, send_whatsapp_text, safe_execute
+from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
 from .invoices import generate_invoice_pdf, send_invoice
 from .admin import handle_admin_action
-from .admin_nudge import handle_admin_reply
+from .admin_nudge import handle_admin_reply   # ✅ lead conversion / add logic
 from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session
 from . import booking, faq, client_nlp
 
 router_bp = Blueprint("router", __name__)
-log = logging.getLogger(__name__)
 
-ADMIN_NUMBER = os.getenv("ADMIN_NUMBER", "")
+ADMIN_NUMBER = os.getenv("ADMIN_NUMBER", "")  # e.g. 27843131635
 NADINE_WA = os.getenv("NADINE_WA", "")
 
 
@@ -42,6 +40,10 @@ def webhook():
       - Unknown → prospect.py onboarding
     """
     data = request.get_json(force=True, silent=True) or {}
+
+    # ✅ Debug logging for raw webhook payload
+    logging.info(f"[WEBHOOK RAW] incoming payload: {data}")
+
     try:
         entry = data["entry"][0]
         changes = entry["changes"][0]
@@ -51,21 +53,31 @@ def webhook():
             return "ok"
 
         msg = messages[0]
-        from_wa = normalize_wa(msg["from"])
+        from_wa = normalize_wa(msg["from"])  # sender WA number
         text_in = msg.get("text", {}).get("body", "").strip()
     except Exception as e:
-        log.exception("Webhook payload error")
+        logging.exception("Failed to parse webhook payload")
+
+        # ✅ Temporary fallback so guest gets something instead of silence
+        try:
+            if "messages" in (data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {})):
+                from_wa = normalize_wa(
+                    data["entry"][0]["changes"][0]["value"]["messages"][0]["from"]
+                )
+                send_whatsapp_text(from_wa, "⚠ Could not parse your message. The studio will follow up.")
+        except Exception:
+            logging.warning("Could not extract from_wa for fallback message")
+
         return jsonify({"error": f"invalid payload {e}"}), 400
 
-    log.info(f"[WEBHOOK] from={from_wa} text={text_in!r}")
-
-    # ─────────────── Admin ───────────────
+    # ─────────────── Admin (Nadine or super-admin) ───────────────
     if from_wa in {normalize_wa(ADMIN_NUMBER), normalize_wa(NADINE_WA)}:
-        log.debug(f"[ROUTER] matched ADMIN ({from_wa})")
+        # Nadine special case: convert/add leads
         if from_wa == normalize_wa(NADINE_WA) and text_in.lower().startswith(("convert", "add ")):
             handle_admin_reply(from_wa, text_in)
             return "ok"
 
+        # All other admin commands
         handle_admin_action(from_wa, msg.get("id"), text_in, None)
         return "ok"
 
@@ -77,11 +89,10 @@ def webhook():
         ).first()
 
     if row:
-        log.debug(f"[ROUTER] matched CLIENT ({from_wa}) text={text_in!r}")
+        # Try NLP first
         parsed = client_nlp.parse_client_command(text_in)
         if parsed:
             intent = parsed["intent"]
-            log.info(f"[CLIENT NLP] intent={intent}")
             if intent == "show_bookings":
                 booking.show_bookings(from_wa)
                 return "ok"
@@ -94,17 +105,12 @@ def webhook():
             if intent == "contact_admin":
                 client = _client_get(from_wa)
                 name = client.get("name", "there") if client else "there"
-                safe_execute(send_whatsapp_text, from_wa,
-                    "👍 Got it! Nadine will contact you shortly.",
-                    label="client_contact_admin"
-                )
+                send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
                 if NADINE_WA:
-                    safe_execute(send_whatsapp_text, NADINE_WA,
-                        f"📞 Client requested contact: {name} ({from_wa})",
-                        label="notify_admin_contact"
-                    )
+                    send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
                 return "ok"
 
+        # Also allow menu numbers
         if text_in == "1":
             booking.show_bookings(from_wa)
             return "ok"
@@ -117,33 +123,27 @@ def webhook():
         if text_in == "0":
             client = _client_get(from_wa)
             name = client.get("name", "there") if client else "there"
-            safe_execute(send_whatsapp_text, from_wa,
-                "👍 Got it! Nadine will contact you shortly.",
-                label="client_menu_contact"
-            )
+            send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
             if NADINE_WA:
-                safe_execute(send_whatsapp_text, NADINE_WA,
-                    f"📞 Client requested contact: {name} ({from_wa})",
-                    label="notify_admin_menu"
-                )
+                send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
             return "ok"
 
+        # ─────────────── Fallback: Forward to Nadine ───────────────
         client = _client_get(from_wa)
         name = client.get("name", "there") if client else "there"
-        safe_execute(send_whatsapp_text, from_wa,
-            "🤖 Thanks for your message! Nadine will follow up with you shortly.",
-            label="client_fallback"
-        )
+
+        send_whatsapp_text(from_wa, "🤖 Thanks for your message! Nadine will follow up with you shortly.")
+
         if NADINE_WA:
             forward_msg = (
                 f"📩 *Client message*\n"
                 f"👤 {name} ({from_wa})\n"
                 f"💬 \"{text_in}\""
             )
-            safe_execute(send_whatsapp_text, NADINE_WA, forward_msg, label="forward_client_msg")
+            send_whatsapp_text(NADINE_WA, forward_msg)
+
         return "ok"
 
-    # ─────────────── Prospect ───────────────
-    log.debug(f"[ROUTER] matched PROSPECT ({from_wa}) text={text_in!r}")
+    # ─────────────── Prospect (unknown) ───────────────
     start_or_resume(from_wa, text_in)
     return "ok"
