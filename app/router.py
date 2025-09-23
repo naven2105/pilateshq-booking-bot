@@ -5,10 +5,11 @@ import os
 
 from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
 from .invoices import generate_invoice_pdf, send_invoice
-from .admin import handle_admin_action, handle_admin_reply   # ✅ fixed import
+from .admin import handle_admin_action
+from .admin_nudge import handle_admin_reply   # ✅ lead conversion / add logic
 from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session
-from . import booking, faq, client_nlp, admin_nudge
+from . import booking, faq, client_nlp
 
 router_bp = Blueprint("router", __name__)
 
@@ -34,7 +35,7 @@ def webhook():
     """
     Handle incoming WhatsApp messages.
     Routing:
-      - Admin (incl. Nadine) → admin.py or admin_nudge.py (convert/add)
+      - Admin (incl. Nadine) → admin.py or admin_nudge.py
       - Known client → client features (invoice/bookings/etc.)
       - Unknown → prospect.py onboarding
     """
