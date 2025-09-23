@@ -142,3 +142,58 @@ def parse_admin_command(text: str, wa_number: str | None = None) -> dict | None:
         if not hhmm: return None
         tomorrow = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
         slot_type = _norm_slot_type(type_word, bool(partner))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Client & attendance commands
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_admin_client_command(text: str) -> dict | None:
+    """
+    Client & attendance updates:
+      - "add client Alice with number 082..."
+      - "change John date of birth to 21 May"
+      - "update John - note text"
+      - "cancel Jane next session"
+      - "Peter is off sick."
+      - "Sam is no show today."
+    """
+    s = text.strip()
+
+    # Add client
+    m = re.match(r'(?i)^\s*add\s+(?:new\s+)?client\s+(.+?)\s+(?:with\s+)?number\s+([+\d\s-]+)\s*$', s)
+    if m:
+        import re as _re
+        name = m.group(1).strip()
+        number = _re.sub(r'\s|-', '', m.group(2))
+        return {"intent": "add_client", "name": name, "number": number}
+
+    # Change DOB
+    m = re.match(r'(?i)^\s*change\s+(.+?)\s+date\s+of\s+birth\s+to\s+(\d{1,2})\s+([A-Za-z]+)\s*$', s)
+    if m:
+        name = m.group(1).strip()
+        day = int(m.group(2)); mon_raw = m.group(3).lower()
+        month = MONTHS.get(mon_raw)
+        if not month:
+            return None
+        return {"intent": "update_dob", "name": name, "day": day, "month": month}
+
+    # Update medical notes
+    m = re.match(r'(?i)^\s*update\s+(.+?)\s*-\s*(.+)\s*$', s)
+    if m:
+        return {"intent": "update_medical", "name": m.group(1).strip(), "note": m.group(2).strip()}
+
+    # Cancel next session
+    m = re.match(r'(?i)^\s*cancel\s+(.+?)\s+next\s+session\s*$', s)
+    if m:
+        return {"intent": "cancel_next", "name": m.group(1).strip()}
+
+    # Off sick today
+    m = re.match(r'(?i)^\s*(.+?)\s+is\s+off\s+sick\.?\s*$', s)
+    if m:
+        return {"intent": "off_sick_today", "name": m.group(1).strip()}
+
+    # No show today
+    m = re.match(r'(?i)^\s*(.+?)\s+is\s+no\s+show\s+today\.?\s*$', s)
+    if m:
+        return {"intent": "no_show_today", "name": m.group(1).strip()}
+
+    return None
