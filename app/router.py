@@ -3,7 +3,7 @@ from flask import Blueprint, request, Response, jsonify
 from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
 from .invoices import generate_invoice_pdf, send_invoice
 from .admin import handle_admin_action
-from .prospect import start_or_resume, _client_get, CLIENT_MENU
+from .prospect import start_or_resume, _client_get, CLIENT_MENU, handle_admin_reply
 from .db import get_session
 from . import booking, faq, client_nlp
 from sqlalchemy import text
@@ -33,7 +33,7 @@ def webhook():
     """
     Handle incoming WhatsApp messages.
     Routing:
-      - Admin → admin.py
+      - Admin (incl. Nadine) → admin.py or prospect.py (convert/add)
       - Known client → client features (invoice/bookings/etc.)
       - Unknown → prospect.py onboarding
     """
@@ -52,8 +52,14 @@ def webhook():
     except Exception as e:
         return jsonify({"error": f"invalid payload {e}"}), 400
 
-    # ─────────────── Admin ───────────────
-    if from_wa == normalize_wa(ADMIN_NUMBER):
+    # ─────────────── Admin (Nadine or super-admin) ───────────────
+    if from_wa in {normalize_wa(ADMIN_NUMBER), normalize_wa(NADINE_WA)}:
+        # Nadine special case: convert/add leads
+        if from_wa == normalize_wa(NADINE_WA) and text_in.lower().startswith(("convert", "add ")):
+            handle_admin_reply(from_wa, text_in)
+            return "ok"
+
+        # All other admin commands
         handle_admin_action(from_wa, msg.get("id"), text_in, None)
         return "ok"
 
