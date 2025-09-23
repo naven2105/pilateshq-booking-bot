@@ -141,4 +141,4 @@ def parse_admin_command(text: str, wa_number: str | None = None) -> dict | None:
         hhmm = parse_time_word(timestr)
         if not hhmm: return None
         tomorrow = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
-        slot_type = _norm_slot_type(type_word, bool(partner_
+        slot_type = _norm_slot_type(type_word, bool(partner))
