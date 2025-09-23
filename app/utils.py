@@ -1,5 +1,7 @@
 # app/utils.py
-import logging, requests, os
+import logging
+import requests
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -8,10 +10,10 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 
 
-def _send_to_meta(payload: dict) -> dict:
+def _send_to_meta(payload: dict) -> tuple:
     """
-    Low-level sender to Meta WhatsApp API.
-    Returns a dict with ok, status_code, and response body.
+    Internal: send payload to Meta WhatsApp API.
+    Returns (ok: bool, status_code: int, response_json: dict | str).
     """
     url = WHATSAPP_API_URL.format(phone_number_id=PHONE_NUMBER_ID)
     headers = {
@@ -20,57 +22,22 @@ def _send_to_meta(payload: dict) -> dict:
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        body = {}
         try:
             body = resp.json()
         except Exception:
-            body = {"raw_text": resp.text[:500]}
-        result = {
-            "ok": resp.ok,
-            "status_code": resp.status_code,
-            "response": body,
-        }
-        if not resp.ok:
-            logger.error("[MetaSendError] status=%s body=%s payload=%s",
-                         resp.status_code, resp.text, payload)
-        else:
-            logger.info("WhatsApp API %s OK", resp.status_code)
-        return result
+            body = resp.text
+        ok = 200 <= resp.status_code < 300
+        if not ok:
+            logger.error(f"[WA SEND FAIL] status={resp.status_code} body={body}")
+        return ok, resp.status_code, body
     except Exception as e:
-        logger.exception("[MetaSendException] payload=%s", payload)
-        return {"ok": False, "status_code": 500, "response": {"error": str(e)}}
-
-
-def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) -> dict:
-    """
-    Send a WhatsApp template by name/language with body variables.
-    Args:
-        to: Target WhatsApp number in 27... format
-        name: Template name (must be approved in Meta)
-        lang: Language code (e.g. 'en_US')
-        variables: List of strings mapped to {{1}}, {{2}}, etc.
-    """
-    components = [{
-        "type": "body",
-        "parameters": [{"type": "text", "text": str(v)} for v in variables],
-    }]
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": name,
-            "language": {"code": lang},
-            "components": components,
-        },
-    }
-    return _send_to_meta(payload)
+        logger.exception("Failed to send payload to Meta")
+        return False, 0, str(e)
 
 
 def send_whatsapp_text(to: str, text: str) -> dict:
     """
-    Fallback plain-text sender (not template).
+    Send a simple WhatsApp text message.
     """
     payload = {
         "messaging_product": "whatsapp",
@@ -78,17 +45,35 @@ def send_whatsapp_text(to: str, text: str) -> dict:
         "type": "text",
         "text": {"body": text},
     }
-    return _send_to_meta(payload)
+    ok, status, body = _send_to_meta(payload)
+    return {"ok": ok, "status_code": status, "response": body}
 
-def normalize_wa(number: str) -> str:
+
+def normalize_wa(num: str) -> str:
     """
-    Normalize WhatsApp numbers into international format (South Africa default).
-    - Removes spaces, dashes, plus.
-    - Converts leading 0 to 27 (South Africa country code).
+    Normalise a WhatsApp number:
+      - remove leading '+'
+      - convert SA numbers '0xxxxxxxxx' → '27xxxxxxxxx'
     """
-    if not number:
-        return number
-    n = str(number).replace(" ", "").replace("-", "").replace("+", "")
-    if n.startswith("0"):
-        n = "27" + n[1:]
-    return n
+    if not num:
+        return num
+    num = num.strip().replace("+", "")
+    if num.startswith("0"):
+        num = "27" + num[1:]
+    return num
+
+
+def safe_execute(func, *args, label: str = "", **kwargs):
+    """
+    Wrapper to safely execute any function.
+    Logs success/failure without breaking the bot flow.
+    Example:
+        safe_execute(send_whatsapp_text, wa, "Hello", label="welcome_prompt")
+    """
+    try:
+        result = func(*args, **kwargs)
+        logger.info(f"[SAFE EXEC OK] {label} → {result}")
+        return result
+    except Exception as e:
+        logger.exception(f"[SAFE EXEC FAIL] {label} args={args} kwargs={kwargs}: {e}")
+        return None

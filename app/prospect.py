@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from sqlalchemy import text
 from .db import get_session
-from .utils import send_whatsapp_text, normalize_wa
+from .utils import send_whatsapp_text, normalize_wa, safe_execute
 from .config import NADINE_WA
 from . import admin_nudge
 
@@ -73,33 +73,41 @@ def start_or_resume(wa_number: str, incoming_text: str):
     wa = normalize_wa(wa_number)
     client = _client_get(wa)
     msg = (incoming_text or "").strip()
+    logging.info(f"[PROSPECT] Incoming={msg!r}, wa={wa}, client={bool(client)}")
 
     # ── Clients get client menu ──
     if client:
-        send_whatsapp_text(wa, CLIENT_MENU.format(name=client.get("name", "there")))
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            CLIENT_MENU.format(name=client.get("name", "there")),
+            label="client_menu"
+        )
         return
 
     # ── Prospects flow ──
     lead = _lead_get_or_create(wa)
+    logging.info(f"[PROSPECT] Lead record: {lead}")
 
     # Step 1: ask for name if not provided
     if not lead.get("name"):
         bad_inputs = {"hi", "hello", "hey", "test"}
         if not msg or msg.lower() in bad_inputs or len(msg) < 2:
-            logging.info(f"[prospect] bad/empty input={msg!r}, sending welcome")
-            send_whatsapp_text(wa, WELCOME)
+            logging.info("[PROSPECT] No valid name yet → sending WELCOME")
+            safe_execute(send_whatsapp_text, wa, WELCOME, label="welcome_prompt")
             return
 
         _lead_update(wa, name=msg)
-        try:
-            admin_nudge.notify_new_lead(msg, wa)
-        except Exception:
-            logging.exception("Failed to send admin nudge for new lead")
-        send_whatsapp_text(wa, AFTER_NAME_MSG.format(name=msg))
+        admin_nudge.notify_new_lead(msg, wa)
+        logging.info(f"[PROSPECT] Stored new lead name={msg}")
+        safe_execute(send_whatsapp_text, wa, AFTER_NAME_MSG.format(name=msg), label="after_name")
         return
 
     # Step 2: all future messages → same polite thank-you
-    send_whatsapp_text(
+    logging.info(f"[PROSPECT] Known lead name={lead.get('name')}, repeating polite reply")
+    safe_execute(
+        send_whatsapp_text,
         wa,
-        AFTER_NAME_MSG.format(name=lead.get("name", "there"))
+        AFTER_NAME_MSG.format(name=lead.get("name", "there")),
+        label="repeat_polite"
     )

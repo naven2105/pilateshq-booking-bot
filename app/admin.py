@@ -1,26 +1,25 @@
-# app/admin.py
 """
-admin.py
-────────
 Handles inbound admin actions (Nadine / super-admin).
 Now integrated with admin_nudge.py so that:
  - Sick / No-show / Cancel actions also trigger a nudge log
+ - Wrapped in safe_execute() for reliability
 """
 
 from __future__ import annotations
 import logging
 from typing import Optional
 from sqlalchemy import text
-from .utils import send_whatsapp_text, normalize_wa
+from .utils import send_whatsapp_text, normalize_wa, safe_execute
 from .admin_nlp import parse_admin_command, parse_admin_client_command
 from .booking import admin_reserve, create_recurring_bookings, create_multi_recurring_bookings
 from .db import get_session
-from . import admin_nudge  # NEW: for nudges
+from . import admin_nudge  # for nudges
+
+log = logging.getLogger(__name__)
 
 
 def _find_or_create_client(name: str, wa_number: str | None = None) -> tuple[int, str] | tuple[None, None]:
-    """Look up a client by name. If not found and wa_number is given, create.
-       Returns (client_id, wa_number)."""
+    """Look up a client by name. If not found and wa_number is given, create."""
     with get_session() as s:
         row = s.execute(
             text("SELECT id, wa_number FROM clients WHERE lower(name)=lower(:n)"),
@@ -46,7 +45,7 @@ def _mark_lead_converted(wa_number: str, client_id: int):
             text("UPDATE leads SET status='converted' WHERE wa_number=:wa"),
             {"wa": wa_number},
         )
-    logging.info(f"Lead {wa_number} promoted → client {client_id}")
+    log.info(f"Lead {wa_number} promoted → client {client_id}")
 
 
 def _find_session(date: str, time: str) -> int | None:
@@ -104,7 +103,6 @@ def _mark_today_booking(client_id: int, new_status: str) -> bool:
         return True
 
 
-# table notifications_log for audit logs
 def _log_notification(client_id: int, message: str):
     """Insert a record into notifications_log audit table."""
     with get_session() as s:
@@ -118,7 +116,7 @@ def _notify_client(wa_number: str, message: str):
     """Send WhatsApp text to a client and log it."""
     if not wa_number:
         return
-    send_whatsapp_text(normalize_wa(wa_number), message)
+    safe_execute(send_whatsapp_text, normalize_wa(wa_number), message, label="notify_client")
     with get_session() as s:
         row = s.execute(
             text("SELECT id FROM clients WHERE wa_number=:wa"),
@@ -130,21 +128,21 @@ def _notify_client(wa_number: str, message: str):
 
 def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: Optional[str] = None):
     """Handle inbound admin actions from WhatsApp."""
-    logging.info(f"[ADMIN] from={from_wa} body={body!r} btn_id={btn_id!r}")
+    log.info(f"[ADMIN] from={from_wa} body={body!r} btn_id={btn_id!r}")
 
     wa = normalize_wa(from_wa)
     text_in = (body or "").strip()
 
     # ─────────────── Menu ───────────────
     if text_in.lower() in {"hi", "menu", "help"}:
-        send_whatsapp_text(
-            wa,
+        safe_execute(send_whatsapp_text, wa,
             "🛠 Admin Menu\n\n"
             "• Book Sessions → e.g. 'Book Mary on 2025-09-21 08:00 single'\n"
             "• Recurring Sessions → e.g. 'Book Mary every Tuesday 09h00 duo'\n"
             "• Manage Clients → e.g. 'Add client Alice with number 082...'\n"
             "• Attendance Updates → e.g. 'Peter is off sick.'\n"
-            "Type your command directly."
+            "Type your command directly.",
+            label="admin_menu"
         )
         return
 
@@ -152,7 +150,7 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
     parsed = parse_admin_command(text_in, wa_number=wa)
     if parsed:
         intent = parsed["intent"]
-        logging.info(f"[ADMIN BOOKING] parsed={parsed}")
+        log.info(f"[ADMIN BOOKING] parsed={parsed}")
 
         if intent == "book_single":
             client_id, wnum = _find_or_create_client(parsed["name"], parsed.get("wa_number"))
@@ -160,13 +158,22 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                 _mark_lead_converted(wnum, client_id)
             sid = _find_session(parsed["date"], parsed["time"])
             if not sid:
-                send_whatsapp_text(wa, f"⚠ No session found on {parsed['date']} at {parsed['time']}.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No session found on {parsed['date']} at {parsed['time']}.",
+                    label="book_single_fail"
+                )
                 return
             ok = admin_reserve(client_id, sid, 1)
             if ok:
-                send_whatsapp_text(wa, f"✅ Session booked for {parsed['name']} on {parsed['date']} at {parsed['time']}.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"✅ Session booked for {parsed['name']} on {parsed['date']} at {parsed['time']}.",
+                    label="book_single_ok"
+                )
             else:
-                send_whatsapp_text(wa, f"❌ Could not reserve — session is full.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"❌ Could not reserve — session is full.",
+                    label="book_single_full"
+                )
             return
 
         if intent == "book_recurring":
@@ -174,7 +181,10 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             if client_id:
                 _mark_lead_converted(wnum, client_id)
             created = create_recurring_bookings(client_id, parsed["weekday"], parsed["time"], parsed["slot_type"])
-            send_whatsapp_text(wa, f"📅 Created {created} weekly bookings for {parsed['name']} ({parsed['slot_type']}).")
+            safe_execute(send_whatsapp_text, wa,
+                f"📅 Created {created} weekly bookings for {parsed['name']} ({parsed['slot_type']}).",
+                label="book_recurring"
+            )
             return
 
         if intent == "book_recurring_multi":
@@ -182,14 +192,17 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             if client_id:
                 _mark_lead_converted(wnum, client_id)
             created = create_multi_recurring_bookings(client_id, parsed["slots"])
-            send_whatsapp_text(wa, f"📅 Created {created} recurring bookings for {parsed['name']} across multiple days.")
+            safe_execute(send_whatsapp_text, wa,
+                f"📅 Created {created} recurring bookings for {parsed['name']} across multiple days.",
+                label="book_multi"
+            )
             return
 
     # ─────────────── Clients / Attendance ───────────────
     parsed = parse_admin_client_command(text_in)
     if parsed:
         intent = parsed["intent"]
-        logging.info(f"[ADMIN CLIENT] parsed={parsed}")
+        log.info(f"[ADMIN CLIENT] parsed={parsed}")
 
         if intent == "add_client":
             name = parsed["name"]
@@ -199,55 +212,88 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             cid, wnum = _find_or_create_client(name, number)
             if cid:
                 _mark_lead_converted(wnum, cid)
-                send_whatsapp_text(wa, f"✅ Client '{name}' added with number {wnum}. (id={cid})")
+                safe_execute(send_whatsapp_text, wa,
+                    f"✅ Client '{name}' added with number {wnum}. (id={cid})",
+                    label="add_client_ok"
+                )
             else:
-                send_whatsapp_text(wa, f"⚠ Could not add client '{name}'.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ Could not add client '{name}'.",
+                    label="add_client_fail"
+                )
             return
 
         if intent == "cancel_next":
             cid, wnum = _find_or_create_client(parsed["name"])
             if not cid:
-                send_whatsapp_text(wa, f"⚠ No client found named '{parsed['name']}'.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No client found named '{parsed['name']}'.",
+                    label="cancel_next_fail"
+                )
                 return
             ok = _cancel_next_booking(cid)
             if ok:
                 _notify_client(wnum, "Hi! Your next session has been cancelled by the studio. Please contact us to reschedule 💜")
-                send_whatsapp_text(wa, f"✅ Next session for {parsed['name']} cancelled and client notified.")
-                # NEW: also nudge Nadine/log
+                safe_execute(send_whatsapp_text, wa,
+                    f"✅ Next session for {parsed['name']} cancelled and client notified.",
+                    label="cancel_next_ok"
+                )
                 admin_nudge.notify_cancel(parsed["name"], wnum, "next session")
             else:
-                send_whatsapp_text(wa, f"⚠ No active future booking found for {parsed['name']}.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No active future booking found for {parsed['name']}.",
+                    label="cancel_next_none"
+                )
             return
 
         if intent == "off_sick_today":
             cid, wnum = _find_or_create_client(parsed["name"])
             if not cid:
-                send_whatsapp_text(wa, f"⚠ No client found named '{parsed['name']}'.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No client found named '{parsed['name']}'.",
+                    label="sick_fail"
+                )
                 return
             ok = _mark_today_booking(cid, "sick")
             if ok:
                 _notify_client(wnum, "Hi! We’ve marked you as sick for today’s session. Wishing you a speedy recovery 🌸")
-                send_whatsapp_text(wa, f"🤒 Marked {parsed['name']} as sick today and client notified.")
-                # NEW: also nudge Nadine/log
+                safe_execute(send_whatsapp_text, wa,
+                    f"🤒 Marked {parsed['name']} as sick today and client notified.",
+                    label="sick_ok"
+                )
                 admin_nudge.notify_sick(parsed["name"], wnum, "today")
             else:
-                send_whatsapp_text(wa, f"⚠ No active booking today for {parsed['name']}.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No active booking today for {parsed['name']}.",
+                    label="sick_none"
+                )
             return
 
         if intent == "no_show_today":
             cid, wnum = _find_or_create_client(parsed["name"])
             if not cid:
-                send_whatsapp_text(wa, f"⚠ No client found named '{parsed['name']}'.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No client found named '{parsed['name']}'.",
+                    label="noshow_fail"
+                )
                 return
             ok = _mark_today_booking(cid, "no_show")
             if ok:
                 _notify_client(wnum, "Hi! You missed today’s session. Please reach out if you’d like to rebook.")
-                send_whatsapp_text(wa, f"🚫 Marked {parsed['name']} as no-show and client notified.")
-                # NEW: also nudge Nadine/log
+                safe_execute(send_whatsapp_text, wa,
+                    f"🚫 Marked {parsed['name']} as no-show and client notified.",
+                    label="noshow_ok"
+                )
                 admin_nudge.notify_no_show(parsed["name"], wnum, "today")
             else:
-                send_whatsapp_text(wa, f"⚠ No active booking today for {parsed['name']}.")
+                safe_execute(send_whatsapp_text, wa,
+                    f"⚠ No active booking today for {parsed['name']}.",
+                    label="noshow_none"
+                )
             return
 
     # ─────────────── Fallback ───────────────
-    send_whatsapp_text(wa, "⚠ Unknown admin command. Reply 'menu' for options.")
+    safe_execute(send_whatsapp_text, wa,
+        "⚠ Unknown admin command. Reply 'menu' for options.",
+        label="admin_fallback"
+    )
