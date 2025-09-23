@@ -5,8 +5,8 @@ import os
 
 from .utils import _send_to_meta, normalize_wa, send_whatsapp_text
 from .invoices import generate_invoice_pdf, send_invoice
-from .admin import handle_admin_action
-from .prospect import start_or_resume, _client_get, CLIENT_MENU, handle_admin_reply
+from .admin import handle_admin_action, handle_admin_reply   # ✅ fixed import
+from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session
 from . import booking, faq, client_nlp, admin_nudge
 
@@ -34,7 +34,7 @@ def webhook():
     """
     Handle incoming WhatsApp messages.
     Routing:
-      - Admin (incl. Nadine) → admin.py or prospect.py (convert/add)
+      - Admin (incl. Nadine) → admin.py or admin_nudge.py (convert/add)
       - Known client → client features (invoice/bookings/etc.)
       - Unknown → prospect.py onboarding
     """
@@ -89,7 +89,8 @@ def webhook():
                 client = _client_get(from_wa)
                 name = client.get("name", "there") if client else "there"
                 send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
-                admin_nudge.notify_client_contact_request(name, from_wa)
+                if NADINE_WA:
+                    send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
                 return "ok"
 
         # Also allow menu numbers
@@ -106,14 +107,24 @@ def webhook():
             client = _client_get(from_wa)
             name = client.get("name", "there") if client else "there"
             send_whatsapp_text(from_wa, "👍 Got it! Nadine will contact you shortly.")
-            admin_nudge.notify_client_contact_request(name, from_wa)
+            if NADINE_WA:
+                send_whatsapp_text(NADINE_WA, f"📞 Client requested contact: {name} ({from_wa})")
             return "ok"
 
         # ─────────────── Fallback: Forward to Nadine ───────────────
         client = _client_get(from_wa)
         name = client.get("name", "there") if client else "there"
+
         send_whatsapp_text(from_wa, "🤖 Thanks for your message! Nadine will follow up with you shortly.")
-        admin_nudge.notify_client_message(name, from_wa, text_in)
+
+        if NADINE_WA:
+            forward_msg = (
+                f"📩 *Client message*\n"
+                f"👤 {name} ({from_wa})\n"
+                f"💬 \"{text_in}\""
+            )
+            send_whatsapp_text(NADINE_WA, forward_msg)
+
         return "ok"
 
     # ─────────────── Prospect (unknown) ───────────────
