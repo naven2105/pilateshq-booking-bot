@@ -30,6 +30,16 @@ def _find_or_create_client(name: str, wa_number: str | None = None) -> tuple[int
     return None, None
 
 
+def _mark_lead_converted(wa_number: str, client_id: int):
+    """Mark a lead as converted once promoted to client."""
+    with get_session() as s:
+        s.execute(
+            text("UPDATE leads SET status='converted' WHERE wa_number=:wa"),
+            {"wa": wa_number},
+        )
+    logging.info(f"Lead {wa_number} promoted → client {client_id}")
+
+
 def _find_session(date: str, time: str) -> int | None:
     """Find a session by date+time. Returns session_id or None."""
     with get_session() as s:
@@ -84,7 +94,8 @@ def _mark_today_booking(client_id: int, new_status: str) -> bool:
         s.execute(text("UPDATE bookings SET status=:st WHERE id=:bid"), {"st": new_status, "bid": bid})
         return True
 
-#table notifications_log for audit logs
+
+# table notifications_log for audit logs
 def _log_notification(client_id: int, message: str):
     """Insert a record into notifications_log audit table."""
     with get_session() as s:
@@ -93,12 +104,12 @@ def _log_notification(client_id: int, message: str):
             {"cid": client_id, "msg": message},
         )
 
+
 def _notify_client(wa_number: str, message: str):
     """Send WhatsApp text to a client and log it."""
     if not wa_number:
         return
     send_whatsapp_text(normalize_wa(wa_number), message)
-    # Try to log notification if client exists
     with get_session() as s:
         row = s.execute(
             text("SELECT id FROM clients WHERE wa_number=:wa"),
@@ -129,22 +140,19 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
         return
 
     # ─────────────── Bookings ───────────────
-    parsed = parse_admin_command(text_in)
+    parsed = parse_admin_command(text_in, wa_number=wa)
     if parsed:
         intent = parsed["intent"]
         logging.info(f"[ADMIN BOOKING] parsed={parsed}")
 
         if intent == "book_single":
-            client_id, _ = _find_or_create_client(parsed["name"])
-            if not client_id:
-                send_whatsapp_text(wa, f"⚠ Could not find client '{parsed['name']}'. Use 'add client ...' first.")
-                return
-
+            client_id, wnum = _find_or_create_client(parsed["name"], parsed.get("wa_number"))
+            if client_id:
+                _mark_lead_converted(wnum, client_id)
             sid = _find_session(parsed["date"], parsed["time"])
             if not sid:
                 send_whatsapp_text(wa, f"⚠ No session found on {parsed['date']} at {parsed['time']}.")
                 return
-
             ok = admin_reserve(client_id, sid, 1)
             if ok:
                 send_whatsapp_text(wa, f"✅ Session booked for {parsed['name']} on {parsed['date']} at {parsed['time']}.")
@@ -153,28 +161,20 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             return
 
         if intent == "book_recurring":
-            client_id, _ = _find_or_create_client(parsed["name"])
-            if not client_id:
-                send_whatsapp_text(wa, f"⚠ No client found named '{parsed['name']}'.")
-                return
+            client_id, wnum = _find_or_create_client(parsed["name"], parsed.get("wa_number"))
+            if client_id:
+                _mark_lead_converted(wnum, client_id)
             created = create_recurring_bookings(client_id, parsed["weekday"], parsed["time"], parsed["slot_type"])
             send_whatsapp_text(wa, f"📅 Created {created} weekly bookings for {parsed['name']} ({parsed['slot_type']}).")
             return
 
         if intent == "book_recurring_multi":
-            client_id, _ = _find_or_create_client(parsed["name"])
-            if not client_id:
-                send_whatsapp_text(wa, f"⚠ No client found named '{parsed['name']}'.")
-                return
+            client_id, wnum = _find_or_create_client(parsed["name"], parsed.get("wa_number"))
+            if client_id:
+                _mark_lead_converted(wnum, client_id)
             created = create_multi_recurring_bookings(client_id, parsed["slots"])
             send_whatsapp_text(wa, f"📅 Created {created} recurring bookings for {parsed['name']} across multiple days.")
             return
-
-        send_whatsapp_text(
-            wa,
-            f"📅 Booking intent recognised: {intent}\nDetails: {parsed}\n(Support coming soon)"
-        )
-        return
 
     # ─────────────── Clients / Attendance ───────────────
     parsed = parse_admin_client_command(text_in)
@@ -189,10 +189,7 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                 number = "27" + number[1:]
             cid, wnum = _find_or_create_client(name, number)
             if cid:
-                try:
-                    _mark_lead_converted(wnum, cid)
-                except Exception:
-                    logging.exception("Failed to mark lead converted")
+                _mark_lead_converted(wnum, cid)
                 send_whatsapp_text(wa, f"✅ Client '{name}' added with number {wnum}. (id={cid})")
             else:
                 send_whatsapp_text(wa, f"⚠ Could not add client '{name}'.")
@@ -237,13 +234,5 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                 send_whatsapp_text(wa, f"⚠ No active booking today for {parsed['name']}.")
             return
 
-        # fallback
-        send_whatsapp_text(
-            wa,
-            f"👥 Client/Attendance intent recognised: {intent}\nDetails: {parsed}\n(DB integration pending)"
-        )
-        return
-
     # ─────────────── Fallback ───────────────
     send_whatsapp_text(wa, "⚠ Unknown admin command. Reply 'menu' for options.")
-

@@ -1,8 +1,11 @@
 # app/booking.py
 from __future__ import annotations
 import logging
+from sqlalchemy import text
+from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa
 from .config import NADINE_WA
+from .prospect import _lead_get_or_create, _lead_update
 
 log = logging.getLogger(__name__)
 
@@ -19,10 +22,6 @@ WEEKDAY_NAMES = {
 
 # ── Client: show bookings ─────────────────────────────
 def show_bookings(wa_number: str):
-    """
-    Show upcoming bookings for a client.
-    Replace with real DB queries later.
-    """
     msg = (
         "📅 Your upcoming bookings:\n\n"
         "• Tue 24 Sep, 08:00 – Reformer Duo\n"
@@ -31,17 +30,39 @@ def show_bookings(wa_number: str):
     )
     send_whatsapp_text(wa_number, msg)
 
+# ── Promotion helper ──────────────────────────────────
+def _promote_lead_to_client(wa: str, name: str):
+    with get_session() as s:
+        # check if already a client
+        exists = s.execute(
+            text("SELECT id FROM clients WHERE wa_number=:wa"),
+            {"wa": wa},
+        ).first()
+        if exists:
+            return
 
-# ── Admin: booking functions ──────────────────────────
-def admin_reserve(name: str, date: str, time: str, slot_type: str, partner: str | None = None):
-    """
-    Single admin booking (via NLP).
-    Replace with DB insert logic later.
-    """
+        # insert new client
+        s.execute(
+            text("INSERT INTO clients (wa_number, name) VALUES (:wa, :name)"),
+            {"wa": wa, "name": name},
+        )
+        # mark lead as converted
+        s.execute(
+            text("UPDATE leads SET status='converted' WHERE wa_number=:wa"),
+            {"wa": wa},
+        )
+        log.info(f"Lead {wa} promoted to client {name}")
+
+# ── Admin booking functions ───────────────────────────
+def admin_reserve(name: str, date: str, time: str, slot_type: str, partner: str | None = None, wa_number: str | None = None):
     msg = f"[ADMIN] Reserving {slot_type} for {name} on {date} {time}"
     if partner:
         msg += f" with {partner}"
     log.info(msg)
+
+    # promote to client if they were a lead
+    if wa_number:
+        _promote_lead_to_client(wa_number, name)
 
     if NADINE_WA:
         send_whatsapp_text(
@@ -50,17 +71,15 @@ def admin_reserve(name: str, date: str, time: str, slot_type: str, partner: str 
             f"📅 {date} {time}\n✨ {slot_type.title()}"
         )
 
-
-def create_recurring_bookings(name: str, weekday: int, time: str, slot_type: str, partner: str | None = None):
-    """
-    Recurring admin bookings (single weekday).
-    weekday = 0 (Mon) … 6 (Sun)
-    """
+def create_recurring_bookings(name: str, weekday: int, time: str, slot_type: str, partner: str | None = None, wa_number: str | None = None):
     weekday_name = WEEKDAY_NAMES.get(weekday, f"Day {weekday}")
     msg = f"[ADMIN] Recurring {slot_type} booking for {name} every {weekday_name} at {time}"
     if partner:
         msg += f" with {partner}"
     log.info(msg)
+
+    if wa_number:
+        _promote_lead_to_client(wa_number, name)
 
     if NADINE_WA:
         send_whatsapp_text(
@@ -69,22 +88,18 @@ def create_recurring_bookings(name: str, weekday: int, time: str, slot_type: str
             f"📅 Every {weekday_name}\n⏰ {time}\n✨ {slot_type.title()}"
         )
 
-
-def create_multi_recurring_bookings(name: str, slots: list[dict], partner: str | None = None):
-    """
-    Multi-day recurring bookings.
-    slots = list of {weekday, time, slot_type, partner?}
-    """
+def create_multi_recurring_bookings(name: str, slots: list[dict], partner: str | None = None, wa_number: str | None = None):
     msg = f"[ADMIN] Multi recurring bookings for {name}: {slots}"
     log.info(msg)
+
+    if wa_number:
+        _promote_lead_to_client(wa_number, name)
 
     if NADINE_WA:
         slot_lines = []
         for s in slots:
             weekday_name = WEEKDAY_NAMES.get(s["weekday"], f"Day {s['weekday']}")
-            slot_lines.append(
-                f"- {weekday_name} @ {s['time']} ({s['slot_type']})"
-            )
+            slot_lines.append(f"- {weekday_name} @ {s['time']} ({s['slot_type']})")
         details = "\n".join(slot_lines)
         send_whatsapp_text(
             normalize_wa(NADINE_WA),
