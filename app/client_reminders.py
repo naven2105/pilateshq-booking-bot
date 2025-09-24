@@ -1,4 +1,3 @@
-# app/client_reminders.py
 from __future__ import annotations
 
 import logging
@@ -7,31 +6,28 @@ from typing import List, Tuple
 
 from sqlalchemy.orm import Session as OrmSession
 
-from .db import db_session
+from .db import get_session
 from .models import Client, Session, Booking
 from . import utils
 from .config import TEMPLATE_LANG
 
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
 def _fmt_hhmm(t: time) -> str:
     return t.strftime("%H:%M")
 
 def _fmt_item(d: date, t: time) -> str:
-    # Compact, single-line for WhatsApp template constraints
     return f"{d.strftime('%a %d %b')} {t.strftime('%H:%M')}"
 
 def _clean_one_line(s: str) -> str:
-    # Remove newlines/tabs and collapse spaces so Meta doesn’t reject
     return " ".join((s or "").split())
 
 def _lang_candidates(preferred: str | None) -> List[str]:
-    # Try env first, then safe fallbacks
-    cand = [x for x in [preferred, "en", "en_US", "en_ZA"] if x]
+    cand = [x for x in [preferred, "en", "en_US"] if x]
     seen, out = set(), []
     for c in cand:
         if c not in seen:
@@ -46,26 +42,29 @@ def _send_template_with_fallback(
     preferred_lang: str | None,
 ) -> bool:
     for lang in _lang_candidates(preferred_lang):
-        ok, status, _ = utils.send_whatsapp_template(
+        resp = utils.send_whatsapp_template(
             to=to,
             name=template,
             lang=lang,
             variables=list(variables.values()),
-        ).values()
+        )
+        ok = resp.get("ok", False)
+        status = resp.get("status_code")
         log.info("[tpl-send] to=%s tpl=%s lang=%s status=%s ok=%s",
                  to, template, lang, status, ok)
         if ok:
             return True
     return False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Night-before (tomorrow) reminders — template: client_session_tomorrow_us
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Night-before (tomorrow) reminders
+# ──────────────────────────────────────────────
 
 def run_client_tomorrow() -> int:
+    log.info("→ using template=client_session_tomorrow_us")
     tomorrow = date.today() + timedelta(days=1)
     sent = 0
-    with db_session() as s:  # type: OrmSession
+    with get_session() as s:  # type: OrmSession
         rows: List[Tuple[str, time]] = (
             s.query(Client.wa_number, Session.start_time)
             .join(Booking, Booking.client_id == Client.id)
@@ -90,11 +89,12 @@ def run_client_tomorrow() -> int:
              tomorrow.isoformat(), len(rows), sent)
     return sent
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1-hour reminders — template: client_session_next_hour_us
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 1-hour reminders
+# ──────────────────────────────────────────────
 
 def run_client_next_hour() -> int:
+    log.info("→ using template=client_session_next_hour_us")
     now = datetime.now()
     today = now.date()
     in_one_hour = (now + timedelta(hours=1)).time()
@@ -103,7 +103,7 @@ def run_client_next_hour() -> int:
     end_t = in_one_hour
 
     sent = 0
-    with db_session() as s:
+    with get_session() as s:
         rows: List[Tuple[str, time]] = (
             s.query(Client.wa_number, Session.start_time)
             .join(Booking, Booking.client_id == Client.id)
@@ -130,16 +130,17 @@ def run_client_next_hour() -> int:
              start_t, end_t, len(rows), sent)
     return sent
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Weekly preview (Sunday 18:00 SAST) — template: client_weekly_schedule_us
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Weekly preview
+# ──────────────────────────────────────────────
 
 def run_client_weekly(window_days: int = 7) -> int:
+    log.info("→ using template=client_weekly_schedule_us")
     start = date.today()
     end = start + timedelta(days=max(1, window_days) - 1)
     sent = 0
 
-    with db_session() as s:  # type: OrmSession
+    with get_session() as s:  # type: OrmSession
         clients: List[Client] = (
             s.query(Client)
             .filter(Client.wa_number.isnot(None))

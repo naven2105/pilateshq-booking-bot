@@ -1,4 +1,3 @@
-# app/utils.py
 import logging
 import requests
 import os
@@ -35,9 +34,38 @@ def _send_to_meta(payload: dict) -> tuple:
         return False, 0, str(e)
 
 
+def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) -> dict:
+    """
+    Send a WhatsApp template by name/language with body variables.
+    Args:
+        to: Target WhatsApp number in 27... format
+        name: Template name (must be approved in Meta)
+        lang: Language code (e.g. 'en_US')
+        variables: List of strings mapped to {{1}}, {{2}}, etc.
+    """
+    components = [{
+        "type": "body",
+        "parameters": [{"type": "text", "text": str(v)} for v in variables],
+    }]
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": name,
+            "language": {"code": lang},
+            "components": components,
+        },
+    }
+
+    ok, status, body = _send_to_meta(payload)
+    return {"ok": ok, "status_code": status, "response": body}
+
+
 def send_whatsapp_text(to: str, text: str) -> dict:
     """
-    Send a simple WhatsApp text message.
+    Fallback plain-text sender (not template).
     """
     payload = {
         "messaging_product": "whatsapp",

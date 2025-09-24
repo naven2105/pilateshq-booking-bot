@@ -1,4 +1,3 @@
-# app/tasks.py
 from __future__ import annotations
 import logging
 from flask import request
@@ -106,13 +105,13 @@ def register_tasks(app):
 
             sent = 0
             for admin in ADMIN_NUMBERS:
-                ok = utils.send_whatsapp_template(
+                resp = utils.send_whatsapp_template(
                     admin,
                     "admin_update_us",
                     TEMPLATE_LANG or "en_US",
                     [msg],
                 )
-                sent += 1 if ok.get("ok") else 0
+                sent += 1 if resp.get("ok") else 0
 
             return f"ok broadcast sent={sent}", 200
         except Exception:
