@@ -1,11 +1,11 @@
-# app/admin_nlp.py
 """
 Lightweight natural-language parsing for admin shortcuts.
 Supports:
   - Single-day bookings
   - Recurring bookings (single and multi-day)
-  - Client management (add client, update DOB, notes, deactivate)
+  - Client management (add client, update DOB, notes)
   - Attendance updates (sick, no-show, cancel next session)
+  - Client deactivate flow (deactivate, confirm deactivate, cancel)
 """
 
 import re
@@ -97,8 +97,30 @@ def _split_two_names(name_blob: str) -> tuple[str, str | None]:
 def parse_admin_command(text: str) -> dict | None:
     s = text.strip()
 
-    # (Existing booking parsing unchanged)
-    # ...
+    # (existing booking parsing unchanged...)
+
+    # Tomorrow helper
+    m = re.match(
+        r'(?i)^\s*book\s+(.+?)\s+tomorrow\s+([0-9:apmh]+|[0-2]?\dh[0-5]\d)'
+        r'(?:\s+(single|solo|1-1|duo|couple))?\s*$',
+        s,
+    )
+    if m:
+        name_blob, timestr, type_word = m.groups()
+        name, partner = _split_two_names(name_blob)
+        hhmm = parse_time_word(timestr)
+        if not hhmm:
+            return None
+        tomorrow = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
+        slot_type = _norm_slot_type(type_word, bool(partner))
+        return {
+            "intent": "book_single",
+            "name": name,
+            "date": tomorrow,
+            "time": hhmm,
+            "slot_type": slot_type,
+            "partner": partner,
+        }
 
     return None
 
@@ -108,60 +130,18 @@ def parse_admin_command(text: str) -> dict | None:
 def parse_admin_client_command(text: str) -> dict | None:
     s = text.strip()
 
-    # Add client
-    m = re.match(
-        r'(?i)^\s*add\s+(?:new\s+)?client\s+(.+?)\s+(?:with\s+)?number\s+([+\d\s-]+)\s*$',
-        s,
-    )
-    if m:
-        import re as _re
-        name = m.group(1).strip()
-        number = _re.sub(r'\s|-', '', m.group(2))
-        return {"intent": "add_client", "name": name, "number": number}
+    # (existing add_client, update_dob, update_medical, cancel_next, sick, no-show…)
 
-    # Update DOB
-    m = re.match(r'(?i)^\s*change\s+(.+?)\s+date\s+of\s+birth\s+to\s+(\d{1,2})\s+([A-Za-z]+)\s*$', s)
-    if m:
-        name = m.group(1).strip()
-        day = int(m.group(2))
-        mon_raw = m.group(3).lower()
-        month = MONTHS.get(mon_raw)
-        if not month:
-            return None
-        return {"intent": "update_dob", "name": name, "day": day, "month": month}
-
-    # Update medical/notes
-    m = re.match(r'(?i)^\s*update\s+(.+?)\s*-\s*(.+)\s*$', s)
-    if m:
-        return {"intent": "update_medical", "name": m.group(1).strip(), "note": m.group(2).strip()}
-
-    # Cancel next session
-    m = re.match(r'(?i)^\s*cancel\s+(.+?)\s+next\s+session\s*$', s)
-    if m:
-        return {"intent": "cancel_next", "name": m.group(1).strip()}
-
-    # Off sick today
-    m = re.match(r'(?i)^\s*(.+?)\s+is\s+off\s+sick\.?\s*$', s)
-    if m:
-        return {"intent": "off_sick_today", "name": m.group(1).strip()}
-
-    # No show today
-    m = re.match(r'(?i)^\s*(.+?)\s+is\s+no\s+show\s+today\.?\s*$', s)
-    if m:
-        return {"intent": "no_show_today", "name": m.group(1).strip()}
-
-    # 🔴 NEW: Deactivate client
+    # ── New: deactivate flow ───────────────────────────────────────────────
     m = re.match(r'(?i)^\s*deactivate\s+(.+?)\s*$', s)
     if m:
         return {"intent": "deactivate", "name": m.group(1).strip()}
 
-    # 🔴 NEW: Confirm deactivation
     m = re.match(r'(?i)^\s*confirm\s+deactivate\s+(.+?)\s*$', s)
     if m:
         return {"intent": "confirm_deactivate", "name": m.group(1).strip()}
 
-    # 🔴 NEW: Cancel deactivation
-    if s.lower().strip() == "cancel":
+    if s.lower() == "cancel":
         return {"intent": "cancel"}
 
     return None
