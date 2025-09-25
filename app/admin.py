@@ -1,8 +1,9 @@
 """
 Handles inbound admin actions (Nadine / super-admin).
-Now integrated with admin_nudge.py so that:
+Integrated with admin_nudge.py so that:
  - Sick / No-show / Cancel actions also trigger a nudge log
  - Wrapped in safe_execute() for reliability
+ - NEW: Deactivate/reactivate client flow with confirmation & booking check
 """
 
 from __future__ import annotations
@@ -19,18 +20,18 @@ log = logging.getLogger(__name__)
 
 
 def _find_or_create_client(name: str, wa_number: str | None = None) -> tuple[int, str] | tuple[None, None]:
-    """Look up a client by name. If not found and wa_number is given, create."""
+    """Look up a client by name (only active). If not found and wa_number is given, create."""
     with get_session() as s:
         row = s.execute(
-            text("SELECT id, wa_number FROM clients WHERE lower(name)=lower(:n)"),
+            text("SELECT id, wa_number FROM clients WHERE lower(name)=lower(:n) AND status='active'"),
             {"n": name},
         ).first()
         if row:
             return row[0], row[1]
         if wa_number:
             r = s.execute(
-                text("INSERT INTO clients (name, wa_number, phone, package_type) "
-                     "VALUES (:n, :wa, :wa, 'manual') RETURNING id, wa_number"),
+                text("INSERT INTO clients (name, wa_number, phone, package_type, status) "
+                     "VALUES (:n, :wa, :wa, 'manual', 'active') RETURNING id, wa_number"),
                 {"n": name, "wa": wa_number},
             )
             cid, wnum = r.first()
@@ -141,6 +142,8 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             "• Recurring Sessions → e.g. 'Book Mary every Tuesday 09h00 duo'\n"
             "• Manage Clients → e.g. 'Add client Alice with number 082...'\n"
             "• Attendance Updates → e.g. 'Peter is off sick.'\n"
+            "• Deactivate Client → e.g. 'Deactivate Alice'\n"
+            "• Reactivate Client → e.g. 'Reactivate Alice'\n"
             "Type your command directly.",
             label="admin_menu"
         )
@@ -290,6 +293,28 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
                     f"⚠ No active booking today for {parsed['name']}.",
                     label="noshow_none"
                 )
+            return
+
+        if intent == "deactivate":
+            name = parsed["name"]
+            admin_nudge.request_deactivate(name, wa)
+            return
+
+        if intent == "confirm_deactivate":
+            name = parsed["name"]
+            admin_nudge.confirm_deactivate(name, wa)
+            return
+
+        if intent == "reactivate":
+            name = parsed["name"]
+            admin_nudge.reactivate_client(name, wa)
+            return
+
+        if intent == "cancel":
+            safe_execute(send_whatsapp_text, wa,
+                "❌ Deactivation cancelled. No changes made.",
+                label="deactivate_cancel"
+            )
             return
 
     # ─────────────── Fallback ───────────────

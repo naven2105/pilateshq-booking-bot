@@ -1,10 +1,8 @@
-# app/prospect.py
 from __future__ import annotations
 import logging
 from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa, safe_execute
-from .config import NADINE_WA
 from . import admin_nudge
 
 # ── Messages ─────────────────────────────────────────────
@@ -30,7 +28,6 @@ CLIENT_MENU = (
 
 # ── DB helpers ───────────────────────────────────────────
 def _lead_get_or_create(wa: str):
-    """Fetch or create a lead record by WhatsApp number."""
     with get_session() as s:
         row = s.execute(
             text("SELECT id, name FROM leads WHERE wa_number=:wa"),
@@ -59,7 +56,6 @@ def _lead_update(wa: str, **fields):
 
 
 def _client_get(wa: str):
-    """Return client record if number exists in clients table."""
     with get_session() as s:
         row = s.execute(
             text("SELECT id, name FROM clients WHERE wa_number=:wa"),
@@ -89,7 +85,6 @@ def start_or_resume(wa_number: str, incoming_text: str):
     lead = _lead_get_or_create(wa)
     logging.info(f"[PROSPECT] Lead record: {lead}")
 
-    # Step 1: ask for name if not provided
     if not lead.get("name"):
         bad_inputs = {"hi", "hello", "hey", "test"}
         if not msg or msg.lower() in bad_inputs or len(msg) < 2:
@@ -103,7 +98,6 @@ def start_or_resume(wa_number: str, incoming_text: str):
         safe_execute(send_whatsapp_text, wa, AFTER_NAME_MSG.format(name=msg), label="after_name")
         return
 
-    # Step 2: all future messages → same polite thank-you
     logging.info(f"[PROSPECT] Known lead name={lead.get('name')}, repeating polite reply")
     safe_execute(
         send_whatsapp_text,
