@@ -16,17 +16,19 @@ from .config import NADINE_WA
 
 log = logging.getLogger(__name__)
 
-TEMPLATE = "admin_alert"   # Approved WhatsApp template
-LANG = "en"
+# ── WhatsApp template config ─────────────────────────────────────
+TEMPLATE = "admin_alert"   # must match Meta exactly
+LANG = "en_US"             # approved language: English (US)
 
-# ── New Prospect Lead ─────────────────────────────────────────────
+
+# ── New Prospect Lead ────────────────────────────────────────────
 def notify_new_lead(name: str, wa: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")  # Local SA time if TZ set
     alert_text = f"📥 New Prospect: {name} ({wa}) at {ts}"
     _send_and_log(alert_text)
 
 
-# ── Booking Nudges ────────────────────────────────────────────────
+# ── Booking Nudges ───────────────────────────────────────────────
 def notify_no_show(client_name: str, wa: str, session_date: str):
     alert_text = f"🚫 No-show: {client_name} ({wa}) missed session on {session_date}."
     _send_and_log(alert_text)
@@ -48,13 +50,17 @@ def confirm_deactivate(name: str, wa: str):
     _send_and_log(alert_text)
 
 
-# ── Internal helper ───────────────────────────────────────────────
+# ── Internal helper ──────────────────────────────────────────────
 def _send_and_log(alert_text: str):
     try:
         if NADINE_WA:
             to_num = normalize_wa(NADINE_WA)
+
+            # Ensure language is correct (fallback safeguard)
+            lang = LANG if LANG != "en" else "en_US"
+
             log.info(f"[ADMIN_NUDGE] Sending WhatsApp template → {to_num}: {alert_text}")
-            result = send_whatsapp_template(to_num, TEMPLATE, LANG, [alert_text])
+            result = send_whatsapp_template(to_num, TEMPLATE, lang, [alert_text])
             log.info(f"[ADMIN_NUDGE] WhatsApp send result: {result}")
         else:
             log.warning("[ADMIN_NUDGE] NADINE_WA not set in env, skipping WhatsApp send")
