@@ -4,6 +4,7 @@ admin_clients.py
 Handles client management:
  - Add clients
  - Convert leads
+ - Book sessions
  - Attendance updates (sick, no-show, cancel next session)
  - Deactivate clients
 """
@@ -48,6 +49,19 @@ def _mark_lead_converted(wa_number: str, client_id: int):
     log.info(f"Lead {wa_number} promoted → client {client_id}")
 
 
+def _create_booking(client_id: int, session_type: str, day: str, time: str):
+    """Insert a new recurring booking into the bookings table."""
+    with get_session() as s:
+        s.execute(
+            text(
+                "INSERT INTO bookings (client_id, session_type, day_of_week, time_of_day, status) "
+                "VALUES (:cid, :stype, :day, :time, 'booked')"
+            ),
+            {"cid": client_id, "stype": session_type, "day": day, "time": time},
+        )
+    log.info(f"Booking created for client={client_id} type={session_type} {day} {time}")
+
+
 def handle_client_command(parsed: dict, wa: str):
     """Route parsed client/admin commands."""
 
@@ -78,6 +92,66 @@ def handle_client_command(parsed: dict, wa: str):
             )
         return
 
+    # ── Book Client ──
+    if intent == "book_client":
+        name = parsed["name"]
+        session_type = parsed.get("session_type", "group")
+        day = parsed.get("day", "Tue")
+        time = parsed.get("time", "08h00")
+        dob = parsed.get("dob")
+        health = parsed.get("health")
+
+        cid, wnum = _find_or_create_client(name, parsed.get("number"))
+        if not cid:
+            safe_execute(
+                send_whatsapp_text,
+                wa,
+                f"⚠ Could not find or create client '{name}'.",
+                label="book_client_fail",
+            )
+            return
+
+        # Store birthday / health if supplied
+        if dob or health:
+            with get_session() as s:
+                s.execute(
+                    text("UPDATE clients SET birthday=:dob, health_info=:health WHERE id=:cid"),
+                    {"dob": dob, "health": health, "cid": cid},
+                )
+
+        _mark_lead_converted(wnum, cid)
+        _create_booking(cid, session_type, day, time)
+
+        # Admin confirmation (back to Nadine)
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            f"✅ Booking added for {name} ({session_type}) every {day} at {time}.",
+            label="book_client_ok",
+        )
+
+        # Notify Nadine with booking details
+        admin_nudge.booking_update(
+            name=name,
+            session_type=session_type,
+            day=day,
+            time=time,
+            dob=dob,
+            health=health,
+        )
+
+        # Notify client directly
+        safe_execute(
+            send_whatsapp_text,
+            wnum,  # client WA number
+            f"💜 Hi {name}, thanks for booking with PilatesHQ!\n"
+            f"Your {session_type.title()} session is reserved:\n"
+            f"📅 Every {day} at {time}.\n\n"
+            "We look forward to seeing you!",
+            label="client_booking_confirm",
+        )
+        return
+
     # ── Cancel Next ──
     if intent == "cancel_next":
         from .admin_bookings import cancel_next_booking
@@ -92,24 +166,4 @@ def handle_client_command(parsed: dict, wa: str):
 
     # ── No-show ──
     if intent == "no_show_today":
-        from .admin_bookings import mark_today_status
-        mark_today_status(parsed["name"], "no_show", wa)
-        return
-
-    # ── Deactivation ──
-    if intent == "deactivate":
-        admin_nudge.request_deactivate(parsed["name"], wa)
-        return
-
-    if intent == "confirm_deactivate":
-        admin_nudge.confirm_deactivate(parsed["name"], wa)
-        return
-
-    if intent == "cancel":
-        safe_execute(
-            send_whatsapp_text,
-            wa,
-            "❌ Deactivation cancelled. No changes made.",
-            label="deactivate_cancel",
-        )
-        return
+        from .admin_bookings import mark_

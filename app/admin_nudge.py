@@ -1,76 +1,78 @@
 """
 admin_nudge.py
 ──────────────
-Handles nudges to Nadine/admin:
- - Notify on new prospect lead
- - Booking-related nudges (no-show, sick, cancel, deactivate, etc.)
+Handles admin notifications (nudges) to Nadine for:
+ - New prospects
+ - Booking updates
+ - Attendance issues (sick, no-show, cancel)
+ - Deactivation requests/confirmations
 """
 
-from __future__ import annotations
 import logging
 from datetime import datetime
-from sqlalchemy import text
-from .utils import send_whatsapp_template, normalize_wa
+from .utils import safe_execute, send_whatsapp_text
 from .db import get_session
-from .config import NADINE_WA
+from sqlalchemy import text
+import os
 
 log = logging.getLogger(__name__)
 
-# ── WhatsApp template config ─────────────────────────────────────
-TEMPLATE = "admin_alert"   # must match Meta exactly
-LANG = "en_US"             # approved language: English (US)
+# Nadine's WhatsApp number from env
+NADINE_WA = os.getenv("NADINE_WA", "")
 
 
-# ── New Prospect Lead ────────────────────────────────────────────
-def notify_new_lead(name: str, wa: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")  # Local SA time if TZ set
-    alert_text = f"📥 New Prospect: {name} ({wa}) at {ts}"
-    _send_and_log(alert_text)
+def _log_notification(label: str, msg: str):
+    """Insert admin notification into notifications_log for audit trail."""
+    with get_session() as s:
+        s.execute(
+            text(
+                "INSERT INTO notifications_log (label, message, created_at) "
+                "VALUES (:l, :m, :ts)"
+            ),
+            {"l": label, "m": msg, "ts": datetime.now()},
+        )
+    log.info(f"[ADMIN NUDGE] {label}: {msg}")
 
 
-# ── Booking Nudges ───────────────────────────────────────────────
-def notify_no_show(client_name: str, wa: str, session_date: str):
-    alert_text = f"🚫 No-show: {client_name} ({wa}) missed session on {session_date}."
-    _send_and_log(alert_text)
+# ── Prospect Alert ──
+def prospect_alert(name: str, wa_number: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    msg = f"📢 Admin Alert\nHi: 📥 New Prospect: {name} ({wa_number}) at {ts}, for your urgent attention😉"
+    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="prospect_alert")
+    _log_notification("prospect_alert", msg)
 
-def notify_sick(client_name: str, wa: str, session_date: str):
-    alert_text = f"🤒 Sick: {client_name} ({wa}) marked sick for session on {session_date}."
-    _send_and_log(alert_text)
 
-def notify_cancel(client_name: str, wa: str, session_date: str):
-    alert_text = f"❌ Cancel: {client_name} ({wa}) cancelled session on {session_date}."
-    _send_and_log(alert_text)
+# ── Booking Update ──
+def booking_update(name: str, session_type: str, day: str, time: str, dob: str | None = None, health: str | None = None):
+    msg = (
+        f"✅ Booking Added\n"
+        f"{name} ({session_type.title()})\n"
+        f"Recurring: {day} at {time}"
+    )
+    if dob:
+        msg += f"\nDOB: {dob}"
+    if health:
+        msg += f"\nHealth: {health}"
 
+    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="booking_update")
+    _log_notification("booking_update", msg)
+
+
+# ── Attendance Status ──
+def status_update(name: str, status: str):
+    msg = f"⚠️ {name} marked as {status.upper()} today."
+    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="status_update")
+    _log_notification("status_update", msg)
+
+
+# ── Deactivation ──
 def request_deactivate(name: str, wa: str):
-    alert_text = f"⚠ Request to deactivate client '{name}'. Reply 'confirm deactivate {name}' to proceed."
-    _send_and_log(alert_text)
+    msg = f"❔ Deactivation requested for {name}. Confirm?"
+    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="request_deactivate")
+    _log_notification("request_deactivate", msg)
+
 
 def confirm_deactivate(name: str, wa: str):
-    alert_text = f"✅ Client '{name}' has been deactivated."
-    _send_and_log(alert_text)
-
-
-# ── Internal helper ──────────────────────────────────────────────
-def _send_and_log(alert_text: str):
-    try:
-        if NADINE_WA:
-            to_num = normalize_wa(NADINE_WA)
-
-            # Ensure language is correct (fallback safeguard)
-            lang = LANG if LANG != "en" else "en_US"
-
-            log.info(f"[ADMIN_NUDGE] Sending WhatsApp template → {to_num}: {alert_text}")
-            result = send_whatsapp_template(to_num, TEMPLATE, lang, [alert_text])
-            log.info(f"[ADMIN_NUDGE] WhatsApp send result: {result}")
-        else:
-            log.warning("[ADMIN_NUDGE] NADINE_WA not set in env, skipping WhatsApp send")
-
-        with get_session() as s:
-            s.execute(
-                text("INSERT INTO notifications_log (client_id, message, created_at) "
-                     "VALUES (NULL, :msg, now())"),
-                {"msg": alert_text},
-            )
-            log.info("[ADMIN_NUDGE] Inserted nudge into notifications_log")
-    except Exception:
-        log.exception("[ADMIN_NUDGE] Failed to send admin nudge")
+    msg = f"✅ Client {name} has been deactivated."
+    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="confirm_deactivate")
+    _log_notification("confirm_deactivate", msg)
