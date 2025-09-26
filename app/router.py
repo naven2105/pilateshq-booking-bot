@@ -45,10 +45,26 @@ def webhook():
 
             msg = messages[0]
             from_wa = msg.get("from")
-            text_in = msg.get("text", {}).get("body", "")
-
-            # Normalize number
             wa = normalize_wa(from_wa)
+
+            # ─────────────── Handle Flow Responses ───────────────
+            if msg.get("type") == "interactive" and msg["interactive"].get("type") == "flow_response":
+                flow_id = msg["interactive"]["flow_response"]["id"]
+                resp = msg["interactive"]["flow_response"]["response"]
+
+                if flow_id == "client_registration":
+                    parsed = {
+                        "intent": "add_client",
+                        "name": resp.get("name"),
+                        "number": resp.get("number"),
+                        "dob": resp.get("dob"),
+                    }
+                    from .admin_clients import handle_client_command
+                    handle_client_command(parsed, from_wa)
+                    return jsonify({"status": "ok", "role": "admin_flow"}), 200
+
+            # ─────────────── Standard Text Messages ───────────────
+            text_in = msg.get("text", {}).get("body", "")
             log.info("[Webhook] Message from %s: %r", wa, text_in)
 
             # Check if this is an admin number

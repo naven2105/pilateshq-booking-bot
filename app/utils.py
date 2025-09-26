@@ -1,3 +1,4 @@
+# app/utils.py
 import logging
 import requests
 import os
@@ -65,13 +66,34 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) 
 
 def send_whatsapp_text(to: str, text: str) -> dict:
     """
-    Fallback plain-text sender (not template).
+    Send plain-text WhatsApp message (non-template).
     """
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text},
+    }
+    ok, status, body = _send_to_meta(payload)
+    return {"ok": ok, "status_code": status, "response": body}
+
+
+def send_whatsapp_flow(to: str, flow_id: str, lang: str = "en_US") -> dict:
+    """
+    Send a WhatsApp Flow (form) template by its ID/name.
+    Example: client_registration
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "flow",
+            "flow": {
+                "name": flow_id,
+                "language": {"code": lang},
+            },
+        },
     }
     ok, status, body = _send_to_meta(payload)
     return {"ok": ok, "status_code": status, "response": body}
