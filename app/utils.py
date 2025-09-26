@@ -106,7 +106,8 @@ def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form") -> di
                 "name": "flow",
                 "parameters": {
                     "flow_id": flow_id,
-                    "flow_cta": flow_cta
+                    "flow_cta": flow_cta,
+                    "flow_message_version": "3"   # ✅ required parameter
                 }
             }
         }
