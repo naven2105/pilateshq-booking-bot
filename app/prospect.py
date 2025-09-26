@@ -1,4 +1,4 @@
-#app/prospect.py
+# app/prospect.py
 from __future__ import annotations
 import logging
 from sqlalchemy import text
@@ -97,7 +97,7 @@ def start_or_resume(wa_number: str, incoming_text: str):
             return
 
         _lead_update(wa, name=msg)
-        admin_nudge.notify_new_lead(msg, wa)  # notify Nadine
+        admin_nudge.prospect_alert(msg, wa)  # ✅ fixed call
         logging.info(f"[PROSPECT] Stored new lead name={msg}")
         safe_execute(send_whatsapp_text, wa, AFTER_NAME_MSG.format(name=msg), label="after_name")
         return
