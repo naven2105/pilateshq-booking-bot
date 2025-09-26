@@ -4,7 +4,7 @@ admin_nudge.py
 Handles admin notifications (nudges) to Nadine for:
  - New prospects
  - Booking updates
- - Attendance issues (sick, no-show, cancel)
+ - Attendance issues (sick, no-show, cancel, late)
  - Deactivation requests/confirmations
 """
 
@@ -58,11 +58,41 @@ def booking_update(name: str, session_type: str, day: str, time: str, dob: str |
     _log_notification("booking_update", msg)
 
 
-# ── Attendance Status ──
+# ── Attendance Status (old generic, kept for compatibility) ──
 def status_update(name: str, status: str):
     msg = f"⚠️ {name} marked as {status.upper()} today."
     safe_execute(send_whatsapp_text, NADINE_WA, msg, label="status_update")
     _log_notification("status_update", msg)
+
+
+# ── Attendance Update (new, detailed) ──
+def attendance_update(wa_number: str, status: str, session_date, session_type: str | None):
+    """Notify Nadine about client attendance changes (sick, cancelled, late)."""
+
+    # Look up client name if possible
+    name = wa_number
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT name FROM clients WHERE wa_number=:wa"),
+            {"wa": wa_number},
+        ).first()
+        if row and row[0]:
+            name = row[0]
+
+    when = session_date.strftime("%a %d %b") if session_date else "today"
+    stype = session_type.capitalize() if session_type else "Session"
+
+    if status == "sick":
+        msg = f"🤒 Attendance Alert\n{name} marked as SICK for {when} ({stype})."
+    elif status == "cancelled":
+        msg = f"❌ Attendance Alert\n{name} CANCELLED {when} ({stype})."
+    elif status == "late":
+        msg = f"⌛ Attendance Alert\n{name} is RUNNING LATE for {when} ({stype})."
+    else:
+        msg = f"⚠ Attendance Alert\n{name} updated status={status} for {when} ({stype})."
+
+    safe_execute(send_whatsapp_text, NADINE_WA, msg, label=f"attendance_{status}")
+    _log_notification(f"attendance_{status}", msg)
 
 
 # ── Deactivation ──
