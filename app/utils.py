@@ -1,4 +1,3 @@
-# app/utils.py
 import logging
 import requests
 import os
@@ -44,10 +43,12 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) 
         lang: Language code (e.g. 'en_US')
         variables: List of strings mapped to {{1}}, {{2}}, etc.
     """
-    components = [{
-        "type": "body",
-        "parameters": [{"type": "text", "text": str(v)} for v in variables],
-    }]
+    components = [
+        {
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in variables],
+        }
+    ]
 
     payload = {
         "messaging_product": "whatsapp",
@@ -64,36 +65,33 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) 
     return {"ok": ok, "status_code": status, "response": body}
 
 
+def send_whatsapp_flow_template(to: str, template_name: str, lang: str = "en_US") -> dict:
+    """
+    Send an approved WhatsApp Flow template.
+    The Flow (form) is already attached to the template in Meta.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": lang},
+        },
+    }
+    ok, status, body = _send_to_meta(payload)
+    return {"ok": ok, "status_code": status, "response": body}
+
+
 def send_whatsapp_text(to: str, text: str) -> dict:
     """
-    Send plain-text WhatsApp message (non-template).
+    Fallback plain-text sender (not template).
     """
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text},
-    }
-    ok, status, body = _send_to_meta(payload)
-    return {"ok": ok, "status_code": status, "response": body}
-
-
-def send_whatsapp_flow(to: str, flow_id: str, lang: str = "en_US") -> dict:
-    """
-    Send a WhatsApp Flow (form) template by its ID/name.
-    Example: client_registration
-    """
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "flow",
-            "flow": {
-                "name": flow_id,
-                "language": {"code": lang},
-            },
-        },
     }
     ok, status, body = _send_to_meta(payload)
     return {"ok": ok, "status_code": status, "response": body}

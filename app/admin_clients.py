@@ -2,7 +2,7 @@
 admin_clients.py
 ────────────────
 Handles client management:
- - Add clients (registration details)
+ - Add clients
  - Convert leads
  - Book sessions
  - Attendance updates (sick, no-show, cancel next session)
@@ -17,6 +17,29 @@ from .utils import send_whatsapp_text, normalize_wa, safe_execute
 from . import admin_nudge
 
 log = logging.getLogger(__name__)
+
+
+def _normalize_dob(dob_raw: str | None) -> str | None:
+    """Normalise DOB input into YYYY-MM-DD format or return None."""
+    if not dob_raw:
+        return None
+    s = dob_raw.strip()
+    try:
+        # Case 1: full date DD-MM-YYYY
+        if len(s.split("-")) == 3 and len(s) == 10:
+            dt = datetime.strptime(s, "%d-%m-%Y")
+            return dt.date().isoformat()
+        # Case 2: just DD-MM (no year)
+        if len(s.split("-")) == 2:
+            dt = datetime.strptime(s, "%d-%m")
+            # Default year 1900
+            return f"1900-{dt.month:02d}-{dt.day:02d}"
+        # Case 3: ISO style YYYY-MM-DD
+        if "-" in s and len(s) == 10 and s[4] == "-":
+            return s  # assume valid already
+    except Exception:
+        return None
+    return None
 
 
 def _find_or_create_client(name: str, wa_number: str | None = None):
@@ -75,32 +98,23 @@ def handle_client_command(parsed: dict, wa: str):
         number = parsed["number"].replace("+", "")
         if number.startswith("0"):
             number = "27" + number[1:]
+        dob = _normalize_dob(parsed.get("dob"))
 
         cid, wnum = _find_or_create_client(name, number)
         if cid:
-            dob = parsed.get("dob")
-            dob_display = None
-
             if dob:
-                try:
-                    dob_date = datetime.strptime(dob, "%d-%m-%Y").date()
-                except ValueError:
-                    dob_date = datetime.strptime(dob, "%d-%m").date()
-
                 with get_session() as s:
                     s.execute(
                         text("UPDATE clients SET birthday=:dob WHERE id=:cid"),
-                        {"dob": dob_date, "cid": cid},
+                        {"dob": dob, "cid": cid},
                     )
-                dob_display = dob_date.strftime("%d %b")
-
             _mark_lead_converted(wnum, cid)
-
-            confirm_msg = f"✅ Client '{name}' added with number {wnum}."
-            if dob_display:
-                confirm_msg += f"\nDOB: {dob_display}"
-
-            safe_execute(send_whatsapp_text, wa, confirm_msg, label="add_client_ok")
+            safe_execute(
+                send_whatsapp_text,
+                wa,
+                f"✅ Client '{name}' added with number {wnum}.",
+                label="add_client_ok",
+            )
         else:
             safe_execute(
                 send_whatsapp_text,
@@ -116,7 +130,7 @@ def handle_client_command(parsed: dict, wa: str):
         session_type = parsed.get("session_type", "group")
         day = parsed.get("day", "Tue")
         time = parsed.get("time", "08h00")
-        dob = parsed.get("dob")
+        dob = _normalize_dob(parsed.get("dob"))
 
         cid, wnum = _find_or_create_client(name, parsed.get("number"))
         if not cid:
@@ -128,36 +142,32 @@ def handle_client_command(parsed: dict, wa: str):
             )
             return
 
-        dob_display = None
+        # Store birthday if supplied
         if dob:
-            try:
-                dob_date = datetime.strptime(dob, "%d-%m-%Y").date()
-            except ValueError:
-                dob_date = datetime.strptime(dob, "%d-%m").date()
-
             with get_session() as s:
                 s.execute(
                     text("UPDATE clients SET birthday=:dob WHERE id=:cid"),
-                    {"dob": dob_date, "cid": cid},
+                    {"dob": dob, "cid": cid},
                 )
-            dob_display = dob_date.strftime("%d %b")
 
         _mark_lead_converted(wnum, cid)
         _create_booking(cid, session_type, day, time)
 
-        confirm_msg = f"✅ Booking added for {name} ({session_type}) every {day} at {time}."
-        if dob_display:
-            confirm_msg += f"\nDOB: {dob_display}"
+        # Admin confirmation
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            f"✅ Booking added for {name} ({session_type}) every {day} at {time}.",
+            label="book_client_ok",
+        )
 
-        safe_execute(send_whatsapp_text, wa, confirm_msg, label="book_client_ok")
-
-        # Notify Nadine with admin nudge
+        # Notify Nadine (admin nudge)
         admin_nudge.booking_update(
             name=name,
             session_type=session_type,
             day=day,
             time=time,
-            dob=dob_display,
+            dob=dob,
         )
         return
 

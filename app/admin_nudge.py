@@ -4,7 +4,7 @@ admin_nudge.py
 Handles admin notifications (nudges) to Nadine for:
  - New prospects
  - Booking updates
- - Attendance issues (sick, no-show, cancel, late)
+ - Attendance issues (sick, no-show, cancel)
  - Deactivation requests/confirmations
 """
 
@@ -34,6 +34,19 @@ def _log_notification(label: str, msg: str):
     log.info(f"[ADMIN NUDGE] {label}: {msg}")
 
 
+def _format_dob(dob: str | None) -> str | None:
+    """Format DOB for display. Hide year if it's the dummy 1900."""
+    if not dob:
+        return None
+    try:
+        dt = datetime.fromisoformat(dob)
+        if dt.year == 1900:
+            return f"{dt.day:02d}-{dt.month:02d}"  # show only DD-MM
+        return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return dob
+
+
 # ── Prospect Alert ──
 def prospect_alert(name: str, wa_number: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -43,14 +56,18 @@ def prospect_alert(name: str, wa_number: str):
 
 
 # ── Booking Update ──
-def booking_update(name: str, session_type: str, day: str, time: str, dob: str | None = None):
+def booking_update(name: str, session_type: str, day: str, time: str, dob: str | None = None, health: str | None = None):
     msg = (
         f"✅ Booking Added\n"
         f"{name} ({session_type.title()})\n"
         f"Recurring: {day} at {time}"
     )
-    if dob:
-        msg += f"\nDOB: {dob}"
+
+    dob_fmt = _format_dob(dob)
+    if dob_fmt:
+        msg += f"\nDOB: {dob_fmt}"
+    if health:
+        msg += f"\nHealth: {health}"
 
     safe_execute(send_whatsapp_text, NADINE_WA, msg, label="booking_update")
     _log_notification("booking_update", msg)
@@ -61,36 +78,6 @@ def status_update(name: str, status: str):
     msg = f"⚠️ {name} marked as {status.upper()} today."
     safe_execute(send_whatsapp_text, NADINE_WA, msg, label="status_update")
     _log_notification("status_update", msg)
-
-
-# ── Attendance Update ──
-def attendance_update(wa_number: str, status: str, session_date, session_type: str | None):
-    """Notify Nadine about client attendance changes (sick, cancelled, late)."""
-
-    # Look up client name if possible
-    name = wa_number
-    with get_session() as s:
-        row = s.execute(
-            text("SELECT name FROM clients WHERE wa_number=:wa"),
-            {"wa": wa_number},
-        ).first()
-        if row and row[0]:
-            name = row[0]
-
-    when = session_date.strftime("%a %d %b") if session_date else "today"
-    stype = session_type.capitalize() if session_type else "Session"
-
-    if status == "sick":
-        msg = f"🤒 Attendance Alert\n{name} marked as SICK for {when} ({stype})."
-    elif status == "cancelled":
-        msg = f"❌ Attendance Alert\n{name} CANCELLED {when} ({stype})."
-    elif status == "late":
-        msg = f"⌛ Attendance Alert\n{name} is RUNNING LATE for {when} ({stype})."
-    else:
-        msg = f"⚠ Attendance Alert\n{name} updated status={status} for {when} ({stype})."
-
-    safe_execute(send_whatsapp_text, NADINE_WA, msg, label=f"attendance_{status}")
-    _log_notification(f"attendance_{status}", msg)
 
 
 # ── Deactivation ──
