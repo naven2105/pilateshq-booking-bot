@@ -2,7 +2,7 @@
 admin_clients.py
 ────────────────
 Handles client management:
- - Add clients
+ - Add clients (registration details)
  - Convert leads
  - Book sessions
  - Attendance updates (sick, no-show, cancel next session)
@@ -10,6 +10,7 @@ Handles client management:
 """
 
 import logging
+from datetime import datetime
 from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa, safe_execute
@@ -30,8 +31,8 @@ def _find_or_create_client(name: str, wa_number: str | None = None):
         if wa_number:
             r = s.execute(
                 text(
-                    "INSERT INTO clients (name, wa_number, phone, package_type) "
-                    "VALUES (:n, :wa, :wa, 'manual') RETURNING id, wa_number"
+                    "INSERT INTO clients (name, wa_number, phone) "
+                    "VALUES (:n, :wa, :wa) RETURNING id, wa_number"
                 ),
                 {"n": name, "wa": wa_number},
             )
@@ -74,15 +75,32 @@ def handle_client_command(parsed: dict, wa: str):
         number = parsed["number"].replace("+", "")
         if number.startswith("0"):
             number = "27" + number[1:]
+
         cid, wnum = _find_or_create_client(name, number)
         if cid:
+            dob = parsed.get("dob")
+            dob_display = None
+
+            if dob:
+                try:
+                    dob_date = datetime.strptime(dob, "%d-%m-%Y").date()
+                except ValueError:
+                    dob_date = datetime.strptime(dob, "%d-%m").date()
+
+                with get_session() as s:
+                    s.execute(
+                        text("UPDATE clients SET birthday=:dob WHERE id=:cid"),
+                        {"dob": dob_date, "cid": cid},
+                    )
+                dob_display = dob_date.strftime("%d %b")
+
             _mark_lead_converted(wnum, cid)
-            safe_execute(
-                send_whatsapp_text,
-                wa,
-                f"✅ Client '{name}' added with number {wnum}.",
-                label="add_client_ok",
-            )
+
+            confirm_msg = f"✅ Client '{name}' added with number {wnum}."
+            if dob_display:
+                confirm_msg += f"\nDOB: {dob_display}"
+
+            safe_execute(send_whatsapp_text, wa, confirm_msg, label="add_client_ok")
         else:
             safe_execute(
                 send_whatsapp_text,
@@ -99,7 +117,6 @@ def handle_client_command(parsed: dict, wa: str):
         day = parsed.get("day", "Tue")
         time = parsed.get("time", "08h00")
         dob = parsed.get("dob")
-        health = parsed.get("health")
 
         cid, wnum = _find_or_create_client(name, parsed.get("number"))
         if not cid:
@@ -111,44 +128,36 @@ def handle_client_command(parsed: dict, wa: str):
             )
             return
 
-        # Store birthday / health if supplied
-        if dob or health:
+        dob_display = None
+        if dob:
+            try:
+                dob_date = datetime.strptime(dob, "%d-%m-%Y").date()
+            except ValueError:
+                dob_date = datetime.strptime(dob, "%d-%m").date()
+
             with get_session() as s:
                 s.execute(
-                    text("UPDATE clients SET birthday=:dob, health_info=:health WHERE id=:cid"),
-                    {"dob": dob, "health": health, "cid": cid},
+                    text("UPDATE clients SET birthday=:dob WHERE id=:cid"),
+                    {"dob": dob_date, "cid": cid},
                 )
+            dob_display = dob_date.strftime("%d %b")
 
         _mark_lead_converted(wnum, cid)
         _create_booking(cid, session_type, day, time)
 
-        # Admin confirmation (back to Nadine)
-        safe_execute(
-            send_whatsapp_text,
-            wa,
-            f"✅ Booking added for {name} ({session_type}) every {day} at {time}.",
-            label="book_client_ok",
-        )
+        confirm_msg = f"✅ Booking added for {name} ({session_type}) every {day} at {time}."
+        if dob_display:
+            confirm_msg += f"\nDOB: {dob_display}"
 
-        # Notify Nadine with booking details
+        safe_execute(send_whatsapp_text, wa, confirm_msg, label="book_client_ok")
+
+        # Notify Nadine with admin nudge
         admin_nudge.booking_update(
             name=name,
             session_type=session_type,
             day=day,
             time=time,
-            dob=dob,
-            health=health,
-        )
-
-        # Notify client directly
-        safe_execute(
-            send_whatsapp_text,
-            wnum,  # client WA number
-            f"💜 Hi {name}, thanks for booking with PilatesHQ!\n"
-            f"Your {session_type.title()} session is reserved:\n"
-            f"📅 Every {day} at {time}.\n\n"
-            "We look forward to seeing you!",
-            label="client_booking_confirm",
+            dob=dob_display,
         )
         return
 
@@ -166,4 +175,24 @@ def handle_client_command(parsed: dict, wa: str):
 
     # ── No-show ──
     if intent == "no_show_today":
-        from .admin_bookings import mark_
+        from .admin_bookings import mark_today_status
+        mark_today_status(parsed["name"], "no_show", wa)
+        return
+
+    # ── Deactivation ──
+    if intent == "deactivate":
+        admin_nudge.request_deactivate(parsed["name"], wa)
+        return
+
+    if intent == "confirm_deactivate":
+        admin_nudge.confirm_deactivate(parsed["name"], wa)
+        return
+
+    if intent == "cancel":
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            "❌ Deactivation cancelled. No changes made.",
+            label="deactivate_cancel",
+        )
+        return

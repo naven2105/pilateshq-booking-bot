@@ -43,7 +43,7 @@ def prospect_alert(name: str, wa_number: str):
 
 
 # ── Booking Update ──
-def booking_update(name: str, session_type: str, day: str, time: str, dob: str | None = None, health: str | None = None):
+def booking_update(name: str, session_type: str, day: str, time: str, dob: str | None = None):
     msg = (
         f"✅ Booking Added\n"
         f"{name} ({session_type.title()})\n"
@@ -51,21 +51,19 @@ def booking_update(name: str, session_type: str, day: str, time: str, dob: str |
     )
     if dob:
         msg += f"\nDOB: {dob}"
-    if health:
-        msg += f"\nHealth: {health}"
 
     safe_execute(send_whatsapp_text, NADINE_WA, msg, label="booking_update")
     _log_notification("booking_update", msg)
 
 
-# ── Attendance Status (old generic, kept for compatibility) ──
+# ── Attendance Status ──
 def status_update(name: str, status: str):
     msg = f"⚠️ {name} marked as {status.upper()} today."
     safe_execute(send_whatsapp_text, NADINE_WA, msg, label="status_update")
     _log_notification("status_update", msg)
 
 
-# ── Attendance Update (new, detailed) ──
+# ── Attendance Update ──
 def attendance_update(wa_number: str, status: str, session_date, session_type: str | None):
     """Notify Nadine about client attendance changes (sick, cancelled, late)."""
 
