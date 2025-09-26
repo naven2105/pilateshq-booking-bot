@@ -1,3 +1,4 @@
+# app/utils.py
 import logging
 import requests
 import os
@@ -43,12 +44,10 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) 
         lang: Language code (e.g. 'en_US')
         variables: List of strings mapped to {{1}}, {{2}}, etc.
     """
-    components = [
-        {
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(v)} for v in variables],
-        }
-    ]
+    components = [{
+        "type": "body",
+        "parameters": [{"type": "text", "text": str(v)} for v in variables],
+    }]
 
     payload = {
         "messaging_product": "whatsapp",
@@ -65,24 +64,6 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) 
     return {"ok": ok, "status_code": status, "response": body}
 
 
-def send_whatsapp_flow_template(to: str, template_name: str, lang: str = "en_US") -> dict:
-    """
-    Send an approved WhatsApp Flow template.
-    The Flow (form) is already attached to the template in Meta.
-    """
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": lang},
-        },
-    }
-    ok, status, body = _send_to_meta(payload)
-    return {"ok": ok, "status_code": status, "response": body}
-
-
 def send_whatsapp_text(to: str, text: str) -> dict:
     """
     Fallback plain-text sender (not template).
@@ -93,6 +74,44 @@ def send_whatsapp_text(to: str, text: str) -> dict:
         "type": "text",
         "text": {"body": text},
     }
+    ok, status, body = _send_to_meta(payload)
+    return {"ok": ok, "status_code": status, "response": body}
+
+
+def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form") -> dict:
+    """
+    Send a WhatsApp interactive Flow message.
+    Args:
+        to: Target WhatsApp number (27...)
+        flow_id: Published Flow ID from Meta
+        flow_cta: Button label (e.g. 'Add New Client')
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "flow",
+            "header": {
+                "type": "text",
+                "text": "New Client Registration"
+            },
+            "body": {
+                "text": "Please complete this form to register a new client."
+            },
+            "footer": {
+                "text": "PilatesHQ"
+            },
+            "action": {
+                "name": "flow",
+                "parameters": {
+                    "flow_id": flow_id,
+                    "flow_cta": flow_cta
+                }
+            }
+        }
+    }
+
     ok, status, body = _send_to_meta(payload)
     return {"ok": ok, "status_code": status, "response": body}
 
