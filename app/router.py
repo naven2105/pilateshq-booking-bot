@@ -17,33 +17,6 @@ log = logging.getLogger(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "changeme")
 
 
-def _handle_flow_reply(msg: dict):
-    """Extract client registration form reply fields safely."""
-    try:
-        flow_reply = msg.get("interactive", {}).get("flow_reply", {})
-        params = flow_reply.get("response_json", {})
-
-        # Meta sometimes sends response_json as a string
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except Exception as e:
-                log.error("[FLOW REPLY] Failed to parse response_json string: %s", e)
-                log.error("[FLOW REPLY] Raw response_json string: %s", params)
-                params = {}
-
-        client_name = params.get("Client Name") or params.get("name")
-        mobile = params.get("Mobile") or params.get("phone")
-        dob = params.get("DOB")
-
-        log.info("[FLOW REPLY] Parsed client form → name=%s, mobile=%s, dob=%s", client_name, mobile, dob)
-        return client_name, mobile, dob
-
-    except Exception as e:
-        log.exception("[FLOW REPLY] Unexpected error while parsing flow reply")
-        return None, None, None
-
-
 def _create_client_record(name: str, mobile: str, dob: str | None):
     """Insert new client and mark lead as converted."""
     wa = normalize_wa(mobile)
@@ -108,13 +81,40 @@ def webhook():
             from_wa = msg.get("from")
             text_in = msg.get("text", {}).get("body", "")
 
-            # ─────────────── Flow Form Replies ───────────────
+            # ─────────────── Flow / NFM Form Replies ───────────────
             if msg.get("type") == "interactive":
                 interactive = msg.get("interactive", {})
-                if interactive.get("type") == "flow_reply":
+                itype = interactive.get("type")
+
+                if itype in {"flow_reply", "nfm_reply"}:
                     try:
-                        log.info("[Webhook] Received flow_reply: %s", interactive.get("flow_reply"))
-                        client_name, mobile, dob = _handle_flow_reply(msg)
+                        reply_data = interactive.get(itype, {})
+                        log.info("[Webhook] Received %s: %s", itype, reply_data)
+
+                        # Always extract response_json
+                        params = reply_data.get("response_json", {})
+                        if isinstance(params, str):
+                            try:
+                                params = json.loads(params)
+                            except Exception as e:
+                                log.error("[%s] Failed to parse response_json string: %s", itype, e)
+                                log.error("[%s] Raw response_json string: %s", itype, params)
+                                params = {}
+
+                        # Our form field keys
+                        client_name = (
+                            params.get("Client Name")
+                            or params.get("screen_0_Client_Name_0")
+                            or params.get("name")
+                        )
+                        mobile = (
+                            params.get("Mobile")
+                            or params.get("screen_0_Mobile_1")
+                            or params.get("phone")
+                        )
+                        dob = params.get("DOB") or params.get("screen_0_DOB_2")
+
+                        log.info("[%s] Parsed form → name=%s, mobile=%s, dob=%s", itype, client_name, mobile, dob)
 
                         if client_name and mobile:
                             cid = _create_client_record(client_name, mobile, dob)
@@ -122,12 +122,12 @@ def webhook():
                         else:
                             send_whatsapp_text(from_wa, "⚠️ Client form reply could not be parsed. Please check logs.")
 
-                        return jsonify({"status": "ok", "role": "flow_reply"}), 200
+                        return jsonify({"status": "ok", "role": itype}), 200
 
                     except Exception:
-                        log.exception("[Webhook] Failed to handle flow_reply")
-                        send_whatsapp_text(from_wa, "⚠️ Error handling client form. Nadine please check logs.")
-                        return jsonify({"status": "error", "role": "flow_reply"}), 200
+                        log.exception("[Webhook] Failed to handle %s", itype)
+                        send_whatsapp_text(from_wa, f"⚠️ Error handling client form ({itype}). Nadine please check logs.")
+                        return jsonify({"status": "error", "role": itype}), 200
 
             # Normalize number
             wa = normalize_wa(from_wa)
