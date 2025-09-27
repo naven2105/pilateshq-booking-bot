@@ -1,3 +1,4 @@
+# app/router.py
 from flask import Blueprint, request, Response, jsonify
 import os
 import logging
@@ -7,7 +8,7 @@ from .invoices import send_invoice
 from .admin_core import handle_admin_action
 from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session
-from . import admin_clients
+from . import admin_flow   # ✅ new import
 
 router_bp = Blueprint("router", __name__)
 log = logging.getLogger(__name__)
@@ -45,44 +46,33 @@ def webhook():
 
             msg = messages[0]
             from_wa = msg.get("from")
-            wa = normalize_wa(from_wa)
-
-            # ─────────────── Flow Response Handling ───────────────
-            if msg.get("type") == "interactive" and msg["interactive"].get("type") == "flow_response":
-                flow_id = msg["interactive"]["flow_response"].get("id")
-                resp = msg["interactive"]["flow_response"].get("response", {})
-
-                log.info(f"[Webhook] Flow submission received: flow_id={flow_id}, response={resp}")
-
-                if flow_id == "client_registration":
-                    parsed = {
-                        "intent": "add_client",
-                        "name": resp.get("Client Name"),
-                        "number": resp.get("Mobile"),
-                        "dob": resp.get("DOB"),
-                    }
-                    admin_clients.handle_client_command(parsed, wa)
-                    return jsonify({"status": "ok", "role": "admin_flow"}), 200
-
-            # ─────────────── Normal Text Handling ───────────────
             text_in = msg.get("text", {}).get("body", "")
+
+            # ✅ Detect flow submission
+            if msg.get("type") == "interactive" and msg.get("interactive", {}).get("type") == "flow_reply":
+                log.info("[Webhook] Routing as ADMIN_FLOW (flow reply): %s", from_wa)
+                admin_flow.handle_flow_reply(msg, from_wa)
+                return jsonify({"status": "ok", "role": "admin_flow"}), 200
+
+            # Normalize number
+            wa = normalize_wa(from_wa)
             log.info("[Webhook] Message from %s: %r", wa, text_in)
 
-            # Admin route
+            # Check if this is an admin number
             admin_list = os.getenv("ADMIN_WA_LIST", "").split(",")
             if wa in [normalize_wa(x) for x in admin_list if x.strip()]:
                 log.info("[Webhook] Routing as ADMIN: %s", wa)
                 handle_admin_action(wa, msg.get("id"), text_in)
                 return jsonify({"status": "ok", "role": "admin"}), 200
 
-            # Client route
+            # If known client, show client menu
             client = _client_get(wa)
             if client:
                 log.info("[Webhook] Routing as CLIENT: %s (%s)", wa, client["name"])
                 send_whatsapp_text(wa, CLIENT_MENU.format(name=client["name"]))
                 return jsonify({"status": "ok", "role": "client"}), 200
 
-            # Prospect route
+            # Otherwise, treat as prospect
             log.info("[Webhook] Routing as PROSPECT: %s", wa)
             start_or_resume(wa, text_in)
             return jsonify({"status": "ok", "role": "prospect"}), 200
