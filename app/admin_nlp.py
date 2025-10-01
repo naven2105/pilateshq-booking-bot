@@ -130,7 +130,7 @@ def parse_admin_command(text: str) -> dict | None:
 def parse_admin_client_command(text: str) -> dict | None:
     s = text.strip()
 
-    # ── New: recurring booking (book_client) ──
+    # ── Recurring booking (book_client) ──
     m = re.match(
         r'(?i)^\s*book\s+(?P<name>[A-Za-z\s]+)\s+(?P<session_type>\w+)\s+(?P<day>\w+)\s+(?P<time>[0-9:apmh]+|[0-2]?\dh[0-5]\d)(?:\s+dob=(?P<dob>[\d-]+))?(?:\s+health=(?P<health>.+))?',
         s,
@@ -151,6 +151,11 @@ def parse_admin_client_command(text: str) -> dict | None:
     m = re.match(r'(?i)^\s*add client\s+(.+?)\s+.*?(\+?\d+)\s*$', s)
     if m:
         return {"intent": "add_client", "name": m.group(1).strip(), "number": m.group(2)}
+
+    # ── Update DOB ──
+    m = re.match(r'(?i)^\s*update\s+dob\s+(.+?)\s+(\S+)\s*$', s)
+    if m:
+        return {"intent": "update_dob", "name": m.group(1).strip(), "dob": m.group(2)}
 
     # ── Cancel Next ──
     m = re.match(r'(?i)^\s*cancel\s+(.+?)\s*$', s)
