@@ -36,7 +36,7 @@ CLIENT_MENU = (
 
 # ── ENV ─────────────────────────────────────────────────
 ADMIN_WA_LIST = os.getenv("ADMIN_WA_LIST", "").split(",")
-ADMIN_TEMPLATE = os.getenv("TPL_ADMIN_PROSPECT", "guest_query_alert")
+ADMIN_TEMPLATE = os.getenv("TPL_ADMIN_PROSPECT", "admin_new_lead_alert")
 CLIENT_REGISTRATION_FLOW_ID = os.getenv("CLIENT_REGISTRATION_FLOW_ID", "")
 
 # ── DB helpers ──────────────────────────────────────────
