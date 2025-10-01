@@ -58,6 +58,27 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
         )
         return
 
+    # ─────────────── Button-driven Add Client (prefill from lead) ───────────────
+    if btn_id == "add_client":
+        # Expect that lead info was stored in DB and passed here
+        # For now, just example placeholders
+        lead_name = "John Doe"
+        lead_mobile = "0735534607"
+
+        prefill = {
+            "Client Name": lead_name,
+            "Mobile": lead_mobile,
+        }
+        safe_execute(
+            send_whatsapp_flow,
+            wa,
+            CLIENT_REGISTRATION_FLOW_ID,
+            "Add New Client",
+            prefill=prefill,
+            label="lead_add_flow"
+        )
+        return
+
     # ─────────────── Bookings ───────────────
     parsed = parse_admin_command(text_in)
     if parsed:

@@ -1,10 +1,17 @@
 # app/prospect.py
 from __future__ import annotations
 import logging
+from datetime import datetime
 from sqlalchemy import text
 from .db import get_session
-from .utils import send_whatsapp_text, normalize_wa, safe_execute
-from . import admin_nudge
+from .utils import (
+    send_whatsapp_text,
+    send_whatsapp_template,
+    send_whatsapp_flow,
+    normalize_wa,
+    safe_execute,
+)
+import os
 
 # ── Messages ─────────────────────────────────────────────
 WELCOME = (
@@ -27,7 +34,12 @@ CLIENT_MENU = (
     "Please reply with a number or simple word."
 )
 
-# ── DB helpers ───────────────────────────────────────────
+# ── ENV ─────────────────────────────────────────────────
+ADMIN_WA_LIST = os.getenv("ADMIN_WA_LIST", "").split(",")
+ADMIN_TEMPLATE = os.getenv("TPL_ADMIN_PROSPECT", "guest_query_alert")
+CLIENT_REGISTRATION_FLOW_ID = os.getenv("CLIENT_REGISTRATION_FLOW_ID", "")
+
+# ── DB helpers ──────────────────────────────────────────
 def _lead_get_or_create(wa: str):
     """Fetch or create a lead record by WhatsApp number."""
     with get_session() as s:
@@ -67,6 +79,35 @@ def _client_get(wa: str):
         return dict(row) if row else None
 
 
+# ── Admin nudge ─────────────────────────────────────────
+def _admin_prospect_alert(name: str, wa: str):
+    """Send Meta-approved template alert to all admins with Add Client button."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    body_var = f"{name} ({wa}) at {ts}"
+
+    for admin in [normalize_wa(x) for x in ADMIN_WA_LIST if x.strip()]:
+        # Send template alert
+        safe_execute(
+            send_whatsapp_template,
+            admin,
+            ADMIN_TEMPLATE,
+            "en_US",
+            [body_var],
+            label="prospect_alert",
+        )
+
+        # Also send Add Client flow prefilled
+        if CLIENT_REGISTRATION_FLOW_ID:
+            safe_execute(
+                send_whatsapp_flow,
+                admin,
+                CLIENT_REGISTRATION_FLOW_ID,
+                flow_cta="Add Client",
+                prefill={"Client Name": name, "Mobile": wa},
+                label="prospect_add_client_flow",
+            )
+
+
 # ── Main entry ──────────────────────────────────────────
 def start_or_resume(wa_number: str, incoming_text: str):
     wa = normalize_wa(wa_number)
@@ -97,7 +138,7 @@ def start_or_resume(wa_number: str, incoming_text: str):
             return
 
         _lead_update(wa, name=msg)
-        admin_nudge.prospect_alert(msg, wa)  # ✅ fixed call
+        _admin_prospect_alert(msg, wa)  # ✅ use template + flow
         logging.info(f"[PROSPECT] Stored new lead name={msg}")
         safe_execute(send_whatsapp_text, wa, AFTER_NAME_MSG.format(name=msg), label="after_name")
         return

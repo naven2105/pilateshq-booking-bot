@@ -1,4 +1,3 @@
-# app/utils.py
 import logging
 import requests
 import os
@@ -78,14 +77,25 @@ def send_whatsapp_text(to: str, text: str) -> dict:
     return {"ok": ok, "status_code": status, "response": body}
 
 
-def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form") -> dict:
+def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form", prefill: dict | None = None) -> dict:
     """
     Send a WhatsApp interactive Flow message.
     Args:
         to: Target WhatsApp number (27...)
         flow_id: Published Flow ID from Meta
         flow_cta: Button label (e.g. 'Add New Client')
+        prefill: Optional dict of pre-filled values, e.g.
+                 {"Client Name": "John Doe", "Mobile": "0735534607"}
     """
+    action_params = {
+        "flow_id": flow_id,
+        "flow_cta": flow_cta,
+        "flow_message_version": "3",   # ✅ required
+    }
+
+    if prefill:
+        action_params["flow_action_payload"] = {"screen_0": prefill}
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -104,11 +114,7 @@ def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form") -> di
             },
             "action": {
                 "name": "flow",
-                "parameters": {
-                    "flow_id": flow_id,
-                    "flow_cta": flow_cta,
-                    "flow_message_version": "3"   # ✅ required parameter
-                }
+                "parameters": action_params
             }
         }
     }
