@@ -159,12 +159,16 @@ def webhook():
 
                 # ✅ Button replies
                 elif itype == "button_reply":
-                    button_id = interactive.get("button_reply", {}).get("id")
-                    button_text = interactive.get("button_reply", {}).get("title")
-                    log.info(f"[Webhook] Button clicked → id={button_id}, text={button_text}")
+                    button = interactive.get("button_reply", {})
+                    button_id = button.get("id")
+                    button_text = button.get("title", "")
+                    # fallback: normalize button text into an ID if no explicit id provided
+                    btn_key = button_id or button_text.lower().replace(" ", "_")
+
+                    log.info(f"[Webhook] Button clicked → id={button_id}, text={button_text}, resolved={btn_key}")
 
                     # Route to admin handler
-                    handle_admin_action(from_wa, msg.get("id"), button_text, btn_id=button_id)
+                    handle_admin_action(from_wa, msg.get("id"), None, btn_id=btn_key)
                     return jsonify({"status": "ok", "role": "admin_button"}), 200
 
             # ─────────────── Fallback to text handling ───────────────
