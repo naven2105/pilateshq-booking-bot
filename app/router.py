@@ -18,9 +18,47 @@ log = logging.getLogger(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "changeme")
 
 
+# ── Helpers ──────────────────────────────────────────────
+def _normalize_dob(dob: str | None) -> str | None:
+    """Normalise DOB string into YYYY-MM-DD (safe for DB)."""
+    if not dob:
+        return None
+    dob = dob.strip()
+    # Try full formats first
+    for fmt in ("%d %B %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(dob, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # Try without year (assume 1900)
+    for fmt in ("%d %B", "%d %b"):
+        try:
+            dt = datetime.strptime(dob, fmt)
+            return dt.replace(year=1900).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    log.warning(f"[DOB] Could not parse → {dob!r}")
+    return None
+
+
+def _format_dob_display(dob_norm: str | None) -> str:
+    """Format normalised DOB string into Nadine-friendly display."""
+    if not dob_norm:
+        return "N/A"
+    try:
+        dt = datetime.strptime(dob_norm, "%Y-%m-%d")
+        if dt.year == 1900:
+            return dt.strftime("%d-%b")      # e.g. 21-May
+        return dt.strftime("%d-%b-%Y")       # e.g. 21-May-1985
+    except Exception:
+        return "N/A"
+
+
 def _create_client_record(name: str, mobile: str, dob: str | None):
     """Insert new client and mark lead as converted."""
     wa = normalize_wa(mobile)
+    dob_norm = _normalize_dob(dob)
+
     with get_session() as s:
         # Check if already exists
         row = s.execute(
@@ -31,13 +69,13 @@ def _create_client_record(name: str, mobile: str, dob: str | None):
             log.info("[CLIENT CREATE] Client already exists wa=%s id=%s", wa, row[0])
             return row[0]
 
-        # Insert new client
+        # Insert new client with normalised DOB
         r = s.execute(
             text(
                 "INSERT INTO clients (name, wa_number, phone, birthday) "
                 "VALUES (:n, :wa, :wa, :dob) RETURNING id"
             ),
-            {"n": name, "wa": wa, "dob": dob},
+            {"n": name, "wa": wa, "dob": dob_norm},
         )
         cid = r.scalar()
         log.info("[CLIENT CREATE] Inserted client id=%s name=%s wa=%s", cid, name, wa)
@@ -50,6 +88,7 @@ def _create_client_record(name: str, mobile: str, dob: str | None):
         return cid
 
 
+# ── Webhook ──────────────────────────────────────────────
 @router_bp.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """Main WhatsApp webhook endpoint for Meta."""
@@ -115,26 +154,14 @@ def webhook():
                             or params.get("screen_0_Mobile_1")
                             or params.get("phone")
                         )
-                        dob_raw = params.get("DOB") or params.get("screen_0_DOB_2")
-                        dob = dob_raw
+                        dob = params.get("DOB") or params.get("screen_0_DOB_2")
 
                         log.info("[%s] Parsed fields → name=%s, mobile=%s, dob=%s", itype, client_name, mobile, dob)
 
                         if client_name and mobile:
                             _create_client_record(client_name, mobile, dob)
 
-                            dob_display = "N/A"
-                            if dob:
-                                try:
-                                    dt = datetime.strptime(dob, "%d %B %Y")
-                                    dob_display = dt.strftime("%d-%b")
-                                except Exception:
-                                    try:
-                                        dt = datetime.strptime(dob, "%d %b %Y")
-                                        dob_display = dt.strftime("%d-%b")
-                                    except Exception:
-                                        dob_display = dob
-
+                            dob_display = _format_dob_display(_normalize_dob(dob))
                             msg_out = (
                                 "✅ New client registered\n\n"
                                 f"Name: {client_name}\n"
@@ -154,13 +181,7 @@ def webhook():
                         log.exception("[Webhook] Failed to handle %s", itype)
                         send_whatsapp_text(
                             from_wa,
-                            f"⚠ Client form error ({itype}).\n"
-                            f"Reason: {str(e)}\n\n"
-                            "Submitted values:\n"
-                            f"• Name: {client_name or 'N/A'}\n"
-                            f"• Mobile: {mobile or 'N/A'}\n"
-                            f"• DOB: {dob_raw or 'N/A'}\n\n"
-                            "👉 Please forward this to support."
+                            f"⚠️ Error handling client form ({itype}). Suspect error: {e}",
                         )
                         return jsonify({"status": "error", "role": itype}), 200
 
