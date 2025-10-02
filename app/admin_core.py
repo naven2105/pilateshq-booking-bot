@@ -23,13 +23,25 @@ log = logging.getLogger(__name__)
 # Flow ID from Meta (published form)
 CLIENT_REGISTRATION_FLOW_ID = os.getenv("CLIENT_REGISTRATION_FLOW_ID", "24571517685863108")
 
-
 def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: Optional[str] = None):
     """Main entrypoint for inbound admin actions (Nadine / super-admin)."""
     wa = normalize_wa(from_wa)
     text_in = (body or "").strip()
 
     log.info(f"[ADMIN] from={from_wa} body={body!r} btn_id={btn_id!r}")
+
+    # ─────────────── Handle Button Actions ───────────────
+    if btn_id:
+        if btn_id == "add_client":
+            safe_execute(
+                send_whatsapp_flow,
+                wa,
+                CLIENT_REGISTRATION_FLOW_ID,
+                "Add New Client",
+                label="admin_add_new_flow_btn"
+            )
+            return
+        # you can add more button actions here later
 
     # ─────────────── Menu ───────────────
     if text_in.lower() in {"hi", "menu", "help"}:
@@ -39,22 +51,11 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             "• Recurring Sessions → e.g. 'Book Mary every Tuesday 09h00 duo'\n"
             "• Manage Clients → e.g. 'Add client Alice with number 082...'\n"
             "• Update Client → 'update dob Alice 21-May' / 'update mobile Alice 083...'\n"
-            "• Add New Client → type 'add new' or tap the button to open the registration form\n"
+            "• Add New Client → type 'add new' or tap the Add Client button\n"
             "• Attendance Updates → e.g. 'Peter sick' / 'Peter no-show'\n"
             "• Deactivate Client → e.g. 'Deactivate Alice'\n"
             "Type your command directly.",
             label="admin_menu"
-        )
-        return
-
-    # ─────────────── Add New Client (Button OR Command) ───────────────
-    if text_in.lower() in {"add new", "new client"} or btn_id == "add_client":
-        safe_execute(
-            send_whatsapp_flow,
-            wa,
-            CLIENT_REGISTRATION_FLOW_ID,
-            "Add New Client",
-            label="admin_add_new_flow"
         )
         return
 
@@ -75,3 +76,5 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
         "⚠ Unknown admin command. Reply 'menu' for options.",
         label="admin_fallback"
     )
+
+
