@@ -23,28 +23,39 @@ log = logging.getLogger(__name__)
 # Flow ID from Meta (published form)
 CLIENT_REGISTRATION_FLOW_ID = os.getenv("CLIENT_REGISTRATION_FLOW_ID", "24571517685863108")
 
+
 def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: Optional[str] = None):
     """Main entrypoint for inbound admin actions (Nadine / super-admin)."""
     wa = normalize_wa(from_wa)
-    text_in = (body or "").strip()
+    text_in = (body or "").strip().lower() if body else ""
+    btn_norm = btn_id.lower().replace(" ", "_") if btn_id else None
 
-    log.info(f"[ADMIN] from={from_wa} body={body!r} btn_id={btn_id!r}")
+    log.info(f"[ADMIN] from={from_wa} body={body!r} btn_id={btn_id!r} → btn_norm={btn_norm}")
 
     # ─────────────── Handle Button Actions ───────────────
-    if btn_id:
-        if btn_id == "add_client":
-            safe_execute(
-                send_whatsapp_flow,
-                wa,
-                CLIENT_REGISTRATION_FLOW_ID,
-                "Add New Client",
-                label="admin_add_new_flow_btn"
-            )
-            return
-        # you can add more button actions here later
+    if btn_norm in {"add_client", "add_client_button"}:
+        safe_execute(
+            send_whatsapp_flow,
+            wa,
+            CLIENT_REGISTRATION_FLOW_ID,
+            "Add New Client",
+            label="admin_add_new_flow_btn"
+        )
+        return
+
+    # ─────────────── Add Client via Text ───────────────
+    if text_in in {"add new", "new client", "add client"}:
+        safe_execute(
+            send_whatsapp_flow,
+            wa,
+            CLIENT_REGISTRATION_FLOW_ID,
+            "Add New Client",
+            label="admin_add_new_flow_text"
+        )
+        return
 
     # ─────────────── Menu ───────────────
-    if text_in.lower() in {"hi", "menu", "help"}:
+    if text_in in {"hi", "menu", "help"}:
         safe_execute(send_whatsapp_text, wa,
             "🛠 Admin Menu\n\n"
             "• Book Sessions → e.g. 'Book Mary tomorrow 08h00 single'\n"
@@ -76,5 +87,3 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
         "⚠ Unknown admin command. Reply 'menu' for options.",
         label="admin_fallback"
     )
-
-

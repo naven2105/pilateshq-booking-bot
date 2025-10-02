@@ -84,7 +84,7 @@ def webhook():
             from_wa = msg.get("from")
             text_in = msg.get("text", {}).get("body", "")
 
-            # ─────────────── Flow / NFM / Button Replies ───────────────
+            # ─────────────── Flow / NFM / Interactive Button Replies ───────────────
             if msg.get("type") == "interactive":
                 interactive = msg.get("interactive", {})
                 itype = interactive.get("type")
@@ -157,19 +157,28 @@ def webhook():
                         )
                         return jsonify({"status": "error", "role": itype}), 200
 
-                # ✅ Button replies
+                # Interactive button replies
                 elif itype == "button_reply":
                     button = interactive.get("button_reply", {})
                     button_id = button.get("id")
                     button_text = button.get("title", "")
-                    # fallback: normalize button text into an ID if no explicit id provided
                     btn_key = button_id or button_text.lower().replace(" ", "_")
 
-                    log.info(f"[Webhook] Button clicked → id={button_id}, text={button_text}, resolved={btn_key}")
+                    log.info(f"[Webhook] Interactive button clicked → id={button_id}, text={button_text}, resolved={btn_key}")
 
-                    # Route to admin handler
                     handle_admin_action(from_wa, msg.get("id"), None, btn_id=btn_key)
                     return jsonify({"status": "ok", "role": "admin_button"}), 200
+
+            # ─────────────── Plain Button Messages (Meta sends type=button) ───────────────
+            if msg.get("type") == "button":
+                button = msg.get("button", {})
+                button_id = button.get("payload") or button.get("text")
+                btn_key = button_id.lower().replace(" ", "_") if button_id else None
+
+                log.info(f"[Webhook] Plain button clicked → id={button_id}, resolved={btn_key}")
+
+                handle_admin_action(from_wa, msg.get("id"), None, btn_id=btn_key)
+                return jsonify({"status": "ok", "role": "admin_button"}), 200
 
             # ─────────────── Fallback to text handling ───────────────
             wa = normalize_wa(from_wa)
