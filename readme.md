@@ -98,6 +98,37 @@ ADMIN_WA_LIST=2782...,2773...   # Nadine’s WA numbers (comma separated)
 # Templates
 TPL_ADMIN_PROSPECT=guest_query_alert
 
+## 📲 WhatsApp Templates
+
+This bot relies on Meta-approved **message templates** to stay compliant with the 24-hour rule.  
+Below are the currently used templates:
+
+- **admin_new_lead_alert** → Prospect → Admin nudge:  
+  `"📢 Admin Alert Hi: 📥 New Prospect: {{1}}, for your urgent attention 😉"`
+
+- **client_registration** → WhatsApp Flow for new client onboarding.  
+
+- **admin_20h00_us** → Evening preview (tomorrow’s schedule).  
+
+- **admin_morning_us** → Morning briefing (today’s sessions).  
+
+- **admin_update_us** → Admin generic update.  
+
+- **admin_cancel_all_sessions_us** → Cancel all sessions (with reason).  
+
+- **client_weekly_schedule_us** → Weekly client schedule.  
+
+- **client_session_tomorrow_us** → Reminder for tomorrow’s session.  
+
+- **client_session_next_hour_us** → Reminder for session in the next hour.  
+
+---
+
+📝 **Note:**  
+Always make sure template names in the code match the **Meta Business Manager approved names**.  
+If a mismatch occurs (e.g. `guest_query_alert` vs `admin_new_lead_alert`), Meta will return `(#132001) Template name does not exist`.
+
+
 # WhatsApp Flows
 CLIENT_REGISTRATION_FLOW_ID=24571517685863108
 

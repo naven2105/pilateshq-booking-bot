@@ -10,7 +10,7 @@ Handles admin notifications (nudges) to Nadine for:
 
 import logging
 from datetime import datetime
-from .utils import safe_execute, send_whatsapp_text
+from .utils import safe_execute, send_whatsapp_template
 from .db import get_session
 from sqlalchemy import text
 import os
@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 
 # Nadine's WhatsApp number from env
 NADINE_WA = os.getenv("NADINE_WA", "")
+
+# Approved Meta template for new lead alerts
+ADMIN_NEW_LEAD_TEMPLATE = "admin_new_lead_alert"
+TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
 
 def _log_notification(label: str, msg: str):
@@ -47,12 +51,23 @@ def _format_dob(dob: str | None) -> str | None:
         return dob
 
 
-# ── Prospect Alert ──
+# ── Prospect Alert (with Add Client button) ──
 def prospect_alert(name: str, wa_number: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    msg = f"📢 Admin Alert\nHi: 📥 New Prospect: {name} ({wa_number}) at {ts}, for your urgent attention😉"
-    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="prospect_alert")
-    _log_notification("prospect_alert", msg)
+    body_text = f'{name} ({wa_number}) at {ts}'
+    log.info(f"[ADMIN NUDGE] Prospect alert → {body_text}")
+
+    # Use Meta-approved template with 1 variable
+    safe_execute(
+        send_whatsapp_template,
+        NADINE_WA,
+        ADMIN_NEW_LEAD_TEMPLATE,
+        TEMPLATE_LANG,
+        [body_text],   # fills {{1}}
+        label="prospect_alert"
+    )
+
+    _log_notification("prospect_alert", body_text)
 
 
 # ── Booking Update ──
@@ -69,25 +84,25 @@ def booking_update(name: str, session_type: str, day: str, time: str, dob: str |
     if health:
         msg += f"\nHealth: {health}"
 
-    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="booking_update")
+    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="booking_update")
     _log_notification("booking_update", msg)
 
 
 # ── Attendance Status ──
 def status_update(name: str, status: str):
     msg = f"⚠️ {name} marked as {status.upper()} today."
-    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="status_update")
+    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="status_update")
     _log_notification("status_update", msg)
 
 
 # ── Deactivation ──
 def request_deactivate(name: str, wa: str):
     msg = f"❔ Deactivation requested for {name}. Confirm?"
-    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="request_deactivate")
+    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="request_deactivate")
     _log_notification("request_deactivate", msg)
 
 
 def confirm_deactivate(name: str, wa: str):
     msg = f"✅ Client {name} has been deactivated."
-    safe_execute(send_whatsapp_text, NADINE_WA, msg, label="confirm_deactivate")
+    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="confirm_deactivate")
     _log_notification("confirm_deactivate", msg)
