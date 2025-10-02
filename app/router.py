@@ -115,7 +115,8 @@ def webhook():
                             or params.get("screen_0_Mobile_1")
                             or params.get("phone")
                         )
-                        dob = params.get("DOB") or params.get("screen_0_DOB_2")
+                        dob_raw = params.get("DOB") or params.get("screen_0_DOB_2")
+                        dob = dob_raw
 
                         log.info("[%s] Parsed fields → name=%s, mobile=%s, dob=%s", itype, client_name, mobile, dob)
 
@@ -149,11 +150,17 @@ def webhook():
 
                         return jsonify({"status": "ok", "role": itype}), 200
 
-                    except Exception:
+                    except Exception as e:
                         log.exception("[Webhook] Failed to handle %s", itype)
                         send_whatsapp_text(
                             from_wa,
-                            f"⚠️ Error handling client form ({itype}). Nadine please check logs.",
+                            f"⚠ Client form error ({itype}).\n"
+                            f"Reason: {str(e)}\n\n"
+                            "Submitted values:\n"
+                            f"• Name: {client_name or 'N/A'}\n"
+                            f"• Mobile: {mobile or 'N/A'}\n"
+                            f"• DOB: {dob_raw or 'N/A'}\n\n"
+                            "👉 Please forward this to support."
                         )
                         return jsonify({"status": "error", "role": itype}), 200
 
