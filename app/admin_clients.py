@@ -20,23 +20,28 @@ log = logging.getLogger(__name__)
 
 def _find_or_create_client(name: str, wa_number: str | None = None):
     """Look up a client by name. If not found and wa_number is given, create."""
+    wa_number = normalize_wa(wa_number) if wa_number else None
+
     with get_session() as s:
+        # Try to find an existing client by name or number
         row = s.execute(
-            text("SELECT id, wa_number FROM clients WHERE lower(name)=lower(:n)"),
-            {"n": name},
+            text("SELECT id, wa_number FROM clients WHERE lower(name)=lower(:n) OR wa_number=:wa"),
+            {"n": name, "wa": wa_number},
         ).first()
         if row:
-            return row[0], row[1]
+            log.info(f"[CLIENT EXISTS] name={name}, wa={wa_number}, id={row[0]}")
+            return row[0], row[1], True  # ✅ already exists
+
+        # If not found and wa_number provided → create
         if wa_number:
             r = s.execute(
-                text(
-                    "INSERT INTO clients (name, wa_number, phone) "
-                    "VALUES (:n, :wa, :wa) RETURNING id, wa_number"
-                ),
+                text("INSERT INTO clients (name, wa_number, phone) "
+                     "VALUES (:n, :wa, :wa) RETURNING id, wa_number"),
                 {"n": name, "wa": wa_number},
             )
-            return r.first()
-    return None, None
+            return r.first()[0], wa_number, False  # ✅ new created
+
+    return None, None, False
 
 
 def _mark_lead_converted(wa_number: str, client_id: int):
@@ -61,21 +66,30 @@ def handle_client_command(parsed: dict, wa: str):
         number = parsed["number"].replace("+", "")
         if number.startswith("0"):
             number = "27" + number[1:]
-        cid, wnum = _find_or_create_client(name, number)
+
+        cid, wnum, existed = _find_or_create_client(name, number)
         if cid:
-            _mark_lead_converted(wnum, cid)
-            safe_execute(
-                send_whatsapp_text,
-                wa,
-                f"✅ Client '{name}' added with number {wnum}.",
-                label="add_client_ok",
-            )
+            if existed:
+                safe_execute(send_whatsapp_text, wa,
+                    f"ℹ Client '{name}' already exists with number {wnum}.",
+                    label="add_client_exists"
+                )
+            else:
+                _mark_lead_converted(wnum, cid)
+                safe_execute(send_whatsapp_text, wa,
+                    f"✅ Client '{name}' added with number {wnum}.",
+                    label="add_client_ok"
+                )
+                # Send welcome to client
+                safe_execute(send_whatsapp_text, wnum,
+                    f"💜 Hi {name}, you’ve been added as a PilatesHQ client. "
+                    f"Nadine will confirm your bookings with you soon!",
+                    label="client_welcome"
+                )
         else:
-            safe_execute(
-                send_whatsapp_text,
-                wa,
+            safe_execute(send_whatsapp_text, wa,
                 f"⚠ Could not add client '{name}'.",
-                label="add_client_fail",
+                label="add_client_fail"
             )
         return
 
@@ -107,10 +121,8 @@ def handle_client_command(parsed: dict, wa: str):
         return
 
     if intent == "cancel":
-        safe_execute(
-            send_whatsapp_text,
-            wa,
+        safe_execute(send_whatsapp_text, wa,
             "❌ Deactivation cancelled. No changes made.",
-            label="deactivate_cancel",
+            label="deactivate_cancel"
         )
         return
