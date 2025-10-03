@@ -41,12 +41,14 @@ def _find_or_create_session(d: str, t: str, slot_type: str) -> int | None:
     """Find existing session or create one with correct capacity."""
     t = normalize_time(t)
     capacity = {"single": 1, "duo": 2, "group": 6}[slot_type]
+    log.debug(f"[_find_or_create_session] d={d}, t={t}, slot_type={slot_type}, capacity={capacity}")
     with get_session() as s:
         row = s.execute(
             text("SELECT id FROM sessions WHERE session_date=:d AND start_time=:t AND session_type=:ty"),
             {"d": d, "t": t, "ty": slot_type},
         ).first()
         if row:
+            log.debug(f"[_find_or_create_session] Found existing session_id={row[0]}")
             return row[0]
         r = s.execute(
             text("""
@@ -55,7 +57,9 @@ def _find_or_create_session(d: str, t: str, slot_type: str) -> int | None:
             """),
             {"d": d, "t": t, "ty": slot_type, "cap": capacity},
         )
-        return r.scalar()
+        sid = r.scalar()
+        log.debug(f"[_find_or_create_session] Created new session_id={sid}")
+        return sid
 
 
 def _is_session_full(session_id: int) -> bool:
@@ -72,6 +76,7 @@ def _is_session_full(session_id: int) -> bool:
         if not row:
             return True
         booked, capacity = row
+        log.debug(f"[_is_session_full] session_id={session_id}, booked={booked}, capacity={capacity}")
         return booked >= capacity
 
 
@@ -81,6 +86,7 @@ def _notify_booking(sid, cname, wnum, d, t, slot_type, admin_wa):
         f"📅 Nadine booked you for {d} at {t} ({slot_type}).\n\n"
         "If this is incorrect, tap ❌ Reject."
     )
+    log.debug(f"[_notify_booking] sid={sid}, cname={cname}, wnum={wnum}, d={d}, t={t}, slot_type={slot_type}")
     safe_execute(
         send_whatsapp_button,
         wnum,
@@ -94,6 +100,11 @@ def _notify_booking(sid, cname, wnum, d, t, slot_type, admin_wa):
 def handle_booking_command(parsed: dict, wa: str):
     """Route parsed booking/admin commands."""
     intent = parsed["intent"]
+
+    # 🔑 Normalise keys: parser sometimes sends "type" instead of "slot_type"
+    if "slot_type" not in parsed and "type" in parsed:
+        parsed["slot_type"] = parsed["type"]
+
     log.info(f"[ADMIN BOOKING] parsed={parsed}")
 
     # ── Single Booking ───────────────────────────────
@@ -105,6 +116,7 @@ def handle_booking_command(parsed: dict, wa: str):
         cid, cname, wnum, _ = choice
 
         time_str = normalize_time(parsed["time"])
+        log.debug(f"[book_single] name={cname}, date={parsed['date']}, time={time_str}, slot_type={parsed['slot_type']}")
         sid = _find_or_create_session(parsed["date"], time_str, parsed["slot_type"])
         if _is_session_full(sid):
             safe_execute(send_whatsapp_text, wa,
@@ -122,6 +134,7 @@ def handle_booking_command(parsed: dict, wa: str):
                 """),
                 {"sid": sid, "cid": cid},
             )
+            log.debug(f"[book_single] Inserted booking for client_id={cid}, session_id={sid}")
 
         safe_execute(send_whatsapp_text, wa,
             f"✅ Session booked for {cname} on {parsed['date']} at {time_str}.",
@@ -143,6 +156,8 @@ def handle_booking_command(parsed: dict, wa: str):
         slot_time = normalize_time(parsed["time"])
         slot_type = parsed["slot_type"]
 
+        log.debug(f"[book_recurring] name={cname}, weekday={weekday}, time={slot_time}, slot_type={slot_type}")
+
         created = 0
         today = date.today()
         for offset in range(0, 8 * 7):  # next 8 weeks
@@ -163,6 +178,7 @@ def handle_booking_command(parsed: dict, wa: str):
                     """), {"sid": sid, "cid": cid},
                 )
             created += 1
+            log.debug(f"[book_recurring] Added booking for {cname}, session_id={sid}, date={d}")
             _notify_booking(sid, cname, wnum, d, slot_time, slot_type, wa)
 
         safe_execute(send_whatsapp_text, wa,
@@ -181,7 +197,13 @@ def handle_booking_command(parsed: dict, wa: str):
 
         created = 0
         for slot in parsed["slots"]:   # [{date, time, slot_type}, …]
+            # 🔑 Normalise key for slot_type
+            if "slot_type" not in slot and "type" in slot:
+                slot["slot_type"] = slot["type"]
+
             d, t, ty = slot["date"], normalize_time(slot["time"]), slot["slot_type"]
+            log.debug(f"[book_recurring_multi] name={cname}, slot_date={d}, slot_time={t}, slot_type={ty}")
+
             sid = _find_or_create_session(d, t, ty)
             if _is_session_full(sid):
                 continue
@@ -195,6 +217,7 @@ def handle_booking_command(parsed: dict, wa: str):
                     """), {"sid": sid, "cid": cid},
                 )
             created += 1
+            log.debug(f"[book_recurring_multi] Added booking for {cname}, session_id={sid}, date={d}, time={t}")
             _notify_booking(sid, cname, wnum, d, t, ty, wa)
 
         safe_execute(send_whatsapp_text, wa,
