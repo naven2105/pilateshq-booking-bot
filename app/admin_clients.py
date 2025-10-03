@@ -6,13 +6,13 @@ Handles client management:
  - Convert leads
  - Attendance updates (sick, no-show, cancel next session)
  - Deactivate clients
- - Invoices & balances (admin side)
 """
 
 import logging
 from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa, safe_execute
+from .admin_notify import notify_client, notify_admin
 from . import admin_nudge
 
 log = logging.getLogger(__name__)
@@ -29,8 +29,10 @@ def _find_or_create_client(name: str, wa_number: str | None = None):
             return row[0], row[1]
         if wa_number:
             r = s.execute(
-                text("INSERT INTO clients (name, wa_number, phone, package_type) "
-                     "VALUES (:n, :wa, :wa, 'manual') RETURNING id, wa_number"),
+                text(
+                    "INSERT INTO clients (name, wa_number, phone) "
+                    "VALUES (:n, :wa, :wa) RETURNING id, wa_number"
+                ),
                 {"n": name, "wa": wa_number},
             )
             return r.first()
@@ -49,6 +51,7 @@ def _mark_lead_converted(wa_number: str, client_id: int):
 
 def handle_client_command(parsed: dict, wa: str):
     """Route parsed client/admin commands."""
+
     intent = parsed["intent"]
     log.info(f"[ADMIN CLIENT] parsed={parsed}")
 
@@ -61,14 +64,18 @@ def handle_client_command(parsed: dict, wa: str):
         cid, wnum = _find_or_create_client(name, number)
         if cid:
             _mark_lead_converted(wnum, cid)
-            safe_execute(send_whatsapp_text, wa,
+            safe_execute(
+                send_whatsapp_text,
+                wa,
                 f"✅ Client '{name}' added with number {wnum}.",
-                label="add_client_ok"
+                label="add_client_ok",
             )
         else:
-            safe_execute(send_whatsapp_text, wa,
+            safe_execute(
+                send_whatsapp_text,
+                wa,
                 f"⚠ Could not add client '{name}'.",
-                label="add_client_fail"
+                label="add_client_fail",
             )
         return
 
@@ -100,20 +107,10 @@ def handle_client_command(parsed: dict, wa: str):
         return
 
     if intent == "cancel":
-        safe_execute(send_whatsapp_text, wa,
+        safe_execute(
+            send_whatsapp_text,
+            wa,
             "❌ Deactivation cancelled. No changes made.",
-            label="deactivate_cancel"
+            label="deactivate_cancel",
         )
-        return
-
-    # ── Invoices ──
-    if intent == "invoice":
-        from .admin_invoices import send_invoice_admin
-        send_invoice_admin(wa, parsed["name"], parsed.get("month"))
-        return
-
-    # ── Balances ──
-    if intent == "balance":
-        from .admin_invoices import show_balance_admin
-        show_balance_admin(wa, parsed["name"])
         return
