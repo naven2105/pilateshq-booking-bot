@@ -164,11 +164,18 @@ def webhook():
                         wa_norm = normalize_wa(from_wa)
 
                         with get_session() as s:
+                            # Update booking status for this client + session
                             s.execute(
-                                text("UPDATE bookings SET status='rejected' "
-                                     "WHERE session_id=:sid AND wa_number=:wa"),
+                                text("""
+                                    UPDATE bookings
+                                    SET status='rejected'
+                                    WHERE session_id=:sid
+                                    AND client_id=(SELECT id FROM clients WHERE wa_number=:wa)
+                                """),
                                 {"sid": sid, "wa": wa_norm},
                             )
+
+                            # Fetch client + session details
                             row = s.execute(
                                 text("""
                                     SELECT c.name, s.session_date, s.start_time
@@ -194,10 +201,15 @@ def webhook():
                             label="client_reject_ok"
                         )
                         # Notify Nadine
-                        admin_nudge.notify_cancel(cname, wa_norm, f"booking on {session_info} rejected by client")
+                        admin_nudge.notify_cancel(
+                            cname,
+                            wa_norm,
+                            f"booking on {session_info} rejected by client"
+                        )
 
                         return jsonify({"status": "ok", "role": "client_reject"}), 200
 
+                    # Other admin button actions
                     handle_admin_action(from_wa, msg.get("id"), None, btn_id=btn_key)
                     return jsonify({"status": "ok", "role": "admin_button"}), 200
 
