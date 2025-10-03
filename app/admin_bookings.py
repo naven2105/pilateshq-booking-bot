@@ -12,7 +12,7 @@ Handles booking-related admin commands with hybrid client matching:
 import logging
 from sqlalchemy import text
 from .db import get_session
-from .utils import send_whatsapp_text, send_whatsapp_buttons, safe_execute
+from .utils import send_whatsapp_text, safe_execute
 from .booking import admin_reserve, create_recurring_bookings, create_multi_recurring_bookings
 from .admin_utils import (
     _find_or_create_client,
