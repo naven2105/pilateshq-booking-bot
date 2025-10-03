@@ -24,8 +24,22 @@ log = logging.getLogger(__name__)
 
 
 # ── Helpers ─────────────────────────────────────────────
+def normalize_time(t: str) -> str:
+    """Convert admin style times like 08h00 → 08:00 for Postgres TIME."""
+    if not t:
+        return t
+    if "h" in t:
+        try:
+            hh, mm = t.split("h")
+            return f"{int(hh):02d}:{int(mm):02d}"
+        except Exception:
+            pass
+    return t  # assume already in HH:MM
+
+
 def _find_or_create_session(d: str, t: str, slot_type: str) -> int | None:
     """Find existing session or create one with correct capacity."""
+    t = normalize_time(t)
     capacity = {"single": 1, "duo": 2, "group": 6}[slot_type]
     with get_session() as s:
         row = s.execute(
@@ -90,7 +104,8 @@ def handle_booking_command(parsed: dict, wa: str):
             return
         cid, cname, wnum, _ = choice
 
-        sid = _find_or_create_session(parsed["date"], parsed["time"], parsed["slot_type"])
+        time_str = normalize_time(parsed["time"])
+        sid = _find_or_create_session(parsed["date"], time_str, parsed["slot_type"])
         if _is_session_full(sid):
             safe_execute(send_whatsapp_text, wa,
                 "❌ Could not reserve — session is full.",
@@ -108,16 +123,15 @@ def handle_booking_command(parsed: dict, wa: str):
                 {"sid": sid, "cid": cid},
             )
 
-        # Notify Nadine
         safe_execute(send_whatsapp_text, wa,
-            f"✅ Session booked for {cname} on {parsed['date']} at {parsed['time']}.",
+            f"✅ Session booked for {cname} on {parsed['date']} at {time_str}.",
             label="book_single_ok"
         )
 
-        _notify_booking(sid, cname, wnum, parsed["date"], parsed["time"], parsed["slot_type"], wa)
+        _notify_booking(sid, cname, wnum, parsed["date"], time_str, parsed["slot_type"], wa)
         return
 
-    # ── Recurring Booking (e.g., every Tuesday) ───────
+    # ── Recurring Booking (weekly) ───────────────────
     if intent == "book_recurring":
         matches = _find_client_matches(parsed["name"])
         choice = _confirm_or_disambiguate(matches, "book recurring", wa)
@@ -125,13 +139,13 @@ def handle_booking_command(parsed: dict, wa: str):
             return
         cid, cname, wnum, _ = choice
 
-        weekday = parsed["weekday"].lower()   # e.g. "tuesday"
-        slot_time = parsed["time"]
+        weekday = parsed["weekday"].lower()
+        slot_time = normalize_time(parsed["time"])
         slot_type = parsed["slot_type"]
 
         created = 0
         today = date.today()
-        for offset in range(0, 8 * 7):  # look ahead 8 weeks
+        for offset in range(0, 8 * 7):  # next 8 weeks
             d = today + timedelta(days=offset)
             if d.strftime("%A").lower() != weekday:
                 continue
@@ -167,7 +181,7 @@ def handle_booking_command(parsed: dict, wa: str):
 
         created = 0
         for slot in parsed["slots"]:   # [{date, time, slot_type}, …]
-            d, t, ty = slot["date"], slot["time"], slot["slot_type"]
+            d, t, ty = slot["date"], normalize_time(slot["time"]), slot["slot_type"]
             sid = _find_or_create_session(d, t, ty)
             if _is_session_full(sid):
                 continue
@@ -192,7 +206,6 @@ def handle_booking_command(parsed: dict, wa: str):
 
 # ── Cancel & Mark Status ───────────────────────────────
 def cancel_next_booking(name: str, wa: str):
-    """Cancel the next booking for a client with hybrid matching."""
     matches = _find_client_matches(name)
     choice = _confirm_or_disambiguate(matches, "cancel next booking", wa)
     if not choice:
@@ -227,7 +240,6 @@ def cancel_next_booking(name: str, wa: str):
 
 
 def mark_today_status(name: str, status: str, wa: str):
-    """Mark today’s booking with sick/no-show status."""
     matches = _find_client_matches(name)
     choice = _confirm_or_disambiguate(matches, f"mark {status}", wa)
     if not choice:
