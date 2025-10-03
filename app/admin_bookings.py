@@ -12,7 +12,7 @@ Handles booking-related admin commands with hybrid client matching:
 import logging
 from sqlalchemy import text
 from .db import get_session
-from .utils import send_whatsapp_text, safe_execute
+from .utils import send_whatsapp_text, send_whatsapp_buttons, safe_execute
 from .booking import admin_reserve, create_recurring_bookings, create_multi_recurring_bookings
 from .admin_utils import (
     _find_or_create_client,
@@ -45,7 +45,7 @@ def handle_booking_command(parsed: dict, wa: str):
         choice = _confirm_or_disambiguate(matches, "book session", wa)
         if not choice:
             return
-        cid, cname, _, _ = choice
+        cid, cname, wnum, _ = choice
 
         sid = _find_session(parsed["date"], parsed["time"])
         if not sid:
@@ -55,12 +55,29 @@ def handle_booking_command(parsed: dict, wa: str):
             )
             return
 
-        ok = admin_reserve(cid, sid, 1)
+        # ✅ Book with confirmed status
+        ok = admin_reserve(cid, sid, 1, status="confirmed")
         if ok:
+            # Notify Nadine
             safe_execute(send_whatsapp_text, wa,
                 f"✅ Session booked for {cname} on {parsed['date']} at {parsed['time']}.",
                 label="book_single_ok"
             )
+
+            # Notify client with reject option
+            msg = (
+                f"📅 Nadine booked you for {parsed['date']} at {parsed['time']} "
+                f"({parsed.get('slot_type') or 'session'}).\n\n"
+                "If this is incorrect, tap ❌ Reject."
+            )
+            safe_execute(
+                send_whatsapp_buttons,
+                wnum,
+                msg,
+                buttons=[{"id": f"reject_{sid}", "title": "❌ Reject"}],
+                label="client_booking_notify",
+            )
+
         else:
             safe_execute(send_whatsapp_text, wa,
                 "❌ Could not reserve — session is full.",
@@ -76,7 +93,9 @@ def handle_booking_command(parsed: dict, wa: str):
             return
         cid, cname, _, _ = choice
 
-        created = create_recurring_bookings(cid, parsed["weekday"], parsed["time"], parsed["slot_type"])
+        created = create_recurring_bookings(
+            cid, parsed["weekday"], parsed["time"], parsed["slot_type"]
+        )
         safe_execute(send_whatsapp_text, wa,
             f"📅 Created {created} weekly bookings for {cname} ({parsed['slot_type']}).",
             label="book_recurring"
