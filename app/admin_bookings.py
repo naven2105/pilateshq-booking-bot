@@ -38,27 +38,35 @@ def normalize_time(t: str) -> str:
 
 
 def _find_or_create_session(d: str, t: str, slot_type: str) -> int | None:
-    """Find existing session or create one with correct capacity."""
+    """
+    Find existing session by date+time (ignoring slot_type) 
+    or create one with requested type/capacity.
+    """
     t = normalize_time(t)
-    capacity = {"single": 1, "duo": 2, "group": 6}[slot_type]
-    log.debug(f"[_find_or_create_session] d={d}, t={t}, slot_type={slot_type}, capacity={capacity}")
+    capacity_map = {"single": 1, "duo": 2, "group": 6}
+    cap = capacity_map.get(slot_type, 1)
+
     with get_session() as s:
+        # 🔎 Check if a session already exists at that date/time
         row = s.execute(
-            text("SELECT id FROM sessions WHERE session_date=:d AND start_time=:t AND session_type=:ty"),
-            {"d": d, "t": t, "ty": slot_type},
+            text("SELECT id, session_type, capacity FROM sessions WHERE session_date=:d AND start_time=:t"),
+            {"d": d, "t": t},
         ).first()
         if row:
-            log.debug(f"[_find_or_create_session] Found existing session_id={row[0]}")
-            return row[0]
+            sid, stype, existing_cap = row
+            log.debug(f"[_find_or_create_session] Reusing session_id={sid}, existing_type={stype}, cap={existing_cap}")
+            return sid
+
+        # 🚀 Otherwise, insert a new one
         r = s.execute(
             text("""
                 INSERT INTO sessions (session_date, start_time, session_type, capacity)
                 VALUES (:d, :t, :ty, :cap) RETURNING id
             """),
-            {"d": d, "t": t, "ty": slot_type, "cap": capacity},
+            {"d": d, "t": t, "ty": slot_type, "cap": cap},
         )
         sid = r.scalar()
-        log.debug(f"[_find_or_create_session] Created new session_id={sid}")
+        log.debug(f"[_find_or_create_session] Created new session_id={sid}, type={slot_type}, cap={cap}")
         return sid
 
 
