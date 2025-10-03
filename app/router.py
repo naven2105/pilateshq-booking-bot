@@ -6,7 +6,6 @@ import json
 from datetime import datetime
 
 from .utils import normalize_wa, send_whatsapp_text
-from .invoices import send_invoice
 from .admin_core import handle_admin_action
 from .prospect import start_or_resume, _client_get, CLIENT_MENU
 from .db import get_session

@@ -1,4 +1,3 @@
-# app/prospect.py
 from __future__ import annotations
 import logging
 from datetime import datetime
@@ -28,8 +27,7 @@ CLIENT_MENU = (
     "💜 Welcome back, {name}!\n"
     "Here’s what I can help you with:\n\n"
     "1️⃣ View my bookings   → (or type *bookings*)\n"
-    "2️⃣ Get my invoice     → (or type *invoice*)\n"
-    "3️⃣ FAQs               → (or type *faq* or *questions*)\n"
+    "2️⃣ FAQs               → (or type *faq* or *questions*)\n"
     "0️⃣ Contact Nadine     → (or type *Nadine*)\n\n"
     "Please reply with a number or simple word."
 )
@@ -86,7 +84,6 @@ def _admin_prospect_alert(name: str, wa: str):
     body_var = f"{name} ({wa}) at {ts}"
 
     for admin in [normalize_wa(x) for x in ADMIN_WA_LIST if x.strip()]:
-        # Send template alert
         safe_execute(
             send_whatsapp_template,
             admin,
@@ -95,8 +92,6 @@ def _admin_prospect_alert(name: str, wa: str):
             [body_var],
             label="prospect_alert",
         )
-
-        # Also send Add Client flow prefilled
         if CLIENT_REGISTRATION_FLOW_ID:
             safe_execute(
                 send_whatsapp_flow,
@@ -115,7 +110,6 @@ def start_or_resume(wa_number: str, incoming_text: str):
     msg = (incoming_text or "").strip()
     logging.info(f"[PROSPECT] Incoming={msg!r}, wa={wa}, client={bool(client)}")
 
-    # ── Clients get client menu ──
     if client:
         safe_execute(
             send_whatsapp_text,
@@ -125,11 +119,9 @@ def start_or_resume(wa_number: str, incoming_text: str):
         )
         return
 
-    # ── Prospects flow ──
     lead = _lead_get_or_create(wa)
     logging.info(f"[PROSPECT] Lead record: {lead}")
 
-    # Step 1: ask for name if not provided
     if not lead.get("name"):
         bad_inputs = {"hi", "hello", "hey", "test"}
         if not msg or msg.lower() in bad_inputs or len(msg) < 2:
@@ -138,12 +130,11 @@ def start_or_resume(wa_number: str, incoming_text: str):
             return
 
         _lead_update(wa, name=msg)
-        _admin_prospect_alert(msg, wa)  # ✅ use template + flow
+        _admin_prospect_alert(msg, wa)
         logging.info(f"[PROSPECT] Stored new lead name={msg}")
         safe_execute(send_whatsapp_text, wa, AFTER_NAME_MSG.format(name=msg), label="after_name")
         return
 
-    # Step 2: all future messages → same polite thank-you
     logging.info(f"[PROSPECT] Known lead name={lead.get('name')}, repeating polite reply")
     safe_execute(
         send_whatsapp_text,

@@ -10,7 +10,8 @@ import logging
 from typing import Optional
 from .utils import send_whatsapp_text, normalize_wa, safe_execute
 from .client_nlp import parse_client_command
-from . import client_bookings, client_invoices, client_attendance
+from . import client_bookings, client_attendance
+from .prospect import CLIENT_MENU, _client_get  # ✅ reuse client lookup + menu
 
 log = logging.getLogger(__name__)
 
@@ -22,18 +23,46 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
 
     log.info(f"[CLIENT] from={from_wa} body={body!r}")
 
-    parsed = parse_client_command(text_in)
-    if not parsed:
+    # ─────────────── Shortcut: greetings → show menu ───────────────
+    if text_in.lower() in {"hi", "hello", "hey"}:
+        client = _client_get(wa)
+        cname = client["name"] if client else "there"
         safe_execute(
             send_whatsapp_text,
             wa,
-            "💜 Sorry, I didn’t understand. Type 'help' for what I can do.",
+            CLIENT_MENU.format(name=cname),
+            label="client_menu_greeting",
+        )
+        return
+
+    parsed = parse_client_command(text_in)
+    if not parsed:
+        # ✅ Fallback now greets by name if available
+        client = _client_get(wa)
+        cname = client["name"] if client else "there"
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            f"💜 Hi {cname}, I didn’t understand that.\n"
+            "Type *menu* to see what I can do for you.",
             label="client_fallback",
         )
         return
 
     intent = parsed["intent"]
     log.info(f"[CLIENT CMD] parsed={parsed}")
+
+    # ─────────────── Menu ───────────────
+    if intent == "menu":
+        client = _client_get(wa)
+        cname = client["name"] if client else "there"
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            CLIENT_MENU.format(name=cname),
+            label="client_menu",
+        )
+        return
 
     # ─────────────── View Bookings ───────────────
     if intent == "show_bookings":
@@ -65,12 +94,21 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
 
     # ─────────────── Invoices ───────────────
     if intent == "get_invoice":
-        month = parsed.get("month")
-        client_invoices.send_invoice(wa, month)
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            "📑 Invoices are currently managed directly by Nadine. Please contact her if you need a copy.",
+            label="client_invoice_redirect",
+        )
         return
 
     if intent == "balance":
-        client_invoices.show_balance(wa)
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            "📊 Balance requests are not yet automated. Please contact Nadine for details.",
+            label="client_balance_redirect",
+        )
         return
 
     # ─────────────── FAQs ───────────────

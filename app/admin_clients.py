@@ -3,12 +3,10 @@ admin_clients.py
 ────────────────
 Handles client management:
  - Add clients
- - Update DOB (with hybrid matching)
- - Update mobile (with hybrid matching)
- - Update name (with hybrid matching)
  - Convert leads
  - Attendance updates (sick, no-show, cancel next session)
  - Deactivate clients
+ - Invoices & balances (admin side)
 """
 
 import logging
@@ -16,133 +14,106 @@ from sqlalchemy import text
 from .db import get_session
 from .utils import send_whatsapp_text, normalize_wa, safe_execute
 from . import admin_nudge
-from .admin_utils import (
-    _find_or_create_client,
-    _format_dob,
-    _find_client_matches,
-    _confirm_or_disambiguate,
-)
 
 log = logging.getLogger(__name__)
 
 
+def _find_or_create_client(name: str, wa_number: str | None = None):
+    """Look up a client by name. If not found and wa_number is given, create."""
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT id, wa_number FROM clients WHERE lower(name)=lower(:n)"),
+            {"n": name},
+        ).first()
+        if row:
+            return row[0], row[1]
+        if wa_number:
+            r = s.execute(
+                text("INSERT INTO clients (name, wa_number, phone, package_type) "
+                     "VALUES (:n, :wa, :wa, 'manual') RETURNING id, wa_number"),
+                {"n": name, "wa": wa_number},
+            )
+            return r.first()
+    return None, None
+
+
+def _mark_lead_converted(wa_number: str, client_id: int):
+    """Mark a lead as converted once promoted to client."""
+    with get_session() as s:
+        s.execute(
+            text("UPDATE leads SET status='converted' WHERE wa_number=:wa"),
+            {"wa": wa_number},
+        )
+    log.info(f"Lead {wa_number} promoted → client {client_id}")
+
+
 def handle_client_command(parsed: dict, wa: str):
-    intent = parsed.get("intent")
+    """Route parsed client/admin commands."""
+    intent = parsed["intent"]
+    log.info(f"[ADMIN CLIENT] parsed={parsed}")
 
-    # ── Add client ──────────────────────────────────────────────
+    # ── Add Client ──
     if intent == "add_client":
-        name = parsed.get("name")
-        num_entered = parsed.get("number")  # as typed by Nadine
-        num = normalize_wa(num_entered)
-        cid, wa_num, cname, dob = _find_or_create_client(name, num)
+        name = parsed["name"]
+        number = parsed["number"].replace("+", "")
+        if number.startswith("0"):
+            number = "27" + number[1:]
+        cid, wnum = _find_or_create_client(name, number)
         if cid:
-            msg = (
-                f"✅ New client registered\n\n"
-                f"Name: {cname}\n"
-                f"Mobile: {num_entered}"
+            _mark_lead_converted(wnum, cid)
+            safe_execute(send_whatsapp_text, wa,
+                f"✅ Client '{name}' added with number {wnum}.",
+                label="add_client_ok"
             )
-            if dob:
-                msg += f"\nDOB: {_format_dob(dob)}"
-            safe_execute(send_whatsapp_text, wa, msg, label="client_added")
         else:
-            safe_execute(send_whatsapp_text, wa, f"⚠ Could not add client '{name}'.", label="client_add_fail")
-        return
-
-    # ── Update DOB ─────────────────────────────────────────────
-    if intent == "update_dob":
-        name = parsed.get("name")
-        new_dob = parsed.get("dob")
-        matches = _find_client_matches(name)
-        choice = _confirm_or_disambiguate(matches, "update DOB", wa, "<new dob>")
-        if not choice:
-            return
-
-        cid, cname, _, _ = choice
-        with get_session() as s:
-            s.execute(
-                text("UPDATE clients SET birthday=:dob WHERE id=:cid"),
-                {"dob": new_dob, "cid": cid},
+            safe_execute(send_whatsapp_text, wa,
+                f"⚠ Could not add client '{name}'.",
+                label="add_client_fail"
             )
-        msg = (
-            f"📝 DOB updated\n\n"
-            f"Name: {cname}\n"
-            f"New DOB: {_format_dob(new_dob)}"
-        )
-        safe_execute(send_whatsapp_text, wa, msg, label="dob_updated")
         return
 
-    # ── Update Mobile ──────────────────────────────────────────
-    if intent == "update_mobile":
-        name = parsed.get("name")
-        num_entered = parsed.get("number")
-        new_mobile = normalize_wa(num_entered)
-
-        matches = _find_client_matches(name)
-        choice = _confirm_or_disambiguate(matches, "update mobile", wa, "<new mobile>")
-        if not choice:
-            return
-
-        cid, cname, _, _ = choice
-        with get_session() as s:
-            s.execute(
-                text("UPDATE clients SET wa_number=:wa, phone=:wa WHERE id=:cid"),
-                {"wa": new_mobile, "cid": cid},
-            )
-        msg = (
-            f"📱 Mobile updated\n\n"
-            f"Name: {cname}\n"
-            f"New Mobile: {num_entered}"
-        )
-        safe_execute(send_whatsapp_text, wa, msg, label="mobile_updated")
+    # ── Cancel Next ──
+    if intent == "cancel_next":
+        from .admin_bookings import cancel_next_booking
+        cancel_next_booking(parsed["name"], wa)
         return
 
-    # ── Update Name ────────────────────────────────────────────
-    if intent == "update_name":
-        old_name = parsed.get("old_name")
-        new_name = parsed.get("new_name")
-
-        matches = _find_client_matches(old_name)
-        choice = _confirm_or_disambiguate(matches, "update name", wa, f"{new_name}")
-        if not choice:
-            return
-
-        cid, cname, _, _ = choice
-        with get_session() as s:
-            s.execute(
-                text("UPDATE clients SET name=:new WHERE id=:cid"),
-                {"new": new_name, "cid": cid},
-            )
-        msg = (
-            f"✏️ Name updated\n\n"
-            f"Old Name: {cname}\n"
-            f"New Name: {new_name}"
-        )
-        safe_execute(send_whatsapp_text, wa, msg, label="name_updated")
+    # ── Sick Today ──
+    if intent == "off_sick_today":
+        from .admin_bookings import mark_today_status
+        mark_today_status(parsed["name"], "sick", wa)
         return
 
-    # ── Attendance Updates ─────────────────────────────────────
-    if intent in {"off_sick_today", "no_show_today", "cancel_next"}:
-        name = parsed.get("name")
-        status = intent.replace("_", " ")
-        admin_nudge.status_update(name, status)
+    # ── No-show ──
+    if intent == "no_show_today":
+        from .admin_bookings import mark_today_status
+        mark_today_status(parsed["name"], "no_show", wa)
         return
 
-    # ── Deactivation ──────────────────────────────────────────
+    # ── Deactivation ──
     if intent == "deactivate":
-        name = parsed.get("name")
-        admin_nudge.request_deactivate(name, wa)
+        admin_nudge.request_deactivate(parsed["name"], wa)
         return
 
     if intent == "confirm_deactivate":
-        name = parsed.get("name")
-        with get_session() as s:
-            s.execute(text("UPDATE clients SET active=false WHERE lower(name)=lower(:n)"), {"n": name.lower()})
-        admin_nudge.confirm_deactivate(name, wa)
+        admin_nudge.confirm_deactivate(parsed["name"], wa)
         return
 
     if intent == "cancel":
-        safe_execute(send_whatsapp_text, wa, "❎ Cancelled.", label="cancel")
+        safe_execute(send_whatsapp_text, wa,
+            "❌ Deactivation cancelled. No changes made.",
+            label="deactivate_cancel"
+        )
         return
 
-    # ── Fallback ──────────────────────────────────────────────
-    safe_execute(send_whatsapp_text, wa, "⚠ Unknown client command.", label="client_fallback")
+    # ── Invoices ──
+    if intent == "invoice":
+        from .admin_invoices import send_invoice_admin
+        send_invoice_admin(wa, parsed["name"], parsed.get("month"))
+        return
+
+    # ── Balances ──
+    if intent == "balance":
+        from .admin_invoices import show_balance_admin
+        show_balance_admin(wa, parsed["name"])
+        return

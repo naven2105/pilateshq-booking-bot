@@ -1,17 +1,17 @@
-# app/client_nlp.py
 """
+client_nlp.py
+──────────────
 Lightweight natural-language parsing for client shortcuts.
 Supports:
-  - View bookings: "show my bookings", "when is my next session?"
-  - Cancel bookings: "cancel next", "cancel Tue 08h00"
-  - Attendance updates: "I am sick", "cannot make it", "running late"
-  - Get invoice: "send me my invoice", "I need a statement"
-  - FAQs: "questions", "faq", "what do you offer"
-  - Contact Nadine: "speak to Nadine", "call me", "contact instructor"
+  - View bookings
+  - Cancel bookings (next / by date & time)
+  - Attendance updates (sick, cancel today, running late)
+  - Invoices
+  - FAQs / Menu
+  - Contact Nadine
 """
 
 import re
-from datetime import datetime
 
 
 def parse_client_command(text: str) -> dict | None:
@@ -20,11 +20,15 @@ def parse_client_command(text: str) -> dict | None:
 
     s = text.strip().lower()
 
+    # ── Menu ──
+    if s in {"menu", "help"}:
+        return {"intent": "menu"}
+
     # ── Bookings ──
     if re.search(r"\b(bookings?|sessions?|schedule|next session)\b", s):
         return {"intent": "show_bookings"}
 
-    # ── Cancel next session ──
+    # ── Cancel next ──
     if re.fullmatch(r"(cancel next|next cancel|cancel my next)", s):
         return {"intent": "cancel_next"}
 
@@ -41,7 +45,7 @@ def parse_client_command(text: str) -> dict | None:
     if s in {"i am sick", "sick", "not well"}:
         return {"intent": "off_sick_today"}
 
-    # ── Cannot attend / generic cancel ──
+    # ── Cannot attend ──
     if s in {"cannot make it", "cannot attend", "not coming", "skip"}:
         return {"intent": "cancel_today"}
 
@@ -51,14 +55,13 @@ def parse_client_command(text: str) -> dict | None:
 
     # ── Invoices ──
     if re.search(r"\b(invoice|statement|payment|bill)\b", s):
-        month = datetime.now().strftime("%B %Y")
-        return {"intent": "get_invoice", "month": month}
+        return {"intent": "get_invoice"}
 
     # ── FAQs ──
-    if re.search(r"\b(faq|question|help|info|information|offer)\b", s):
+    if re.search(r"\b(faq|question|info|information|offer)\b", s):
         return {"intent": "faq"}
 
-    # ── Contact Nadine / Admin ──
+    # ── Contact Nadine ──
     if re.search(r"\b(contact|speak|call|whatsapp|talk).*(nadine|instructor|admin)?\b", s):
         return {"intent": "contact_admin"}
 

@@ -2,7 +2,7 @@
 admin_core.py
 ──────────────
 Central dispatcher for admin actions.
-Delegates to bookings, clients, and notify modules.
+Delegates to bookings, clients, invoices, and notify modules.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from .utils import (
     safe_execute,
 )
 from .admin_nlp import parse_admin_command, parse_admin_client_command
-from . import admin_bookings, admin_clients
+from . import admin_bookings, admin_clients, admin_invoices
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
             "• Add New Client → type 'add new' or tap the Add Client button\n"
             "• Attendance Updates → e.g. 'Peter sick' / 'Peter no-show'\n"
             "• Deactivate Client → e.g. 'Deactivate Alice'\n"
+            "• Invoices → 'Invoice John' / 'Balance John'\n"
             "Type your command directly.",
             label="admin_menu"
         )
@@ -80,6 +81,17 @@ def handle_admin_action(from_wa: str, msg_id: Optional[str], body: str, btn_id: 
     parsed = parse_admin_client_command(text_in)
     if parsed:
         admin_clients.handle_client_command(parsed, wa)
+        return
+
+    # ─────────────── Invoices ───────────────
+    if text_in.startswith("invoice "):
+        name = text_in.split(" ", 1)[1].strip()
+        admin_invoices.send_invoice_admin(name, wa_number=None, month=None, admin_wa=wa)
+        return
+
+    if text_in.startswith("balance "):
+        name = text_in.split(" ", 1)[1].strip()
+        admin_invoices.show_balance_admin(name, wa_number=None, admin_wa=wa)
         return
 
     # ─────────────── Fallback ───────────────
