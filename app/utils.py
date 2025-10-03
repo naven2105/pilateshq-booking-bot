@@ -37,11 +37,6 @@ def _send_to_meta(payload: dict) -> tuple:
 def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) -> dict:
     """
     Send a WhatsApp template by name/language with body variables.
-    Args:
-        to: Target WhatsApp number in 27... format
-        name: Template name (must be approved in Meta)
-        lang: Language code (e.g. 'en_US')
-        variables: List of strings mapped to {{1}}, {{2}}, etc.
     """
     components = [{
         "type": "body",
@@ -80,19 +75,12 @@ def send_whatsapp_text(to: str, text: str) -> dict:
 def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form", prefill: dict | None = None) -> dict:
     """
     Send a WhatsApp interactive Flow message.
-    Args:
-        to: Target WhatsApp number (27...)
-        flow_id: Published Flow ID from Meta
-        flow_cta: Button label (e.g. 'Add New Client')
-        prefill: Optional dict of pre-filled values, e.g.
-                 {"Client Name": "John Doe", "Mobile": "0735534607"}
     """
     action_params = {
         "flow_id": flow_id,
         "flow_cta": flow_cta,
-        "flow_message_version": "3",   # ✅ required
+        "flow_message_version": "3",
     }
-
     if prefill:
         action_params["flow_action_payload"] = {"screen_0": prefill}
 
@@ -102,23 +90,40 @@ def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form", prefi
         "type": "interactive",
         "interactive": {
             "type": "flow",
-            "header": {
-                "type": "text",
-                "text": "New Client Registration"
-            },
-            "body": {
-                "text": "Please complete this form to register a new client."
-            },
-            "footer": {
-                "text": "PilatesHQ"
-            },
-            "action": {
-                "name": "flow",
-                "parameters": action_params
-            }
-        }
+            "header": {"type": "text", "text": "New Client Registration"},
+            "body": {"text": "Please complete this form to register a new client."},
+            "footer": {"text": "PilatesHQ"},
+            "action": {"name": "flow", "parameters": action_params},
+        },
     }
 
+    ok, status, body = _send_to_meta(payload)
+    return {"ok": ok, "status_code": status, "response": body}
+
+
+def send_whatsapp_button(to: str, text: str, buttons: list[dict]) -> dict:
+    """
+    Send a WhatsApp interactive button message.
+    Example:
+        send_whatsapp_button("2773...", "Confirm?", [
+            {"id": "reject_123", "title": "❌ Reject"}
+        ])
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": text},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                    for b in buttons
+                ]
+            },
+        },
+    }
     ok, status, body = _send_to_meta(payload)
     return {"ok": ok, "status_code": status, "response": body}
 
@@ -141,8 +146,6 @@ def safe_execute(func, *args, label: str = "", **kwargs):
     """
     Wrapper to safely execute any function.
     Logs success/failure without breaking the bot flow.
-    Example:
-        safe_execute(send_whatsapp_text, wa, "Hello", label="welcome_prompt")
     """
     try:
         result = func(*args, **kwargs)
