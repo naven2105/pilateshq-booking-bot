@@ -2,7 +2,9 @@
 from __future__ import annotations
 import logging
 from flask import Flask
-from app.router import router_bp
+
+# Import blueprints
+from app.router_webhook import router_bp   # ✅ new split router
 from app.diag import diag_bp
 from app.tasks import register_tasks
 
@@ -12,7 +14,7 @@ logging.basicConfig(
 )
 logging.getLogger("werkzeug").setLevel(logging.INFO)
 
-# Create Flask app (single entrypoint for dev + prod)
+# ── Create Flask app (single entrypoint for dev + prod) ──
 app: Flask = Flask(__name__)
 
 # Register blueprints
