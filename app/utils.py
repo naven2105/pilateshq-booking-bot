@@ -1,7 +1,7 @@
-#app/utils.py
 import logging
 import requests
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) 
     """
     components = [{
         "type": "body",
-        "parameters": [{"type": "text", "text": str(v)} for v in variables],
+        "parameters": [{"type": "text", "text": sanitize_param(str(v))} for v in variables],
     }]
 
     payload = {
@@ -155,3 +155,17 @@ def safe_execute(func, *args, label: str = "", **kwargs):
     except Exception as e:
         logger.exception(f"[SAFE EXEC FAIL] {label} args={args} kwargs={kwargs}: {e}")
         return None
+
+
+def sanitize_param(text: str) -> str:
+    """
+    Clean a string for WhatsApp template variables:
+      - Remove newlines/tabs
+      - Collapse multiple spaces
+      - Trim leading/trailing spaces
+    """
+    if not text:
+        return ""
+    clean = re.sub(r"[\n\t]+", " ", text)       # replace newlines/tabs with space
+    clean = re.sub(r"\s{2,}", " ", clean)       # collapse multiple spaces
+    return clean.strip()

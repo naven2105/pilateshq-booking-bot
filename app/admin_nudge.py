@@ -14,6 +14,7 @@ from .utils import safe_execute, send_whatsapp_template
 from .db import get_session
 from sqlalchemy import text
 import os
+import re
 
 log = logging.getLogger(__name__)
 
@@ -51,10 +52,24 @@ def _format_dob(dob: str | None) -> str | None:
         return dob
 
 
+def _sanitize_param(text: str) -> str:
+    """
+    Meta template vars cannot contain newlines, tabs, or >4 spaces.
+    This helper flattens and cleans text.
+    """
+    if not text:
+        return ""
+    # Replace newlines/tabs with spaces
+    clean = re.sub(r"[\n\t]+", " ", text)
+    # Collapse multiple spaces
+    clean = re.sub(r"\s{2,}", " ", clean)
+    return clean.strip()
+
+
 # ── Prospect Alert (with Add Client button) ──
 def prospect_alert(name: str, wa_number: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    body_text = f'{name} ({wa_number}) at {ts}'
+    body_text = _sanitize_param(f'{name} ({wa_number}) at {ts}')
     log.info(f"[ADMIN NUDGE] Prospect alert → {body_text}")
 
     # Use Meta-approved template with 1 variable
@@ -73,36 +88,64 @@ def prospect_alert(name: str, wa_number: str):
 # ── Booking Update ──
 def booking_update(name: str, session_type: str, day: str, time: str, dob: str | None = None, health: str | None = None):
     msg = (
-        f"✅ Booking Added\n"
-        f"{name} ({session_type.title()})\n"
-        f"Recurring: {day} at {time}"
+        f"✅ Booking Added — {name} ({session_type.title()}), Recurring: {day} at {time}"
     )
 
     dob_fmt = _format_dob(dob)
     if dob_fmt:
-        msg += f"\nDOB: {dob_fmt}"
+        msg += f", DOB: {dob_fmt}"
     if health:
-        msg += f"\nHealth: {health}"
+        msg += f", Health: {health}"
 
-    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="booking_update")
+    msg = _sanitize_param(msg)
+
+    safe_execute(
+        send_whatsapp_template,
+        NADINE_WA,
+        "admin_update_us",
+        TEMPLATE_LANG,
+        [msg],
+        label="booking_update"
+    )
     _log_notification("booking_update", msg)
 
 
 # ── Attendance Status ──
 def status_update(name: str, status: str):
-    msg = f"⚠️ {name} marked as {status.upper()} today."
-    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="status_update")
+    msg = _sanitize_param(f"⚠️ {name} marked as {status.upper()} today.")
+    safe_execute(
+        send_whatsapp_template,
+        NADINE_WA,
+        "admin_update_us",
+        TEMPLATE_LANG,
+        [msg],
+        label="status_update"
+    )
     _log_notification("status_update", msg)
 
 
 # ── Deactivation ──
 def request_deactivate(name: str, wa: str):
-    msg = f"❔ Deactivation requested for {name}. Confirm?"
-    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="request_deactivate")
+    msg = _sanitize_param(f"❔ Deactivation requested for {name}. Confirm?")
+    safe_execute(
+        send_whatsapp_template,
+        NADINE_WA,
+        "admin_update_us",
+        TEMPLATE_LANG,
+        [msg],
+        label="request_deactivate"
+    )
     _log_notification("request_deactivate", msg)
 
 
 def confirm_deactivate(name: str, wa: str):
-    msg = f"✅ Client {name} has been deactivated."
-    safe_execute(send_whatsapp_template, NADINE_WA, "admin_update_us", TEMPLATE_LANG, [msg], label="confirm_deactivate")
+    msg = _sanitize_param(f"✅ Client {name} has been deactivated.")
+    safe_execute(
+        send_whatsapp_template,
+        NADINE_WA,
+        "admin_update_us",
+        TEMPLATE_LANG,
+        [msg],
+        label="confirm_deactivate"
+    )
     _log_notification("confirm_deactivate", msg)

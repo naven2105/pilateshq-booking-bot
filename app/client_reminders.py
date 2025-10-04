@@ -10,6 +10,7 @@ from .db import get_session
 from .models import Client, Session, Booking
 from . import utils
 from .config import TEMPLATE_LANG
+from .utils import sanitize_param
 
 log = logging.getLogger(__name__)
 
@@ -22,9 +23,6 @@ def _fmt_hhmm(t: time) -> str:
 
 def _fmt_item(d: date, t: time) -> str:
     return f"{d.strftime('%a %d %b')} {t.strftime('%H:%M')}"
-
-def _clean_one_line(s: str) -> str:
-    return " ".join((s or "").split())
 
 def _lang_candidates(preferred: str | None) -> List[str]:
     cand = [x for x in [preferred, "en", "en_US"] if x]
@@ -46,7 +44,7 @@ def _send_template_with_fallback(
             to=to,
             name=template,
             lang=lang,
-            variables=list(variables.values()),
+            variables=[sanitize_param(v) for v in variables.values()],
         )
         ok = resp.get("ok", False)
         status = resp.get("status_code")
@@ -169,16 +167,15 @@ def run_client_weekly(window_days: int = 7) -> int:
                 items_list = [_fmt_item(d, t) for d, t in bookings]
                 items_str = " • ".join(items_list)
             else:
-                items_str = ("No sessions booked this week — "
-                             "we miss you at the studio! Reply BOOK to grab a spot.")
-
-            items_str = _clean_one_line(items_str)
-            name_str = _clean_one_line(c.name or "there")
+                items_str = (
+                    "No sessions booked this week — "
+                    "we miss you at the studio! Reply BOOK to grab a spot."
+                )
 
             ok = _send_template_with_fallback(
                 to=c.wa_number,
                 template="client_weekly_schedule_us",
-                variables={"1": name_str, "2": items_str},
+                variables={"1": c.name or "there", "2": items_str},
                 preferred_lang=TEMPLATE_LANG,
             )
             sent += 1 if ok else 0
