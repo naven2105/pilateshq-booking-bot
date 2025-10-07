@@ -1,17 +1,19 @@
+# app/router_client.py
 """
 router_client.py
 ────────────────
 Handles client messages (non-admin).
 Delegates to client_commands (bookings, cancel, message Nadine).
+Now defaults to the interactive FAQ menu for unrecognised messages.
 """
 
 import logging
 from flask import jsonify
 from . import client_commands
-from .prospect import CLIENT_MENU
 from .utils import send_whatsapp_text, safe_execute
 from .db import get_session
 from sqlalchemy import text
+from .client_faqs import handle_faq_message, handle_faq_button  # ✅ FAQ integration
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +33,20 @@ def client_get(wa: str):
 def handle_client(msg, wa: str, text_in: str, client: dict):
     """Handle messages from registered clients."""
     txt = text_in.strip().lower()
+    msg_type = msg.get("type")
 
+    # ── Handle interactive FAQ buttons
+    if msg_type == "button":
+        button_id = msg["button"]["payload"]
+        if handle_faq_button(wa, button_id):
+            return jsonify({"status": "ok", "role": "client_faq_button"}), 200
+
+    # ── Handle FAQ trigger words
+    if any(k in txt for k in ["faq", "faqs", "help", "questions"]):
+        handle_faq_message(wa, txt)
+        return jsonify({"status": "ok", "role": "client_faq"}), 200
+
+    # ── Recognised booking and admin-type commands
     if txt in ["bookings", "my bookings", "sessions"]:
         client_commands.show_bookings(wa)
         return jsonify({"status": "ok", "role": "client_bookings"}), 200
@@ -52,6 +67,6 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
         client_commands.message_nadine(wa, client["name"], msg_out)
         return jsonify({"status": "ok", "role": "client_message"}), 200
 
-    # Default → client menu
-    safe_execute(send_whatsapp_text, wa, CLIENT_MENU.format(name=client["name"]))
-    return jsonify({"status": "ok", "role": "client_menu"}), 200
+    # ── Default: unknown message → trigger FAQ menu instead of static menu
+    handle_faq_message(wa, "faq")
+    return jsonify({"status": "ok", "role": "client_faq_default"}), 200

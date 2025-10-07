@@ -4,6 +4,7 @@ client_faqs.py
 ──────────────────────────────────────────
 WhatsApp interactive FAQ menu for PilatesHQ clients.
 Triggered when user types 'faq', 'faqs', or 'help'.
+Includes 'Back to Menu' button for easy navigation.
 """
 
 import re
@@ -11,7 +12,7 @@ from .utils import send_whatsapp_text, send_whatsapp_interactive
 
 FAQ_KEYWORDS = ["faq", "faqs", "help", "questions"]
 
-BACK_NOTE = "\n\n🔙 Type *FAQ* anytime to view all topics again."
+BACK_BUTTON = [{"id": "faq_menu", "title": "🔙 Back to Menu"}]
 
 FAQ_ANSWERS = {
     "faq_bookings": (
@@ -20,7 +21,6 @@ FAQ_ANSWERS = {
         "👉 'Book tomorrow 08h00 single'\n"
         "To cancel, message 'Cancel Tuesday 08h00'.\n"
         "Please give at least 6 hours’ notice for cancellations 🙏."
-        + BACK_NOTE
     ),
     "faq_payments": (
         "💰 *Payments*\n"
@@ -28,20 +28,17 @@ FAQ_ANSWERS = {
         "Single = R300 | Duo = R250 | Group = R180\n"
         "Bank: Absa | Account: 4117151887 | Ref: Your Name\n"
         "Invoices are automatically sent monthly via WhatsApp 📑."
-        + BACK_NOTE
     ),
     "faq_classes": (
         "🤸 *Classes*\n"
         "All sessions are 55 minutes. Bring a towel and grip socks.\n"
         "Reformer sessions focus on strength, balance, posture, and rehab support."
-        + BACK_NOTE
     ),
     "faq_studio": (
         "🏠 *Studio Info*\n"
         "Address: 71 Grant Avenue, Norwood\n"
         "Adequate Parking at the Spar 🚗\n"
         "Hours: Mon–Fri 07h30–18h00 | Sat 07h30–12h00 | Sun 07h30–12h00"
-        + BACK_NOTE
     ),
 }
 
@@ -72,7 +69,17 @@ def _send_faq_menu(wa_number: str):
 
 def handle_faq_button(wa_number: str, button_id: str):
     """Handle button click from FAQ interactive message."""
-    if button_id in FAQ_ANSWERS:
-        send_whatsapp_text(wa_number, FAQ_ANSWERS[button_id])
+    if button_id == "faq_menu":
+        _send_faq_menu(wa_number)
         return True
+
+    if button_id in FAQ_ANSWERS:
+        # Send answer with a 'Back to Menu' button
+        send_whatsapp_interactive(
+            wa_number,
+            FAQ_ANSWERS[button_id],
+            BACK_BUTTON
+        )
+        return True
+
     return False
