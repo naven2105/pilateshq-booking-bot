@@ -91,3 +91,8 @@ def webhook():
     except Exception as e:
         print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
+
+@router_bp.route("/", methods=["GET"])
+def health():
+    """Simple health check endpoint for Render uptime probe."""
+    return jsonify({"status": "ok", "service": "PilatesHQ Booking Bot"}), 200
