@@ -1,134 +1,62 @@
-#app/router_webhook.py
 """
-Main Flask Webhook Router — Database-Free Version
--------------------------------------------------
-Handles all incoming WhatsApp messages:
-• Detects RESCHEDULE replies
-• Forwards them to Google Apps Script
-• Sends confirmations & admin alerts
-• Looks up client names via Google Sheets API (no Postgres required)
+router_webhook.py
+Handles incoming Meta Webhook events (GET verify + POST messages).
+Forwards “RESCHEDULE” to Google Apps Script and triggers admin notifications.
 """
 
 import os
-import json
-import logging
 import requests
-from flask import Blueprint, request, current_app, jsonify
-from .utils import send_whatsapp_text
-from .admin_nudge import notify_new_lead
-from .reschedule_forwarder import forward_reschedule
+from flask import Blueprint, request, jsonify
+from render_backend.app.admin_nudge import notify_new_lead
+from render_backend.app.utils import send_whatsapp_template
 
 router_bp = Blueprint("router_bp", __name__)
-log = logging.getLogger(__name__)
 
-# ─── Environment Variables ────────────────────────────────────────
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
-GOOGLE_SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")  # for Sheets API public access
+VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+APPS_SCRIPT_URL = f"https://script.googleapis.com/v1/scripts/{GOOGLE_API_KEY}:run"
 
-# ─────────────────────────────────────────────────────────────
-# 🔐 Meta Webhook Verification (GET)
-# ─────────────────────────────────────────────────────────────
+
+# ───────────────────────────────
+# META VERIFICATION HANDSHAKE
+# ───────────────────────────────
 @router_bp.route("/webhook", methods=["GET"])
-def verify_token():
-    verify_token = request.args.get("hub.verify_token")
+def verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    if verify_token == META_VERIFY_TOKEN:
-        log.info("[Webhook] Verified successfully.")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
         return challenge, 200
-    log.warning("[Webhook] Verification failed.")
     return "Forbidden", 403
 
 
-# ─────────────────────────────────────────────────────────────
-# 📄 Google Sheets Client Name Lookup
-# ─────────────────────────────────────────────────────────────
-def lookup_client_name(wa_number: str):
-    """
-    Looks up client name from Google Sheets instead of Postgres.
-    Sheet structure:
-      Column A = Name
-      Column B = WhatsApp number (e.g., 27735534607)
-    """
-    if not GOOGLE_SHEET_ID or not GOOGLE_API_KEY:
-        log.warning("[Lookup] Missing Google Sheet config.")
-        return "Unknown"
-
-    try:
-        url = (
-            f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/"
-            f"PilatesHQ Clients!A:B?key={GOOGLE_API_KEY}"
-        )
-        res = requests.get(url, timeout=10)
-        res.raise_for_status()
-        values = res.json().get("values", [])[1:]  # skip header
-        for row in values:
-            if len(row) >= 2 and row[1].replace(" ", "") == wa_number:
-                return row[0]
-        return "Unknown"
-    except Exception as e:
-        log.error(f"[Lookup] Failed: {e}")
-        return "Unknown"
-
-
-# ─────────────────────────────────────────────────────────────
-# 📩 Incoming Message Handler (POST)
-# ─────────────────────────────────────────────────────────────
+# ───────────────────────────────
+# META MESSAGE HANDLER
+# ───────────────────────────────
 @router_bp.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    if not data:
-        return "No data", 400
-
-    log.info(f"[Webhook] Incoming payload: {json.dumps(data)[:400]}")
+    data = request.get_json(force=True)
+    print("📩 Webhook received:", data)
 
     try:
-        changes = data.get("entry", [])[0].get("changes", [])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return "ok", 200
+        entry = data.get("entry", [])[0]
+        changes = entry.get("changes", [])[0]
+        message = changes["value"]["messages"][0]
+        wa_number = message["from"]
+        msg_text = message["text"]["body"].strip().lower()
 
-        msg = messages[0]
-        from_number = msg.get("from")
-        msg_type = msg.get("type")
-        text_body = (msg.get("text", {}).get("body") or "").strip()
-        text_upper = text_body.upper()
+        # Forward RESCHEDULE to Apps Script
+        if "reschedule" in msg_text:
+            requests.post(APPS_SCRIPT_URL, json={"function": "handleReschedule", "parameters": [wa_number]})
+            return jsonify({"status": "forwarded to Apps Script"}), 200
 
-        log.info(f"[Webhook] From {from_number}: {text_body}")
+        # Treat unknown numbers as new leads
+        if msg_text not in ("hi", "hello"):
+            notify_new_lead(name="Unknown", wa_number=wa_number)
 
-        # ─── RESCHEDULE detection ─────────────────────────────
-        if text_upper == "RESCHEDULE":
-            client_name = lookup_client_name(from_number)
-            forward_reschedule(client_name, from_number)
-            send_whatsapp_text(
-                from_number,
-                "🔄 Got it! Nadine has been notified and will contact you to reschedule soon 💜",
-            )
-            return "ok", 200
-
-        # ─── New Prospect or Greeting ─────────────────────────
-        if any(x in text_body.lower() for x in ["hi", "hello", "hey"]):
-            notify_new_lead(from_number, text_body)
-            return "ok", 200
-
-        # ─── Booking command placeholder ──────────────────────
-        if text_upper.startswith("BOOK "):
-            send_whatsapp_text(
-                from_number,
-                "📘 Got your booking request — Nadine will confirm shortly!",
-            )
-            return "ok", 200
-
-        # ─── Default fallback ─────────────────────────────────
-        send_whatsapp_text(
-            from_number,
-            "💬 Thank you! Your message has been received — Nadine will respond soon.",
-        )
-        return "ok", 200
+        return jsonify({"status": "processed"}), 200
 
     except Exception as e:
-        log.exception(f"[Webhook] Error: {e}")
+        print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
