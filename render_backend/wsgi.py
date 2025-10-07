@@ -1,4 +1,4 @@
-# app/wsgi.py
+# render_backend/wsgi.py
 from __future__ import annotations
 import logging
 from flask import Flask
@@ -7,6 +7,9 @@ from flask import Flask
 from app.router_webhook import router_bp   # ✅ new split router
 from app.diag import diag_bp
 from app.tasks import register_tasks
+
+import os
+print("📂 Current working directory:", os.getcwd())
 
 logging.basicConfig(
     level=logging.INFO,
