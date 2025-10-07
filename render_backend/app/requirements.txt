@@ -1,18 +1,10 @@
-# requirements.txt
+# === PilatesHQ WhatsApp Bot (Optimised) ===
 Flask==3.0.3
-requests==2.32.3
 gunicorn==22.0.0
+requests==2.32.3
 SQLAlchemy==2.0.35
-
-# PostgreSQL driver
-psycopg2-binary>=2.9   # safe drop-in, matches SQLAlchemy default
-
-# AI
+psycopg2-binary>=2.9
+python-dotenv>=1.0.1
+reportlab>=4.0.4
 openai>=1.0.0
-
-# PDF generation
-reportlab>=4.0.0
-
-# Optional: better logging / scheduling
-python-dotenv>=1.0.1   # load env files locally
-apscheduler>=3.10.4    # if you want scheduled tasks in-app
+openpyxl==3.1.2  # Optional, keep only if needed
