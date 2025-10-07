@@ -30,6 +30,7 @@ def verify():
     if mode == "subscribe" and token == VERIFY_TOKEN:
         print("✅ Meta webhook verified successfully.")
         return challenge, 200
+
     print("❌ Meta webhook verification failed.")
     return "Forbidden", 403
 
@@ -44,47 +45,48 @@ def webhook():
     print("📩 Webhook received:", data)
 
     try:
-        entry = data.get("entry", [])[0]
-        change = entry.get("changes", [])[0]
+        # Validate expected structure
+        entry = (data.get("entry") or [{}])[0]
+        change = (entry.get("changes") or [{}])[0]
         value = change.get("value", {})
 
-        # Case 1 — Incoming client message
+        # ── Case 1: Status update (sent, delivered, failed) ────────────────
+        if "statuses" in value:
+            status_info = value["statuses"][0]
+            msg_id = status_info.get("id")
+            msg_status = status_info.get("status")
+            recipient = status_info.get("recipient_id")
+
+            print(f"📬 Status update: {msg_id} → {msg_status} (to {recipient})")
+
+            if status_info.get("errors"):
+                for err in status_info["errors"]:
+                    print(f"⚠️ WhatsApp Error {err.get('code')}: {err.get('message')}")
+                    print(f"   Details: {err.get('error_data', {}).get('details')}")
+            return jsonify({"status": "status event logged"}), 200
+
+        # ── Case 2: New incoming message ──────────────────────────────────
         if "messages" in value:
             msg = value["messages"][0]
             wa_number = msg.get("from", "")
             msg_text = msg.get("text", {}).get("body", "").strip().lower()
+
             print(f"💬 Incoming message from {wa_number}: {msg_text}")
 
-            # Forward reschedule request to Apps Script
+            # Forward RESCHEDULE requests to Apps Script
             if "reschedule" in msg_text:
                 payload = {"function": "handleReschedule", "parameters": [wa_number]}
                 requests.post(APPS_SCRIPT_URL, json=payload)
                 print(f"🔁 Forwarded 'reschedule' to Apps Script for {wa_number}")
                 return jsonify({"status": "forwarded"}), 200
 
-            # Otherwise, treat as new lead
+            # Notify Nadine for new lead
             notify_new_lead(name="Unknown", wa_number=wa_number)
             return jsonify({"status": "message processed"}), 200
 
-        # Case 2 — Status update (sent, delivered, failed)
-        elif "statuses" in value:
-            status_info = value["statuses"][0]
-            msg_id = status_info.get("id")
-            msg_status = status_info.get("status")
-            recipient = status_info.get("recipient_id")
-            print(f"📬 Status update: {msg_id} → {msg_status} (to {recipient})")
-
-            # Log error detail if present
-            if status_info.get("errors"):
-                for err in status_info["errors"]:
-                    print(f"⚠️ WhatsApp Error {err.get('code')}: {err.get('message')} - {err.get('error_data', {})}")
-
-            return jsonify({"status": "status event logged"}), 200
-
-        # Case 3 — Unknown or unsupported webhook structure
-        else:
-            print("⚠️ Unknown webhook event type received:", value)
-            return jsonify({"status": "ignored"}), 200
+        # ── Case 3: Unknown event type ────────────────────────────────────
+        print("⚠️ Unknown webhook event type received:", value)
+        return jsonify({"status": "ignored"}), 200
 
     except Exception as e:
         print("❌ Webhook error:", e)
