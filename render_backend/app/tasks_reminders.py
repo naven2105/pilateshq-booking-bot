@@ -15,8 +15,8 @@ tasks_bp = Blueprint("tasks_bp", __name__)
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
-TPL_ADMIN_MORNING = "tpl_admin_morning"
-TPL_ADMIN_20H00 = "tpl_admin_20h00"
+TPL_ADMIN_MORNING = "admin_morning_us"
+TPL_ADMIN_20H00 = "admin_20h00_us"
 
 
 @tasks_bp.route("/tasks/run-reminders", methods=["POST"])
