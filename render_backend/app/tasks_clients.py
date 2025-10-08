@@ -41,18 +41,14 @@ def fetch_sessions():
 
 
 def update_reminder_sent(row_index: int):
-    """Write timestamp to column G for that session row."""
+    """Write timestamp to Google Sheet via Apps Script."""
     try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        url = SHEET_WRITE_URL.format(row=row_index + 2)  # +2: header + 0-index
-        body = {"range": f"Sessions!G{row_index+2}",
-                "majorDimension": "ROWS",
-                "values": [[timestamp]]}
-        res = requests.put(url, json=body, timeout=10)
-        print(f"📝 Updated reminder_sent_at row {row_index+2}: {res.status_code}")
+        script_url = os.getenv("APPS_SCRIPT_WEBHOOK_URL")
+        body = {"function": "updateReminderSent", "parameters": [row_index + 2]}
+        res = requests.post(script_url, json=body, timeout=10)
+        print(f"📝 Updated via Apps Script row {row_index+2}: {res.status_code}")
     except Exception as e:
-        print(f"⚠️ Failed to update reminder_sent_at for row {row_index+2}: {e}")
-
+        print(f"⚠️ Failed to update via Apps Script row {row_index+2}: {e}")
 
 def parse_sessions(values, target_date, reminder_type):
     """Filter sessions by date, time, and status."""
