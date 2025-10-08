@@ -1,11 +1,11 @@
-# File: render_backend/app/tasks_clients.py
 """
 tasks_clients.py
 ────────────────────────────────────────────
 Handles client reminders:
  - Tomorrow’s session reminder
  - Next-hour reminder
-Fetches and filters session data from Google Sheets.
+Fetches and filters session data from Google Sheets,
+and writes back "reminder sent" timestamps.
 """
 
 import os
@@ -24,19 +24,34 @@ TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 TPL_TOMORROW = "client_session_tomorrow_us"
 TPL_NEXT_HOUR = "client_session_next_hour_us"
 
-SHEET_URL = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Sessions!A:F?key={GOOGLE_API_KEY}"
+SHEET_READ_URL = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Sessions!A:G?key={GOOGLE_API_KEY}"
+SHEET_WRITE_URL = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/Sessions!G{{row}}?valueInputOption=USER_ENTERED&key={GOOGLE_API_KEY}"
 
 
 # ─────────────────────────────────────────────────────
 def fetch_sessions():
     """Fetch all session rows from Google Sheets."""
     try:
-        r = requests.get(SHEET_URL, timeout=10)
+        r = requests.get(SHEET_READ_URL, timeout=10)
         r.raise_for_status()
         return r.json().get("values", [])[1:]  # skip header
     except Exception as e:
-        print("❌ Failed to fetch sessions from Sheets:", e)
+        print("❌ Failed to fetch sessions:", e)
         return []
+
+
+def update_reminder_sent(row_index: int):
+    """Write timestamp to column G for that session row."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        url = SHEET_WRITE_URL.format(row=row_index + 2)  # +2: header + 0-index
+        body = {"range": f"Sessions!G{row_index+2}",
+                "majorDimension": "ROWS",
+                "values": [[timestamp]]}
+        res = requests.put(url, json=body, timeout=10)
+        print(f"📝 Updated reminder_sent_at row {row_index+2}: {res.status_code}")
+    except Exception as e:
+        print(f"⚠️ Failed to update reminder_sent_at for row {row_index+2}: {e}")
 
 
 def parse_sessions(values, target_date, reminder_type):
@@ -44,9 +59,8 @@ def parse_sessions(values, target_date, reminder_type):
     sessions = []
     now = datetime.now()
 
-    for row in values:
+    for i, row in enumerate(values):
         try:
-            # Expect: [date, name, wa_number, time, status]
             session_date = datetime.strptime(row[0], "%Y-%m-%d").date()
             if str(session_date) != target_date:
                 continue
@@ -56,19 +70,16 @@ def parse_sessions(values, target_date, reminder_type):
             time_str = row[3].strip()
             status = row[4].lower().strip() if len(row) > 4 else "confirmed"
 
-            # Skip cancelled / rescheduled
             if status not in ["confirmed", "active"]:
-                print(f"🚫 Skipped {name} ({status})")
                 continue
 
-            # Skip past sessions (for same-day reminders)
             if reminder_type == "next-hour":
                 session_time = datetime.strptime(time_str, "%H:%M").time()
                 if datetime.combine(session_date, session_time) < now:
-                    print(f"⏩ Skipped past session for {name} at {time_str}")
                     continue
 
             sessions.append({
+                "index": i,
                 "name": name,
                 "wa_number": wa_number,
                 "time": time_str,
@@ -83,7 +94,7 @@ def parse_sessions(values, target_date, reminder_type):
 # ─────────────────────────────────────────────────────
 @tasks_clients_bp.route("/tasks/client-reminders", methods=["POST"])
 def client_reminders():
-    """Send reminders to clients for tomorrow or next-hour sessions."""
+    """Send reminders and mark as sent."""
     data = request.get_json(force=True)
     reminder_type = (data or {}).get("type", "tomorrow").lower()
     print(f"📅 Client reminder trigger received: {reminder_type}")
@@ -95,12 +106,8 @@ def client_reminders():
     today = datetime.now().date()
     tomorrow = today + timedelta(days=1)
 
-    if reminder_type == "tomorrow":
-        target_date = str(tomorrow)
-        template_name = TPL_TOMORROW
-    else:
-        target_date = str(today)
-        template_name = TPL_NEXT_HOUR
+    target_date = str(tomorrow) if reminder_type == "tomorrow" else str(today)
+    template_name = TPL_TOMORROW if reminder_type == "tomorrow" else TPL_NEXT_HOUR
 
     sessions = parse_sessions(values, target_date, reminder_type)
     print(f"🧾 Filtered {len(sessions)} sessions for {target_date}")
@@ -113,6 +120,8 @@ def client_reminders():
             lang=TEMPLATE_LANG,
             variables=[s["time"]]
         )
+        if result.get("ok"):
+            update_reminder_sent(s["index"])
         sent.append({
             "name": s["name"],
             "ok": result.get("ok"),
