@@ -1,4 +1,3 @@
-# render_backend/wsgi.py
 """
 wsgi.py
 ────────────────────────────────────────────
@@ -7,18 +6,22 @@ Initialises the Flask app and registers routes.
 """
 
 from flask import Flask, jsonify
+
+# Import blueprints
 from render_backend.app.router_webhook import router_bp
 from render_backend.app.tasks_reminders import tasks_bp
+from render_backend.app.tasks_clients import tasks_clients_bp
 
 
 def create_app():
     app = Flask(__name__)
 
-    # ── Register Blueprints ────────────────────────────────────────────────
+    # Register blueprints
     app.register_blueprint(router_bp)
     app.register_blueprint(tasks_bp)
+    app.register_blueprint(tasks_clients_bp)
 
-    # ── Health check for Render uptime probes ───────────────────────────────
+    # ── Health check for Render uptime probes ─────────────
     @app.route("/", methods=["GET"])
     def health():
         """Simple health check endpoint."""
@@ -31,7 +34,7 @@ def create_app():
     return app
 
 
-# ── Gunicorn Entrypoint ────────────────────────────────────────────────────
+# Gunicorn entrypoint
 app = create_app()
 
 if __name__ == "__main__":

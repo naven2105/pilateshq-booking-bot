@@ -1,3 +1,4 @@
+#render_backend/app/router_webhook.py
 """
 router_webhook.py
 ────────────────────────────────────────────
@@ -9,13 +10,15 @@ import os
 import requests
 from flask import Blueprint, request, jsonify
 from render_backend.app.admin_nudge import notify_new_lead
+from render_backend.app.utils import send_whatsapp_template
 
 router_bp = Blueprint("router_bp", __name__)
 
+# ── Environment variables ────────────────────────────────────────────────
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-APPS_SCRIPT_URL = f"https://script.googleapis.com/v1/scripts/{GOOGLE_API_KEY}:run"
-
+APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
+NADINE_WA = os.getenv("NADINE_WA", "")
+TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
 # ───────────────────────────────
 # META VERIFICATION HANDSHAKE
@@ -70,17 +73,40 @@ def webhook():
             msg = value["messages"][0]
             wa_number = msg.get("from", "")
             msg_text = msg.get("text", {}).get("body", "").strip().lower()
+            name = msg.get("profile", {}).get("name", "Unknown")
 
             print(f"💬 Incoming message from {wa_number}: {msg_text}")
 
-            # Forward RESCHEDULE requests to Apps Script
+            # ── Handle RESCHEDULE keyword ────────────────────────────────
             if "reschedule" in msg_text:
-                payload = {"function": "handleReschedule", "parameters": [wa_number]}
-                requests.post(APPS_SCRIPT_URL, json=payload)
-                print(f"🔁 Forwarded 'reschedule' to Apps Script for {wa_number}")
-                return jsonify({"status": "forwarded"}), 200
+                print(f"🔁 Reschedule request from {name} ({wa_number})")
 
-            # Notify Nadine for new lead
+                # 1️⃣ Forward to Google Apps Script
+                if APPS_SCRIPT_URL:
+                    try:
+                        forward_payload = {
+                            "wa_number": wa_number,
+                            "name": name,
+                            "message": msg_text,
+                        }
+                        r = requests.post(APPS_SCRIPT_URL, json=forward_payload, timeout=10)
+                        print(f"📤 Forwarded to Apps Script → status {r.status_code}")
+                    except Exception as e:
+                        print(f"❌ Failed to forward RESCHEDULE → {e}")
+
+                # 2️⃣ Notify Nadine via WhatsApp template
+                if NADINE_WA:
+                    send_whatsapp_template(
+                        to=NADINE_WA,
+                        name="admin_generic_alert_us",
+                        lang=TEMPLATE_LANG,
+                        variables=[f"Client {name} ({wa_number}) requested to reschedule."]
+                    )
+                    print("📲 Sent admin alert to Nadine.")
+
+                return jsonify({"status": "reschedule handled"}), 200
+
+            # ── Default: New lead message ─────────────────────────────────
             notify_new_lead(name="Unknown", wa_number=wa_number)
             return jsonify({"status": "message processed"}), 200
 
@@ -92,6 +118,10 @@ def webhook():
         print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
 
+
+# ───────────────────────────────
+# HEALTH CHECK ENDPOINT
+# ───────────────────────────────
 @router_bp.route("/", methods=["GET"])
 def health():
     """Simple health check endpoint for Render uptime probe."""
