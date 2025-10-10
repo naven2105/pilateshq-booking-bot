@@ -8,9 +8,9 @@ import logging
 import os
 from flask import Flask
 
-# Import the new split router blueprint
+# ── Import Blueprints ──
 from .router_webhook import router_bp
-
+from .client_reminders import bp as client_reminders_bp  # ⬅️ NEW import
 
 def create_app():
     """Flask application factory."""
@@ -25,5 +25,6 @@ def create_app():
 
     # ── Register blueprints ──
     app.register_blueprint(router_bp)
+    app.register_blueprint(client_reminders_bp, url_prefix="/tasks")  # ⬅️ NEW route
 
     return app
