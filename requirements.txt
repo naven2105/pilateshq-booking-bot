@@ -1,10 +1,13 @@
-# === PilatesHQ WhatsApp Bot (Optimised) ===
+# booking/requirements.txt
+# === PilatesHQ WhatsApp Bot – Google Sheets Edition ===
+# Clean version with no database dependencies.
+
 Flask==3.0.3
 gunicorn==22.0.0
 requests==2.32.3
-SQLAlchemy==2.0.35
-psycopg2-binary>=2.9
 python-dotenv>=1.0.1
-reportlab>=4.0.4
-openai>=1.0.0
-openpyxl==3.1.2  # Optional, keep only if needed
+
+# Optional (keep only if used elsewhere)
+reportlab>=4.0.4      # For PDF generation
+openai>=1.0.0         # For GPT-based messaging or analysis
+openpyxl==3.1.2       # For reading/writing Excel sheets
