@@ -1,9 +1,15 @@
-#render_backend/app/router_webhook.py
+# render_backend/app/router_webhook.py
 """
 router_webhook.py
 ────────────────────────────────────────────
 Handles incoming Meta Webhook events (GET verify + POST messages).
-Forwards “RESCHEDULE” to Google Apps Script and triggers admin notifications.
+Supports admin commands:
+  - "reschedule"
+  - "credits"
+  - "today"
+  - "pause"
+  - "resume"
+  - "report"
 """
 
 import os
@@ -14,7 +20,7 @@ from render_backend.app.utils import send_whatsapp_template
 
 router_bp = Blueprint("router_bp", __name__)
 
-# ── Environment variables ────────────────────────────────────────────────
+# ── Environment variables ───────────────────────────────
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
 NADINE_WA = os.getenv("NADINE_WA", "")
@@ -48,12 +54,11 @@ def webhook():
     print("📩 Webhook received:", data)
 
     try:
-        # Validate expected structure
         entry = (data.get("entry") or [{}])[0]
         change = (entry.get("changes") or [{}])[0]
         value = change.get("value", {})
 
-        # ── Case 1: Status update (sent, delivered, failed) ────────────────
+        # ── Case 1: Status update ───────────────────────────────
         if "statuses" in value:
             status_info = value["statuses"][0]
             msg_id = status_info.get("id")
@@ -61,14 +66,9 @@ def webhook():
             recipient = status_info.get("recipient_id")
 
             print(f"📬 Status update: {msg_id} → {msg_status} (to {recipient})")
-
-            if status_info.get("errors"):
-                for err in status_info["errors"]:
-                    print(f"⚠️ WhatsApp Error {err.get('code')}: {err.get('message')}")
-                    print(f"   Details: {err.get('error_data', {}).get('details')}")
             return jsonify({"status": "status event logged"}), 200
 
-        # ── Case 2: New incoming message ──────────────────────────────────
+        # ── Case 2: New incoming message ────────────────────────
         if "messages" in value:
             msg = value["messages"][0]
             wa_number = msg.get("from", "")
@@ -77,24 +77,15 @@ def webhook():
 
             print(f"💬 Incoming message from {wa_number}: {msg_text}")
 
-            # ── Handle RESCHEDULE keyword ────────────────────────────────
+            # ── Handle "reschedule" ─────────────────────────────
             if "reschedule" in msg_text:
                 print(f"🔁 Reschedule request from {name} ({wa_number})")
-
-                # 1️⃣ Forward to Google Apps Script
                 if APPS_SCRIPT_URL:
                     try:
-                        forward_payload = {
-                            "wa_number": wa_number,
-                            "name": name,
-                            "message": msg_text,
-                        }
-                        r = requests.post(APPS_SCRIPT_URL, json=forward_payload, timeout=10)
-                        print(f"📤 Forwarded to Apps Script → status {r.status_code}")
+                        requests.post(APPS_SCRIPT_URL, json={"wa_number": wa_number, "name": name, "message": msg_text}, timeout=10)
                     except Exception as e:
                         print(f"❌ Failed to forward RESCHEDULE → {e}")
 
-                # 2️⃣ Notify Nadine via WhatsApp template
                 if NADINE_WA:
                     send_whatsapp_template(
                         to=NADINE_WA,
@@ -102,16 +93,81 @@ def webhook():
                         lang=TEMPLATE_LANG,
                         variables=[f"Client {name} ({wa_number}) requested to reschedule."]
                     )
-                    print("📲 Sent admin alert to Nadine.")
-
                 return jsonify({"status": "reschedule handled"}), 200
 
-            # ── Default: New lead message ─────────────────────────────────
+            # ── Handle "credits" ────────────────────────────────
+            if msg_text in ["credits", "unused credits"]:
+                if APPS_SCRIPT_URL:
+                    try:
+                        requests.post(APPS_SCRIPT_URL, json={"action": "get_unused_credits"}, timeout=10)
+                        print("📤 Requested unused credits summary.")
+                    except Exception as e:
+                        print(f"❌ Failed to request unused credits → {e}")
+
+                send_whatsapp_template(
+                    to=wa_number,
+                    name="admin_generic_alert_us",
+                    lang=TEMPLATE_LANG,
+                    variables=["Fetching latest credits summary..."]
+                )
+                return jsonify({"status": "credits requested"}), 200
+
+            # ── Handle "today" ───────────────────────────────────
+            if msg_text in ["today", "bookings today"]:
+                if APPS_SCRIPT_URL:
+                    try:
+                        requests.post(APPS_SCRIPT_URL, json={"action": "get_todays_bookings"}, timeout=10)
+                        print("📤 Requested today's bookings.")
+                    except Exception as e:
+                        print(f"❌ Failed to request today's bookings → {e}")
+
+                send_whatsapp_template(
+                    to=wa_number,
+                    name="admin_generic_alert_us",
+                    lang=TEMPLATE_LANG,
+                    variables=["Fetching today's schedule..."]
+                )
+                return jsonify({"status": "today requested"}), 200
+
+            # ── Handle "pause" / "resume" ─────────────────────────
+            if msg_text in ["pause", "resume"]:
+                action = "pause_jobs" if msg_text == "pause" else "resume_jobs"
+                if APPS_SCRIPT_URL:
+                    try:
+                        requests.post(APPS_SCRIPT_URL, json={"action": action}, timeout=10)
+                        print(f"📤 Sent {action} to Apps Script")
+                    except Exception as e:
+                        print(f"❌ Failed to send {action} → {e}")
+
+                send_whatsapp_template(
+                    to=wa_number,
+                    name="admin_generic_alert_us",
+                    lang=TEMPLATE_LANG,
+                    variables=[f"Automation {msg_text}d successfully."]
+                )
+                return jsonify({"status": f"{msg_text}d"}), 200
+
+            # ── Handle "report" ───────────────────────────────────
+            if msg_text == "report":
+                if APPS_SCRIPT_URL:
+                    try:
+                        requests.post(APPS_SCRIPT_URL, json={"action": "get_admin_report"}, timeout=10)
+                        print("📤 Requested admin report from Sheets.")
+                    except Exception as e:
+                        print(f"❌ Failed to request report → {e}")
+
+                send_whatsapp_template(
+                    to=wa_number,
+                    name="admin_generic_alert_us",
+                    lang=TEMPLATE_LANG,
+                    variables=["Generating today's studio report..."]
+                )
+                return jsonify({"status": "report requested"}), 200
+
+            # ── Default: treat as new lead ───────────────────────
             notify_new_lead(name="Unknown", wa_number=wa_number)
             return jsonify({"status": "message processed"}), 200
 
-        # ── Case 3: Unknown event type ────────────────────────────────────
-        print("⚠️ Unknown webhook event type received:", value)
         return jsonify({"status": "ignored"}), 200
 
     except Exception as e:
