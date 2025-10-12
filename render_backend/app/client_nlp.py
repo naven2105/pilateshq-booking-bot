@@ -1,31 +1,54 @@
-#render_backend_app/client_attendance.py
+#app/client_nlp.py
 """
 client_nlp.py
-──────────────
+───────────────────────────────
 Lightweight natural-language parsing for client shortcuts.
-Supports:
-  - View bookings
-  - Cancel bookings (next / by date & time)
-  - Attendance updates (sick, cancel today, running late)
-  - Invoices
-  - FAQs / Menu
-  - Contact Nadine
+
+Recognises:
+  • View / cancel bookings
+  • Attendance updates (sick, running late, cancel today)
+  • Invoices / payments
+  • Reschedule requests
+  • FAQs and general help
+  • Contact Nadine (admin)
+  • Greetings
+
+Each intent returns a small dict → consumed by router_client or client_commands.
 """
 
 import re
+import logging
 
+log = logging.getLogger(__name__)
 
+# ────────────────────────────────────────────────────────────────
+# Simple keyword mappings (exact text matches)
+# ────────────────────────────────────────────────────────────────
+SIMPLE_INTENTS = {
+    ("menu", "help"): "menu",
+    ("sick", "not well", "i am sick"): "off_sick_today",
+    ("skip", "cannot make it", "cannot attend", "not coming"): "cancel_today",
+}
+
+# ────────────────────────────────────────────────────────────────
+# Core NLP function
+# ────────────────────────────────────────────────────────────────
 def parse_client_command(text: str) -> dict | None:
     if not text:
         return None
 
     s = text.strip().lower()
 
-    # ── Menu ──
-    if s in {"menu", "help"}:
-        return {"intent": "menu"}
+    # ── Greetings ──
+    if re.fullmatch(r"(hi|hello|hey|morning|good morning|good afternoon|evening)", s):
+        return {"intent": "greeting"}
 
-    # ── Bookings ──
+    # ── Simple intent lookups ──
+    for keys, intent in SIMPLE_INTENTS.items():
+        if s in keys:
+            return {"intent": intent}
+
+    # ── Booking info ──
     if re.search(r"\b(bookings?|sessions?|schedule|next session)\b", s):
         return {"intent": "show_bookings"}
 
@@ -42,28 +65,30 @@ def parse_client_command(text: str) -> dict | None:
             "time": m.group("time"),
         }
 
-    # ── Sick today ──
-    if s in {"i am sick", "sick", "not well"}:
-        return {"intent": "off_sick_today"}
-
-    # ── Cannot attend ──
-    if s in {"cannot make it", "cannot attend", "not coming", "skip"}:
-        return {"intent": "cancel_today"}
-
     # ── Running late ──
     if "late" in s or "running late" in s:
         return {"intent": "running_late"}
+
+    # ── Reschedule ──
+    if "reschedule" in s or "move" in s:
+        return {"intent": "reschedule_request"}
+
+    # ── Payment confirmations ──
+    if re.search(r"\b(paid|payment done|eft|proof sent|pop)\b", s):
+        return {"intent": "payment_confirmation"}
 
     # ── Invoices ──
     if re.search(r"\b(invoice|statement|payment|bill)\b", s):
         return {"intent": "get_invoice"}
 
     # ── FAQs ──
-    if re.search(r"\b(faq|question|info|information|offer)\b", s):
+    if re.search(r"\b(faq|question|info|information|offer|help)\b", s):
         return {"intent": "faq"}
 
     # ── Contact Nadine ──
     if re.search(r"\b(contact|speak|call|whatsapp|talk).*(nadine|instructor|admin)?\b", s):
         return {"intent": "contact_admin"}
 
+    # ── Fallback ──
+    log.debug(f"[client_nlp] Unmatched message: {text!r}")
     return None

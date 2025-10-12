@@ -1,7 +1,10 @@
-# app/admin_bookings.py
+#app/admin_bookings.py
 """
-Handles booking-related admin commands with hybrid client matching:
- - Single-day bookings
+admin_bookings.py
+────────────────────────────────────────────
+Handles booking-related admin commands using Google Sheets integration.
+Supports:
+ - Single bookings
  - Recurring bookings
  - Multi-day recurring bookings
  - Cancel next booking
@@ -9,107 +12,73 @@ Handles booking-related admin commands with hybrid client matching:
 """
 
 import logging
-from sqlalchemy import text
 from datetime import date, timedelta
-from .db import get_session
-from .utils import send_whatsapp_text, safe_execute, send_whatsapp_button
-from .admin_utils import (
-    _find_client_matches,
-    _confirm_or_disambiguate,
+from .utils import (
+    send_whatsapp_text,
+    safe_execute,
+    send_whatsapp_button,
+    post_to_webhook,
 )
-from .admin_notify import notify_client
-from . import admin_nudge
+from .admin_utils import _find_client_matches, _confirm_or_disambiguate
+from .config import WEBHOOK_BASE
 
 log = logging.getLogger(__name__)
 
 
 # ── Helpers ─────────────────────────────────────────────
 def normalize_time(t: str) -> str:
-    """Convert admin style times like 08h00 → 08:00 for Postgres TIME."""
+    """Convert admin style times like 08h00 → 08:00."""
     if not t:
         return t
+    t = t.strip().lower()
     if "h" in t:
         try:
             hh, mm = t.split("h")
             return f"{int(hh):02d}:{int(mm):02d}"
         except Exception:
             pass
-    return t  # assume already in HH:MM
+    return t
 
 
-def _find_or_create_session(d: str, t: str, slot_type: str) -> int | None:
+def _add_session_to_sheet(client_name, wa_number, session_date, start_time, slot_type, status="confirmed", notes=""):
     """
-    Find existing session by date+time (ignoring slot_type) 
-    or create one with requested type/capacity.
+    Append a booking row to the Google Sheet via Apps Script endpoint.
     """
-    t = normalize_time(t)
-    capacity_map = {"single": 1, "duo": 2, "group": 6}
-    cap = capacity_map.get(slot_type, 1)
-
-    with get_session() as s:
-        # 🔎 Check if a session already exists at that date/time
-        row = s.execute(
-            text("SELECT id, session_type, capacity FROM sessions WHERE session_date=:d AND start_time=:t"),
-            {"d": d, "t": t},
-        ).first()
-        if row:
-            sid, stype, existing_cap = row
-            log.debug(f"[_find_or_create_session] Reusing session_id={sid}, existing_type={stype}, cap={existing_cap}")
-            return sid
-
-        # 🚀 Otherwise, insert a new one
-        r = s.execute(
-            text("""
-                INSERT INTO sessions (session_date, start_time, session_type, capacity)
-                VALUES (:d, :t, :ty, :cap) RETURNING id
-            """),
-            {"d": d, "t": t, "ty": slot_type, "cap": cap},
-        )
-        sid = r.scalar()
-        log.debug(f"[_find_or_create_session] Created new session_id={sid}, type={slot_type}, cap={cap}")
-        return sid
+    payload = {
+        "action": "add_session",
+        "client_name": client_name,
+        "wa_number": wa_number,
+        "session_date": str(session_date),
+        "start_time": start_time,
+        "session_type": slot_type,
+        "status": status,
+        "notes": notes,
+    }
+    log.info(f"[Sheets] Adding session for {client_name} on {session_date} {start_time} ({slot_type})")
+    post_to_webhook(f"{WEBHOOK_BASE}/sheets", payload)
 
 
-def _is_session_full(session_id: int) -> bool:
-    """Check if session is full by comparing confirmed bookings with capacity."""
-    with get_session() as s:
-        row = s.execute(
-            text("""
-                SELECT COUNT(*) AS booked, s.capacity
-                FROM sessions s
-                LEFT JOIN bookings b ON b.session_id = s.id AND b.status='confirmed'
-                WHERE s.id=:sid
-                GROUP BY s.capacity
-            """), {"sid": session_id}).first()
-        if not row:
-            return True
-        booked, capacity = row
-        log.debug(f"[_is_session_full] session_id={session_id}, booked={booked}, capacity={capacity}")
-        return booked >= capacity
-
-
-def _notify_booking(sid, cname, wnum, d, t, slot_type, admin_wa):
-    """Notify client of booking with Reject button."""
+def _notify_booking(client_name, wa_number, session_date, session_time, slot_type):
+    """Send booking confirmation with Reject button."""
     msg = (
-        f"📅 Nadine booked you for {d} at {t} ({slot_type}).\n\n"
+        f"📅 Nadine booked you for {session_date} at {session_time} ({slot_type}).\n\n"
         "If this is incorrect, tap ❌ Reject."
     )
-    log.debug(f"[_notify_booking] sid={sid}, cname={cname}, wnum={wnum}, d={d}, t={t}, slot_type={slot_type}")
     safe_execute(
         send_whatsapp_button,
-        wnum,
+        wa_number,
         msg,
-        buttons=[{"id": f"reject_{sid}", "title": "❌ Reject"}],
+        buttons=[{"id": f"reject_{session_date}_{session_time}", "title": "❌ Reject"}],
         label="client_booking_notify",
     )
 
 
-# ── Booking Commands ────────────────────────────────────
+# ── Main Dispatcher ─────────────────────────────────────
 def handle_booking_command(parsed: dict, wa: str):
-    """Route parsed booking/admin commands."""
+    """
+    Routes parsed admin booking commands to Google Sheets integration.
+    """
     intent = parsed["intent"]
-
-    # 🔑 Normalise keys: parser sometimes sends "type" instead of "slot_type"
     if "slot_type" not in parsed and "type" in parsed:
         parsed["slot_type"] = parsed["type"]
 
@@ -121,35 +90,18 @@ def handle_booking_command(parsed: dict, wa: str):
         choice = _confirm_or_disambiguate(matches, "book session", wa)
         if not choice:
             return
-        cid, cname, wnum, _ = choice
+        _, cname, wnum, _ = choice
 
         time_str = normalize_time(parsed["time"])
-        log.debug(f"[book_single] name={cname}, date={parsed['date']}, time={time_str}, slot_type={parsed['slot_type']}")
-        sid = _find_or_create_session(parsed["date"], time_str, parsed["slot_type"])
-        if _is_session_full(sid):
-            safe_execute(send_whatsapp_text, wa,
-                "❌ Could not reserve — session is full.",
-                label="book_single_full"
-            )
-            return
+        _add_session_to_sheet(cname, wnum, parsed["date"], time_str, parsed["slot_type"])
 
-        with get_session() as s:
-            s.execute(
-                text("""
-                    INSERT INTO bookings (session_id, client_id, status)
-                    VALUES (:sid, :cid, 'confirmed')
-                    ON CONFLICT (session_id, client_id) DO NOTHING
-                """),
-                {"sid": sid, "cid": cid},
-            )
-            log.debug(f"[book_single] Inserted booking for client_id={cid}, session_id={sid}")
-
-        safe_execute(send_whatsapp_text, wa,
+        safe_execute(
+            send_whatsapp_text,
+            wa,
             f"✅ Session booked for {cname} on {parsed['date']} at {time_str}.",
-            label="book_single_ok"
+            label="book_single_ok",
         )
-
-        _notify_booking(sid, cname, wnum, parsed["date"], time_str, parsed["slot_type"], wa)
+        _notify_booking(cname, wnum, parsed["date"], time_str, parsed["slot_type"])
         return
 
     # ── Recurring Booking (weekly) ───────────────────
@@ -158,13 +110,11 @@ def handle_booking_command(parsed: dict, wa: str):
         choice = _confirm_or_disambiguate(matches, "book recurring", wa)
         if not choice:
             return
-        cid, cname, wnum, _ = choice
+        _, cname, wnum, _ = choice
 
         weekday = parsed["weekday"].lower()
         slot_time = normalize_time(parsed["time"])
         slot_type = parsed["slot_type"]
-
-        log.debug(f"[book_recurring] name={cname}, weekday={weekday}, time={slot_time}, slot_type={slot_type}")
 
         created = 0
         today = date.today()
@@ -172,26 +122,14 @@ def handle_booking_command(parsed: dict, wa: str):
             d = today + timedelta(days=offset)
             if d.strftime("%A").lower() != weekday:
                 continue
-
-            sid = _find_or_create_session(d, slot_time, slot_type)
-            if _is_session_full(sid):
-                continue
-
-            with get_session() as s:
-                s.execute(
-                    text("""
-                        INSERT INTO bookings (session_id, client_id, status)
-                        VALUES (:sid, :cid, 'confirmed')
-                        ON CONFLICT (session_id, client_id) DO NOTHING
-                    """), {"sid": sid, "cid": cid},
-                )
+            _add_session_to_sheet(cname, wnum, d, slot_time, slot_type)
             created += 1
-            log.debug(f"[book_recurring] Added booking for {cname}, session_id={sid}, date={d}")
-            _notify_booking(sid, cname, wnum, d, slot_time, slot_type, wa)
 
-        safe_execute(send_whatsapp_text, wa,
+        safe_execute(
+            send_whatsapp_text,
+            wa,
             f"📅 Created {created} weekly bookings for {cname} ({slot_type}).",
-            label="book_recurring"
+            label="book_recurring",
         )
         return
 
@@ -201,110 +139,63 @@ def handle_booking_command(parsed: dict, wa: str):
         choice = _confirm_or_disambiguate(matches, "book recurring multi", wa)
         if not choice:
             return
-        cid, cname, wnum, _ = choice
+        _, cname, wnum, _ = choice
 
         created = 0
-        for slot in parsed["slots"]:   # [{date, time, slot_type}, …]
-            # 🔑 Normalise key for slot_type
+        for slot in parsed["slots"]:
             if "slot_type" not in slot and "type" in slot:
                 slot["slot_type"] = slot["type"]
-
             d, t, ty = slot["date"], normalize_time(slot["time"]), slot["slot_type"]
-            log.debug(f"[book_recurring_multi] name={cname}, slot_date={d}, slot_time={t}, slot_type={ty}")
-
-            sid = _find_or_create_session(d, t, ty)
-            if _is_session_full(sid):
-                continue
-
-            with get_session() as s:
-                s.execute(
-                    text("""
-                        INSERT INTO bookings (session_id, client_id, status)
-                        VALUES (:sid, :cid, 'confirmed')
-                        ON CONFLICT (session_id, client_id) DO NOTHING
-                    """), {"sid": sid, "cid": cid},
-                )
+            _add_session_to_sheet(cname, wnum, d, t, ty)
             created += 1
-            log.debug(f"[book_recurring_multi] Added booking for {cname}, session_id={sid}, date={d}, time={t}")
-            _notify_booking(sid, cname, wnum, d, t, ty, wa)
 
-        safe_execute(send_whatsapp_text, wa,
+        safe_execute(
+            send_whatsapp_text,
+            wa,
             f"📅 Created {created} recurring bookings for {cname} across multiple days.",
-            label="book_multi"
+            label="book_multi",
         )
         return
 
-
-# ── Cancel & Mark Status ───────────────────────────────
-def cancel_next_booking(name: str, wa: str):
-    matches = _find_client_matches(name)
-    choice = _confirm_or_disambiguate(matches, "cancel next booking", wa)
-    if not choice:
-        return
-    cid, cname, wnum, _ = choice
-
-    with get_session() as s:
-        row = s.execute(
-            text("""
-                SELECT b.id FROM bookings b
-                JOIN sessions s ON b.session_id = s.id
-                WHERE b.client_id=:cid AND b.status='confirmed' AND s.session_date >= CURRENT_DATE
-                ORDER BY s.session_date ASC LIMIT 1
-            """), {"cid": cid}).first()
-
-        if not row:
-            safe_execute(send_whatsapp_text, wa,
-                f"⚠ No active future booking found for {cname}.",
-                label="cancel_next_none"
-            )
+    # ── Cancel Next ───────────────────────────────
+    if intent == "cancel_next":
+        matches = _find_client_matches(parsed["name"])
+        choice = _confirm_or_disambiguate(matches, "cancel next booking", wa)
+        if not choice:
             return
+        _, cname, wnum, _ = choice
 
-        bid = row[0]
-        s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:bid"), {"bid": bid})
+        payload = {"action": "cancel_next", "wa": wnum}
+        post_to_webhook(f"{WEBHOOK_BASE}/sheets", payload)
 
-    notify_client(wnum, "Hi! Your next session has been cancelled by the studio. Please contact us to reschedule 💜")
-    safe_execute(send_whatsapp_text, wa,
-        f"✅ Next session for {cname} cancelled and client notified.",
-        label="cancel_next_ok"
-    )
-    admin_nudge.notify_cancel(cname, wnum, "next session")
-
-
-def mark_today_status(name: str, status: str, wa: str):
-    matches = _find_client_matches(name)
-    choice = _confirm_or_disambiguate(matches, f"mark {status}", wa)
-    if not choice:
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            f"✅ Next booking for {cname} cancelled and client notified.",
+            label="cancel_next_ok",
+        )
         return
-    cid, cname, wnum, _ = choice
 
-    with get_session() as s:
-        row = s.execute(
-            text("""
-                SELECT b.id FROM bookings b
-                JOIN sessions s ON b.session_id = s.id
-                WHERE b.client_id=:cid AND b.status='confirmed' AND s.session_date=CURRENT_DATE
-                LIMIT 1
-            """), {"cid": cid}).first()
-
-        if not row:
-            safe_execute(send_whatsapp_text, wa,
-                f"⚠ No active booking today for {cname}.",
-                label=f"{status}_none"
-            )
+    # ── Attendance Updates ───────────────────────────
+    if intent in {"mark_sick", "mark_no_show"}:
+        status = "sick" if "sick" in intent else "no_show"
+        matches = _find_client_matches(parsed["name"])
+        choice = _confirm_or_disambiguate(matches, f"mark {status}", wa)
+        if not choice:
             return
+        _, cname, wnum, _ = choice
 
-        bid = row[0]
-        s.execute(text("UPDATE bookings SET status=:st WHERE id=:bid"),
-                  {"st": status, "bid": bid})
+        payload = {
+            "action": "mark_today_status",
+            "wa": wnum,
+            "status": status,
+        }
+        post_to_webhook(f"{WEBHOOK_BASE}/sheets", payload)
 
-    if status == "sick":
-        notify_client(wnum, "Hi! We’ve marked you as sick for today’s session. Wishing you a speedy recovery 🌸")
-        admin_nudge.notify_sick(cname, wnum, "today")
-    elif status == "no_show":
-        notify_client(wnum, "Hi! You missed today’s session. Please reach out if you’d like to rebook.")
-        admin_nudge.notify_no_show(cname, wnum, "today")
-
-    safe_execute(send_whatsapp_text, wa,
-        f"✅ Marked {cname} as {status.replace('_','-')} today and client notified.",
-        label=f"{status}_ok"
-    )
+        safe_execute(
+            send_whatsapp_text,
+            wa,
+            f"✅ Marked {cname} as {status.replace('_','-')} today and client notified.",
+            label=f"{status}_ok",
+        )
+        return

@@ -1,160 +1,84 @@
-# render_backend/app/router_webhook.py
+# app/router_client.py
 """
-router_webhook.py
-────────────────────────────────────────────
-Handles incoming Meta Webhook events (GET verify + POST messages).
-Supports:
- - Client messages (reschedule, new leads)
- - Nadine admin commands (pause, resume, report, credits, help)
+router_client.py
+────────────────
+Handles client messages (non-admin).
+Delegates to client_commands (bookings, cancel, message Nadine).
+Now defaults to the interactive FAQ menu for unrecognised messages,
+with automatic fallback to static FAQs if needed.
 """
 
-import os
-import requests
-from flask import Blueprint, request, jsonify
-from render_backend.app.utils import send_whatsapp_template
+import logging
+from flask import jsonify
+from . import client_commands
+from .utils import send_whatsapp_text, safe_execute
+from .db import get_session
+from sqlalchemy import text
+from .client_faqs import handle_faq_message, handle_faq_button  # ✅ Integrated FAQ system
+from .faqs import build_faq_text  # ✅ Fallback for static FAQs
 
-router_bp = Blueprint("router_bp", __name__)
+log = logging.getLogger(__name__)
 
-# ── Environment variables ────────────────────────────────────────────────
-VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
-NADINE_WA = os.getenv("NADINE_WA", "")  # e.g. 27627597357
-TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-def post_to_apps_script(action: str):
-    """Post a simple action to Apps Script (pause/resume/report/credits)."""
-    if not APPS_SCRIPT_URL:
-        print("⚠️ No Apps Script URL configured.")
-        return {"ok": False, "error": "Missing Apps Script URL"}
+def client_get(wa: str):
+    """Fetch client record by WhatsApp number."""
+    with get_session() as s:
+        row = s.execute(
+            text("SELECT id, name FROM clients WHERE wa_number=:wa"),
+            {"wa": wa},
+        ).first()
+        if row:
+            return {"id": row[0], "name": row[1]}
+        return None
+
+
+def handle_client(msg, wa: str, text_in: str, client: dict):
+    """Handle messages from registered clients."""
+    txt = text_in.strip().lower()
+    msg_type = msg.get("type")
+
+    # ── Handle interactive FAQ buttons ───────────────────────────────
+    if msg_type == "button":
+        button_id = msg["button"]["payload"]
+        if handle_faq_button(wa, button_id):
+            return jsonify({"status": "ok", "role": "client_faq_button"}), 200
+
+    # ── Handle FAQ trigger words ─────────────────────────────────────
+    if any(k in txt for k in ["faq", "faqs", "help", "questions"]):
+        # Try sending interactive FAQ
+        try:
+            handle_faq_message(wa, txt)
+        except Exception as e:
+            log.warning(f"[FAQ] Interactive FAQ failed ({e}); using fallback text.")
+            safe_execute(send_whatsapp_text, wa, build_faq_text())
+        return jsonify({"status": "ok", "role": "client_faq"}), 200
+
+    # ── Recognised booking and admin-type commands ───────────────────
+    if txt in ["bookings", "my bookings", "sessions"]:
+        client_commands.show_bookings(wa)
+        return jsonify({"status": "ok", "role": "client_bookings"}), 200
+
+    if txt in ["cancel next", "cancel upcoming"]:
+        client_commands.cancel_next(wa)
+        return jsonify({"status": "ok", "role": "client_cancel_next"}), 200
+
+    if txt.startswith("cancel "):
+        parts = txt.split()
+        if len(parts) >= 3:
+            _, day, time = parts[0:3]
+            client_commands.cancel_specific(wa, day, time)
+            return jsonify({"status": "ok", "role": "client_cancel_specific"}), 200
+
+    if txt.startswith("message nadine"):
+        msg_out = text_in[len("message nadine"):].strip()
+        client_commands.message_nadine(wa, client["name"], msg_out)
+        return jsonify({"status": "ok", "role": "client_message"}), 200
+
+    # ── Default: unknown message → trigger FAQ menu or fallback ──────
     try:
-        payload = {"action": action}
-        r = requests.post(APPS_SCRIPT_URL, json=payload, timeout=10)
-        print(f"📤 Sent action={action} → status={r.status_code}")
-        return {"ok": r.status_code == 200, "status": r.status_code}
+        handle_faq_message(wa, "faq")
     except Exception as e:
-        print(f"❌ Apps Script post failed for action={action}: {e}")
-        return {"ok": False, "error": str(e)}
+        log.warning(f"[FAQ] Fallback trigger failed ({e}); sending plain FAQ text.")
+        safe_execute(send_whatsapp_text, wa, build_faq_text())
 
-
-def send_admin_reply(message: str):
-    """Send WhatsApp text reply to Nadine."""
-    if not NADINE_WA:
-        print("⚠️ NADINE_WA not configured.")
-        return
-    send_whatsapp_template(
-        to=NADINE_WA,
-        name="admin_generic_alert_us",
-        lang=TEMPLATE_LANG,
-        variables=[message]
-    )
-
-# ───────────────────────────────
-# META VERIFICATION HANDSHAKE
-# ───────────────────────────────
-@router_bp.route("/webhook", methods=["GET"])
-def verify():
-    """Verify webhook during Meta setup."""
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Meta webhook verified successfully.")
-        return challenge, 200
-    print("❌ Meta webhook verification failed.")
-    return "Forbidden", 403
-
-
-# ───────────────────────────────
-# META MESSAGE HANDLER
-# ───────────────────────────────
-@router_bp.route("/webhook", methods=["POST"])
-def webhook():
-    """Handle incoming messages or status events from Meta."""
-    data = request.get_json(force=True)
-    print("📩 Webhook received:", data)
-
-    try:
-        entry = (data.get("entry") or [{}])[0]
-        change = (entry.get("changes") or [{}])[0]
-        value = change.get("value", {})
-
-        # ── Case 1: Status updates ───────────────────────
-        if "statuses" in value:
-            status_info = value["statuses"][0]
-            msg_id = status_info.get("id")
-            msg_status = status_info.get("status")
-            recipient = status_info.get("recipient_id")
-            print(f"📬 Status update: {msg_id} → {msg_status} (to {recipient})")
-            return jsonify({"status": "status event logged"}), 200
-
-        # ── Case 2: Incoming messages ────────────────────
-        if "messages" in value:
-            msg = value["messages"][0]
-            wa_number = msg.get("from", "")
-            msg_text = msg.get("text", {}).get("body", "").strip().lower()
-            name = msg.get("profile", {}).get("name", "Unknown")
-
-            print(f"💬 Message from {wa_number}: {msg_text}")
-
-            # ── ADMIN COMMANDS ────────────────────────────
-            if wa_number == NADINE_WA:
-                if msg_text in ["pause", "resume", "report", "credits", "help"]:
-                    print(f"🛠 Admin command from Nadine: {msg_text}")
-
-                    if msg_text == "pause":
-                        post_to_apps_script("pause_jobs")
-                        send_admin_reply("⏸️ Automation paused.")
-                    elif msg_text == "resume":
-                        post_to_apps_script("resume_jobs")
-                        send_admin_reply("▶️ Automation resumed.")
-                    elif msg_text == "report":
-                        post_to_apps_script("get_admin_report")
-                        send_admin_reply("📊 Studio report is being prepared.")
-                    elif msg_text == "credits":
-                        post_to_apps_script("get_unused_credits")
-                        send_admin_reply("📋 Credits summary requested.")
-                    elif msg_text == "help":
-                        send_admin_reply(
-                            "🧭 Admin Commands:\n"
-                            "• report – Studio summary\n"
-                            "• credits – Clients with unused credits\n"
-                            "• pause – Pause automations\n"
-                            "• resume – Resume automations\n"
-                            "• help – Show this menu"
-                        )
-                    return jsonify({"status": "admin command handled"}), 200
-
-            # ── RESCHEDULE (Client Message) ────────────────
-            if "reschedule" in msg_text:
-                print(f"🔁 Reschedule request from {name} ({wa_number})")
-                if APPS_SCRIPT_URL:
-                    requests.post(APPS_SCRIPT_URL, json={
-                        "wa_number": wa_number,
-                        "name": name,
-                        "message": msg_text
-                    }, timeout=10)
-                send_admin_reply(f"Client {name} ({wa_number}) requested to reschedule.")
-                return jsonify({"status": "reschedule handled"}), 200
-
-            # ── Default (New Lead / Generic Message) ───────
-            send_admin_reply(f"📥 New message from {name} ({wa_number}): {msg_text}")
-            return jsonify({"status": "message processed"}), 200
-
-        # ── Unknown event type ───────────────────────────
-        print("⚠️ Unknown webhook event:", value)
-        return jsonify({"status": "ignored"}), 200
-
-    except Exception as e:
-        print("❌ Webhook error:", e)
-        return jsonify({"error": str(e)}), 500
-
-
-# ───────────────────────────────
-# HEALTH CHECK ENDPOINT
-# ───────────────────────────────
-@router_bp.route("/", methods=["GET"])
-def health():
-    """Simple health check for Render."""
-    return jsonify({"status": "ok", "service": "PilatesHQ Booking Bot"}), 200
+    return jsonify({"status": "ok", "role": "client_faq_default"}), 200

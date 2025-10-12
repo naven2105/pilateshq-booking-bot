@@ -1,7 +1,7 @@
-#render_backend_app/client_core.py
+#app/client_core.py
 """
 client_core.py
-──────────────
+──────────────────────────────────────────────
 Central dispatcher for client actions.
 Delegates to bookings, invoices, attendance, and notify modules.
 """
@@ -11,8 +11,10 @@ import logging
 from typing import Optional
 from .utils import send_whatsapp_text, normalize_wa, safe_execute
 from .client_nlp import parse_client_command
-from . import client_bookings, client_attendance
-from .prospect import CLIENT_MENU, _client_get  # ✅ reuse client lookup + menu
+from . import client_bookings, client_attendance, client_faqs
+from .invoices import send_invoice
+from .prospect import CLIENT_MENU, _client_get
+from .config import NADINE_WA
 
 log = logging.getLogger(__name__)
 
@@ -21,13 +23,14 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
     """Main entrypoint for inbound client actions (normal clients)."""
     wa = normalize_wa(from_wa)
     text_in = (body or "").strip()
+    parsed = parse_client_command(text_in)
+    client = _client_get(wa)
+    cname = client["name"] if client and client.get("name") else "there"
 
-    log.info(f"[CLIENT] from={from_wa} body={body!r}")
+    log.info(f"[CLIENT] from={from_wa} body={body!r} parsed={parsed}")
 
-    # ─────────────── Shortcut: greetings → show menu ───────────────
-    if text_in.lower() in {"hi", "hello", "hey"}:
-        client = _client_get(wa)
-        cname = client["name"] if client else "there"
+    # ─────────────── Greetings → Menu ───────────────
+    if text_in.lower() in {"hi", "hello", "hey", "menu"}:
         safe_execute(
             send_whatsapp_text,
             wa,
@@ -36,27 +39,22 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
         )
         return
 
-    parsed = parse_client_command(text_in)
+    # ─────────────── Unknown → fallback ───────────────
     if not parsed:
-        # ✅ Fallback now greets by name if available
-        client = _client_get(wa)
-        cname = client["name"] if client else "there"
         safe_execute(
             send_whatsapp_text,
             wa,
-            f"💜 Hi {cname}, I didn’t understand that.\n"
-            "Type *menu* to see what I can do for you.",
+            f"💜 Hi {cname}, I didn’t quite catch that.\n"
+            "Try *bookings*, *faq*, or *message Nadine* for help.",
             label="client_fallback",
         )
         return
 
     intent = parsed["intent"]
-    log.info(f"[CLIENT CMD] parsed={parsed}")
+    log.info(f"[CLIENT CMD] intent={intent}")
 
     # ─────────────── Menu ───────────────
     if intent == "menu":
-        client = _client_get(wa)
-        cname = client["name"] if client else "there"
         safe_execute(
             send_whatsapp_text,
             wa,
@@ -65,22 +63,20 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
         )
         return
 
-    # ─────────────── View Bookings ───────────────
+    # ─────────────── Bookings ───────────────
     if intent == "show_bookings":
         client_bookings.show_bookings(wa)
         return
 
-    # ─────────────── Cancel Next ───────────────
     if intent == "cancel_next":
         client_bookings.cancel_next(wa)
         return
 
-    # ─────────────── Cancel Specific ───────────────
     if intent == "cancel_specific":
         client_bookings.cancel_specific(wa, parsed["day"], parsed["time"])
         return
 
-    # ─────────────── Attendance Updates ───────────────
+    # ─────────────── Attendance ───────────────
     if intent == "off_sick_today":
         client_attendance.mark_sick_today(wa)
         return
@@ -95,35 +91,22 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
 
     # ─────────────── Invoices ───────────────
     if intent == "get_invoice":
-        safe_execute(
-            send_whatsapp_text,
-            wa,
-            "📑 Invoices are currently managed directly by Nadine. Please contact her if you need a copy.",
-            label="client_invoice_redirect",
-        )
+        safe_execute(send_invoice, wa)
         return
 
     if intent == "balance":
         safe_execute(
             send_whatsapp_text,
             wa,
-            "📊 Balance requests are not yet automated. Please contact Nadine for details.",
+            "📊 Your package balance updates will appear here soon.\n"
+            "For now, Nadine can confirm your remaining sessions.",
             label="client_balance_redirect",
         )
         return
 
     # ─────────────── FAQs ───────────────
     if intent == "faq":
-        safe_execute(
-            send_whatsapp_text,
-            wa,
-            "ℹ PilatesHQ Info:\n\n"
-            "• Reformer Single = R300\n"
-            "• Reformer Duo = R250\n"
-            "• Reformer Trio = R200\n\n"
-            "Type 'sessions' to view your bookings or 'invoice' to get your statement.",
-            label="client_faq",
-        )
+        client_faqs.handle_faq_message(wa, "faq")
         return
 
     # ─────────────── Contact Nadine ───────────────
@@ -131,7 +114,21 @@ def handle_client_action(from_wa: str, msg_id: Optional[str], body: str):
         safe_execute(
             send_whatsapp_text,
             wa,
-            "📞 You can reach Nadine directly at: 0627597357",
+            "📞 Nadine will contact you soon. You can also message her directly at 062 759 7357.",
             label="client_contact_admin",
         )
+        safe_execute(
+            send_whatsapp_text,
+            NADINE_WA,
+            f"📩 Client *{cname}* ({wa}) wants to contact you:\n‘{text_in}’",
+            label="admin_contact_alert",
+        )
         return
+
+    # ─────────────── Unknown fallback (defensive) ───────────────
+    safe_execute(
+        send_whatsapp_text,
+        wa,
+        "💬 I’m not sure how to handle that yet — Nadine will follow up shortly.",
+        label="client_unknown_fallback",
+    )

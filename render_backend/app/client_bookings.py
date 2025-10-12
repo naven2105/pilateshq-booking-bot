@@ -1,76 +1,74 @@
-#render_backend_app/client_bookings.py
+#app/client_bookings.py
 """
 client_bookings.py
 ──────────────────
-Handles client booking queries (view, cancel next, cancel specific).
+Handles client booking queries (view, cancel next, cancel specific)
+using Google Sheets via the Apps Script API.
 """
 
 import logging
-from sqlalchemy import text
-from .db import get_session
-from .utils import send_whatsapp_text, safe_execute
+import requests
+from datetime import datetime
+from .utils import send_whatsapp_text, safe_execute, normalize_wa
 
 log = logging.getLogger(__name__)
 
+# Your deployed Google Apps Script URL
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzXQgwxZZDisjHRs78yQeG7xsDNynSLLKcAV57fn1mflZa1dtCKdNvK-0YpkqNtyJiBqQ/exec"
 
+
+# ───────────────────────────────────────────────
+# 🔹 Show upcoming sessions
+# ───────────────────────────────────────────────
 def show_bookings(wa_number: str):
-    """Show upcoming sessions for a client in a clean format."""
-    with get_session() as s:
-        rows = s.execute(
-            text("""
-                SELECT s.session_date, s.start_time, s.session_type
-                FROM bookings b
-                JOIN sessions s ON b.session_id = s.id
-                JOIN clients c ON b.client_id = c.id
-                WHERE c.wa_number = :wa
-                  AND b.status = 'confirmed'
-                  AND s.session_date >= CURRENT_DATE
-                ORDER BY s.session_date, s.start_time
-                LIMIT 5
-            """),
-            {"wa": wa_number},
-        ).fetchall()
+    """Fetch and show upcoming sessions for a client via Google Sheets."""
+    try:
+        payload = {"action": "get_upcoming_sessions", "wa": wa_number}
+        res = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
+        data = res.json() if res.status_code == 200 else {}
 
-    if not rows:
+        sessions = data.get("sessions", [])
+        if not sessions:
+            safe_execute(
+                send_whatsapp_text,
+                wa_number,
+                "📅 You have no upcoming sessions booked.\n"
+                "💜 Would you like to book your next class?",
+                label="client_bookings_none",
+            )
+            return
+
+        lines = ["📅 *Your upcoming sessions:*"]
+        for s in sessions[:5]:
+            d = s.get("date")
+            t = s.get("time")
+            stype = s.get("session_type", "Session").capitalize()
+            lines.append(f"• {d} {t} — {stype}")
+
+        msg = "\n".join(lines)
+        safe_execute(send_whatsapp_text, wa_number, msg, label="client_bookings_ok")
+
+    except Exception as e:
+        log.error(f"[show_bookings] Failed: {e}")
         safe_execute(
             send_whatsapp_text,
             wa_number,
-            "📅 You have no upcoming sessions booked.\n"
-            "💜 Would you like to book your next class?",
-            label="client_bookings_none",
+            "⚠ Sorry, I couldn’t fetch your bookings right now. Please try again shortly.",
+            label="client_bookings_error",
         )
-        return
-
-    lines = ["📅 Your upcoming sessions:"]
-    for session_date, start_time, session_type in rows:
-        day = session_date.strftime("%a %d %b")
-        time = start_time.strftime("%H:%M")
-        stype = session_type.capitalize() if session_type else "Session"
-        lines.append(f"• {day} {time} — {stype} Reformer")
-
-    msg = "\n".join(lines)
-    safe_execute(send_whatsapp_text, wa_number, msg, label="client_bookings_ok")
 
 
+# ───────────────────────────────────────────────
+# 🔹 Cancel next session
+# ───────────────────────────────────────────────
 def cancel_next(wa_number: str):
-    """Cancel the next upcoming booking for the client."""
-    with get_session() as s:
-        row = s.execute(
-            text("""
-                SELECT b.id, s.session_date, s.start_time
-                FROM bookings b
-                JOIN sessions s ON b.session_id = s.id
-                JOIN clients c ON b.client_id = c.id
-                WHERE c.wa_number = :wa
-                  AND b.status = 'confirmed'
-                  AND s.session_date >= CURRENT_DATE
-                ORDER BY s.session_date, s.start_time
-                LIMIT 1
-            """),
-            {"wa": wa_number},
-        ).first()
+    """Cancel the next confirmed booking for the client."""
+    try:
+        payload = {"action": "cancel_next", "wa": wa_number}
+        res = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
+        data = res.json() if res.status_code == 200 else {}
 
-        if not row:
+        if not data.get("ok"):
             safe_execute(
                 send_whatsapp_text,
                 wa_number,
@@ -79,38 +77,35 @@ def cancel_next(wa_number: str):
             )
             return
 
-        bid, session_date, start_time = row
-        s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:id"), {"id": bid})
-        dt = f"{session_date.strftime('%a %d %b')} {start_time.strftime('%H:%M')}"
+        dt_str = data.get("cancelled_session", "your next session")
+        safe_execute(
+            send_whatsapp_text,
+            wa_number,
+            f"❌ Your next session on {dt_str} has been cancelled.",
+            label="client_cancel_next",
+        )
 
-    safe_execute(
-        send_whatsapp_text,
-        wa_number,
-        f"❌ Your next session on {dt} has been cancelled.",
-        label="client_cancel_next",
-    )
+    except Exception as e:
+        log.error(f"[cancel_next] Error: {e}")
+        safe_execute(
+            send_whatsapp_text,
+            wa_number,
+            "⚠ I couldn’t update your booking. Please try again or contact Nadine.",
+            label="client_cancel_next_error",
+        )
 
 
+# ───────────────────────────────────────────────
+# 🔹 Cancel by day and time
+# ───────────────────────────────────────────────
 def cancel_specific(wa_number: str, day: str, time: str):
-    """Cancel a specific session by day + time (e.g. 'Tue' and '09:00')."""
-    with get_session() as s:
-        row = s.execute(
-            text("""
-                SELECT b.id, s.session_date, s.start_time
-                FROM bookings b
-                JOIN sessions s ON b.session_id = s.id
-                JOIN clients c ON b.client_id = c.id
-                WHERE c.wa_number = :wa
-                  AND b.status = 'confirmed'
-                  AND s.session_date >= CURRENT_DATE
-                  AND to_char(s.session_date, 'Dy') ILIKE :day
-                  AND to_char(s.start_time, 'HH24:MI') = :time
-                LIMIT 1
-            """),
-            {"wa": wa_number, "day": day + "%", "time": time},
-        ).first()
+    """Cancel a specific session by weekday and time."""
+    try:
+        payload = {"action": "cancel_by_date_time", "wa": wa_number, "day": day, "time": time}
+        res = requests.post(APPS_SCRIPT_URL, json=payload, timeout=15)
+        data = res.json() if res.status_code == 200 else {}
 
-        if not row:
+        if not data.get("ok"):
             safe_execute(
                 send_whatsapp_text,
                 wa_number,
@@ -119,13 +114,18 @@ def cancel_specific(wa_number: str, day: str, time: str):
             )
             return
 
-        bid, session_date, start_time = row
-        s.execute(text("UPDATE bookings SET status='cancelled' WHERE id=:id"), {"id": bid})
-        dt = f"{session_date.strftime('%a %d %b')} {start_time.strftime('%H:%M')}"
+        safe_execute(
+            send_whatsapp_text,
+            wa_number,
+            f"❌ Your session on {day} at {time} has been cancelled.",
+            label="client_cancel_specific_ok",
+        )
 
-    safe_execute(
-        send_whatsapp_text,
-        wa_number,
-        f"❌ Your session on {dt} has been cancelled.",
-        label="client_cancel_specific_ok",
-    )
+    except Exception as e:
+        log.error(f"[cancel_specific] Error: {e}")
+        safe_execute(
+            send_whatsapp_text,
+            wa_number,
+            "⚠ Sorry, something went wrong while cancelling. Please try again later.",
+            label="client_cancel_specific_error",
+        )

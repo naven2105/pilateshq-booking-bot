@@ -1,172 +1,199 @@
-#app/utils.py
+# render_backend/app/utils.py
+"""
+utils.py
+────────────────────────────────────────────
+Utility functions for the PilatesHQ WhatsApp Bot backend.
+
+Includes:
+ - send_whatsapp_template(): Meta Cloud API template sender
+ - send_whatsapp_text(): plain text message sender
+ - safe_execute(): error-safe wrapper for API calls
+ - normalize_wa(): normalise WhatsApp numbers (e.g., 073 → 2773)
+ - normalize_dob() / format_dob_display(): date helpers
+────────────────────────────────────────────
+"""
+
+import os
 import logging
 import requests
-import os
-import re
+import time
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-WHATSAPP_API_URL = "https://graph.facebook.com/v17.0/{phone_number_id}/messages"
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+# ── Environment variables ───────────────────────────────────────
+META_BASE_URL = "https://graph.facebook.com/v19.0"
+META_PHONE_ID = os.getenv("META_PHONE_ID", "")
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
+DEFAULT_LANG = os.getenv("TEMPLATE_LANG", "en_US")
+
+# ─────────────────────────────────────────────────────────────
+# WhatsApp number normaliser
+# ─────────────────────────────────────────────────────────────
+def normalize_wa(num: str) -> str:
+    """Convert local SA numbers (e.g., 073...) to 27-prefix international format."""
+    if not num:
+        return ""
+    s = str(num).strip().replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if s.startswith("0"):
+        s = "27" + s[1:]
+    return s
 
 
-def _send_to_meta(payload: dict) -> tuple:
+# ─────────────────────────────────────────────────────────────
+# DOB utilities
+# ─────────────────────────────────────────────────────────────
+def normalize_dob(dob: str | None) -> str | None:
+    """Normalise DOB text to YYYY-MM-DD format."""
+    if not dob:
+        return None
+    dob = dob.strip()
+    for fmt in ("%d %B %Y", "%d %b %Y", "%d %B", "%d %b"):
+        try:
+            dt = datetime.strptime(dob, fmt)
+            # Replace missing year with current year
+            if dt.year == 1900:
+                dt = dt.replace(year=datetime.now().year)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    log.warning(f"[DOB] Could not parse {dob!r}")
+    return None
+
+
+def format_dob_display(dob_norm: str | None) -> str:
+    """Display DOB nicely (DD-MMM or DD-MMM-YYYY)."""
+    if not dob_norm:
+        return "N/A"
+    try:
+        dt = datetime.strptime(dob_norm, "%Y-%m-%d")
+        return dt.strftime("%d-%b" if dt.year == datetime.now().year else "%d-%b-%Y")
+    except Exception:
+        return "N/A"
+
+
+# ─────────────────────────────────────────────────────────────
+# Safe execution wrapper
+# ─────────────────────────────────────────────────────────────
+def safe_execute(label, func, *args, **kwargs):
+    """Run an operation safely, logging errors instead of breaking execution."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        log.error(f"❌ {label} failed → {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Send WhatsApp Template Message
+# ─────────────────────────────────────────────────────────────
+def send_whatsapp_template(to: str, name: str, lang: str = DEFAULT_LANG, variables=None):
     """
-    Internal: send payload to Meta WhatsApp API.
-    Returns (ok: bool, status_code: int, response_json: dict | str).
+    Send a pre-approved WhatsApp template message.
+    Args:
+        to: recipient phone number (string)
+        name: template name (string)
+        lang: language code (default: en_US)
+        variables: list of string replacements for {{1}}, {{2}}, etc.
     """
-    url = WHATSAPP_API_URL.format(phone_number_id=PHONE_NUMBER_ID)
+    if not META_PHONE_ID or not META_ACCESS_TOKEN:
+        log.warning("⚠️ Meta credentials missing, cannot send message.")
+        return {"ok": False, "error": "missing credentials"}
+
+    url = f"{META_BASE_URL}/{META_PHONE_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        try:
-            body = resp.json()
-        except Exception:
-            body = resp.text
-        ok = 200 <= resp.status_code < 300
-        if not ok:
-            logger.error(f"[WA SEND FAIL] status={resp.status_code} body={body}")
-        return ok, resp.status_code, body
-    except Exception as e:
-        logger.exception("Failed to send payload to Meta")
-        return False, 0, str(e)
 
-
-def send_whatsapp_template(to: str, name: str, lang: str, variables: list[str]) -> dict:
-    """
-    Send a WhatsApp template by name/language with body variables.
-    """
-    components = [{
-        "type": "body",
-        "parameters": [{"type": "text", "text": sanitize_param(str(v))} for v in variables],
-    }]
-
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": normalize_wa(to),
         "type": "template",
         "template": {
             "name": name,
             "language": {"code": lang},
-            "components": components,
         },
     }
 
-    ok, status, body = _send_to_meta(payload)
-    return {"ok": ok, "status_code": status, "response": body}
+    if variables:
+        data["template"]["components"] = [{
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in variables],
+        }]
 
+    log.info(f"📤 Sending WhatsApp template → {to} ({name}) vars={variables}")
 
-def send_whatsapp_text(to: str, text: str) -> dict:
-    """
-    Fallback plain-text sender (not template).
-    """
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text},
-    }
-    ok, status, body = _send_to_meta(payload)
-    return {"ok": ok, "status_code": status, "response": body}
-
-
-def send_whatsapp_flow(to: str, flow_id: str, flow_cta: str = "Fill Form", prefill: dict | None = None) -> dict:
-    """
-    Send a WhatsApp interactive Flow message.
-    """
-    action_params = {
-        "flow_id": flow_id,
-        "flow_cta": flow_cta,
-        "flow_message_version": "3",
-    }
-    if prefill:
-        action_params["flow_action_payload"] = {"screen_0": prefill}
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "flow",
-            "header": {"type": "text", "text": "New Client Registration"},
-            "body": {"text": "Please complete this form to register a new client."},
-            "footer": {"text": "PilatesHQ"},
-            "action": {"name": "flow", "parameters": action_params},
-        },
-    }
-
-    ok, status, body = _send_to_meta(payload)
-    return {"ok": ok, "status_code": status, "response": body}
-
-
-def send_whatsapp_button(to: str, text: str, buttons: list[dict]) -> dict:
-    """
-    Send a WhatsApp interactive button message.
-    Example:
-        send_whatsapp_button("2773...", "Confirm?", [
-            {"id": "reject_123", "title": "❌ Reject"}
-        ])
-    """
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": text},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
-                    for b in buttons
-                ]
-            },
-        },
-    }
-    ok, status, body = _send_to_meta(payload)
-    return {"ok": ok, "status_code": status, "response": body}
-
-
-def normalize_wa(num: str) -> str:
-    """
-    Normalise a WhatsApp number:
-      - remove leading '+'
-      - convert SA numbers '0xxxxxxxxx' → '27xxxxxxxxx'
-    """
-    if not num:
-        return num
-    num = num.strip().replace("+", "")
-    if num.startswith("0"):
-        num = "27" + num[1:]
-    return num
-
-
-def safe_execute(func, *args, label: str = "", **kwargs):
-    """
-    Wrapper to safely execute any function.
-    Logs success/failure without breaking the bot flow.
-    """
     try:
-        result = func(*args, **kwargs)
-        logger.info(f"[SAFE EXEC OK] {label} → {result}")
-        return result
+        resp = requests.post(url, json=data, headers=headers, timeout=10)
+        result = resp.json() if resp.text else {}
+        if resp.status_code >= 400:
+            log.error(f"❌ WhatsApp API error {resp.status_code}: {resp.text}")
+            return {"ok": False, "status_code": resp.status_code, "error": resp.text}
+        else:
+            log.info(f"✅ WhatsApp message sent to {to} ({name}) → {resp.status_code}")
+            return {"ok": True, "status_code": resp.status_code, "response": result}
     except Exception as e:
-        logger.exception(f"[SAFE EXEC FAIL] {label} args={args} kwargs={kwargs}: {e}")
-        return None
+        log.error(f"❌ WhatsApp template send failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
-def sanitize_param(text: str) -> str:
+# ─────────────────────────────────────────────────────────────
+# Send Free-Text Message
+# ─────────────────────────────────────────────────────────────
+def send_whatsapp_text(to: str, text: str):
+    """Send a plain WhatsApp message (non-template)."""
+    if not META_PHONE_ID or not META_ACCESS_TOKEN:
+        log.warning("⚠️ Meta credentials missing.")
+        return {"ok": False, "error": "missing credentials"}
+
+    url = f"{META_BASE_URL}/{META_PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": normalize_wa(to),
+        "type": "text",
+        "text": {"preview_url": False, "body": text},
+    }
+
+    log.info(f"💬 Sending WhatsApp text → {to}: {text}")
+
+    try:
+        resp = requests.post(url, json=data, headers=headers, timeout=10)
+        result = resp.json() if resp.text else {}
+        if resp.status_code >= 400:
+            log.error(f"❌ WhatsApp text error {resp.status_code}: {resp.text}")
+            return {"ok": False, "status_code": resp.status_code, "error": resp.text}
+        else:
+            log.info(f"✅ WhatsApp text sent to {to}")
+            return {"ok": True, "status_code": resp.status_code, "response": result}
+    except Exception as e:
+        log.error(f"❌ WhatsApp text send failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────
+# Rate-limit safe send helper
+# ─────────────────────────────────────────────────────────────
+def send_with_delay(messages, delay=1.0):
     """
-    Clean a string for WhatsApp template variables:
-      - Remove newlines/tabs
-      - Collapse multiple spaces
-      - Trim leading/trailing spaces
+    Send multiple messages with spacing to avoid Meta rate limits.
+    Args:
+        messages: list of dicts, each with keys {to, name, vars}
+        delay: seconds between sends
     """
-    if not text:
-        return ""
-    clean = re.sub(r"[\n\t]+", " ", text)       # replace newlines/tabs with space
-    clean = re.sub(r"\s{2,}", " ", clean)       # collapse multiple spaces
-    return clean.strip()
+    for msg in messages:
+        safe_execute(
+            f"Send to {msg.get('to')}",
+            send_whatsapp_template,
+            msg.get("to"),
+            msg.get("name"),
+            DEFAULT_LANG,
+            msg.get("vars", []),
+        )
+        time.sleep(delay)
