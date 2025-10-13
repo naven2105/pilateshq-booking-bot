@@ -1,17 +1,12 @@
-#render_backend_app/client_reminders.py
+# render_backend_app/client_reminders.py
 """
 client_reminders.py
 ────────────────────────────────────────────
 Handles reminder jobs sent from Google Apps Script.
-No database required.
-
-Jobs supported:
- • client-night-before  (daily 20h00)
- • client-week-ahead    (Sunday 20h00)
- • client-next-hour     (hourly)
-
-Each job includes a JSON list of sessions/clients.
-Dispatches WhatsApp templates via utils.send_whatsapp_template.
+Supports both:
+ • Job-based reminders (night-before, week-ahead, next-hour)
+ • Direct single reminders from Apps Script payloads
+────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -30,8 +25,10 @@ log = logging.getLogger(__name__)
 TPL_NIGHT = "client_session_tomorrow_us"
 TPL_WEEK = "client_weekly_schedule_us"
 TPL_NEXT_HOUR = "client_session_next_hour_us"
+TPL_SINGLE = "client_single_reminder_us"
+TPL_DUO = "client_duo_reminder_us"
+TPL_TRIO = "client_trio_reminder_us"
 TEMPLATE_LANG = "en_US"
-
 
 # ──────────────────────────────────────────────
 # Helper
@@ -47,23 +44,71 @@ def _send_template(to: str, tpl: str, vars: dict):
         [str(v or "").strip() for v in vars.values()],
     )
 
-
 # ──────────────────────────────────────────────
-# POST endpoint from Apps Script
+# POST endpoint from Apps Script (Direct)
 # ──────────────────────────────────────────────
 @bp.route("/client-reminders", methods=["POST"])
 def handle_client_reminders():
     """
-    Receives payloads like:
-    { "type": "client-night-before", "sessions": [...] }
+    Receives either:
+    • Job-style payloads from Apps Script (type + sessions list)
+    • Direct single-session payloads from Apps Script (wa_number + session_type + date)
     """
+
     payload = request.get_json(force=True)
+    log.info(f"[Tasks] /client-reminders payload: {payload}")
+
+    # Direct payload (used by Apps Script runTestScenario / sendOneTestPOST)
+    if "wa_number" in payload:
+        wa_number = str(payload.get("wa_number"))
+        client_name = payload.get("client_name", "there")
+        session_type = (payload.get("session_type") or payload.get("type") or "").lower().strip()
+        session_date = payload.get("date") or payload.get("session_date")
+        session_time = payload.get("start_time", "08:00")
+
+        # ── Normalise session_type ────────────────────────────────
+        if "single" in session_type:
+            session_type = "single"
+            tpl = TPL_SINGLE
+        elif "duo" in session_type:
+            session_type = "duo"
+            tpl = TPL_DUO
+        elif "trio" in session_type:
+            session_type = "trio"
+            tpl = TPL_TRIO
+        else:
+            # Unknown → alert admin
+            admin_wa = payload.get("admin_number")
+            warn_msg = f"⚠️ Unknown client reminder type: {payload.get('session_type')}"
+            log.warning(warn_msg)
+            if admin_wa:
+                _send_template(admin_wa, "admin_generic_alert_us", {"1": warn_msg})
+            return jsonify({"ok": True, "note": "Unknown session_type"}), 200
+
+        # ── Compose message variables ─────────────────────────────
+        vars = {
+            "1": client_name,
+            "2": session_date,
+            "3": session_time,
+        }
+
+        # ── Send the WhatsApp message ─────────────────────────────
+        ok = _send_template(wa_number, tpl, vars)
+        if ok:
+            log.info(f"✅ Sent {session_type} reminder → {wa_number}")
+            return jsonify({"ok": True, "template": tpl, "to": wa_number}), 200
+        else:
+            log.error(f"❌ Failed to send {session_type} reminder → {wa_number}")
+            return jsonify({"ok": False, "error": "Failed to send"}), 500
+
+    # ──────────────────────────────────────────────
+    # Job-type payloads (night-before, week-ahead, next-hour)
+    # ──────────────────────────────────────────────
     job_type = (payload.get("type") or "").strip()
     sessions = payload.get("sessions", [])
     log.info(f"[client-reminders] Received job={job_type}, count={len(sessions)}")
 
     sent = 0
-
     if job_type == "client-night-before":
         for s in sessions:
             ok = _send_template(
@@ -97,7 +142,6 @@ def handle_client_reminders():
 
     log.info(f"[client-reminders] Job={job_type} → Sent={sent}")
     return jsonify({"ok": True, "sent": sent})
-
 
 # ──────────────────────────────────────────────
 # Health check
