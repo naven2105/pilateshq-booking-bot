@@ -1,16 +1,17 @@
 #render_backend_app/client_reminders.py
 """
-app/client_reminders.py
+client_reminders.py
 ────────────────────────────────────────────
-Google Sheets Integration – No database required.
+Handles reminder jobs sent from Google Apps Script.
+No database required.
 
-Receives reminder jobs from Apps Script:
+Jobs supported:
  • client-night-before  (daily 20h00)
  • client-week-ahead    (Sunday 20h00)
  • client-next-hour     (hourly)
 
-Each job includes a list of sessions or clients in the JSON payload.
-Dispatches WhatsApp templates accordingly.
+Each job includes a JSON list of sessions/clients.
+Dispatches WhatsApp templates via utils.send_whatsapp_template.
 """
 
 from __future__ import annotations
@@ -35,25 +36,20 @@ TEMPLATE_LANG = "en_US"
 # ──────────────────────────────────────────────
 # Helper
 # ──────────────────────────────────────────────
-def _clean(v: str | None) -> str:
-    """Trim value safely for template parameters."""
-    return (v or "").strip()
-
-
 def _send_template(to: str, tpl: str, vars: dict):
-    """Simple wrapper for WhatsApp template send."""
+    """Send a WhatsApp template message."""
     try:
         resp = utils.send_whatsapp_template(
             to=to,
             name=tpl,
             lang=TEMPLATE_LANG,
-            variables=[_clean(v) for v in vars.values()],
+            variables=[str(v or "").strip() for v in vars.values()],
         )
         ok = resp.get("ok", False)
         log.info(f"[send_template] tpl={tpl} to={to} ok={ok}")
         return ok
     except Exception as e:
-        log.warning(f"[send_template] failed to send to {to}: {e}")
+        log.warning(f"[send_template] failed for {to}: {e}")
         return False
 
 
@@ -61,15 +57,24 @@ def _send_template(to: str, tpl: str, vars: dict):
 # POST endpoint from Apps Script
 # ──────────────────────────────────────────────
 @bp.route("/client-reminders", methods=["POST"])
-@safe_execute
+@safe_execute()
 def handle_client_reminders():
     """
-    Handles reminder jobs from Google Apps Script.
+    Payload examples:
+    {
+      "type": "client-night-before",
+      "sessions": [{"client_name": "Mary", "wa_number": "2773...", "session_time": "08:00"}]
+    }
 
-    Example payloads:
-    { "type": "client-night-before", "sessions": [
-        {"client_name": "Mary", "wa_number": "2773...", "session_time": "08:00"}
-    ]}
+    {
+      "type": "client-week-ahead",
+      "sessions": [{"client_name": "Mary", "wa_number": "2773...", "session_date": "Mon 07 Oct", "session_time": "08:00", "session_type": "duo"}]
+    }
+
+    {
+      "type": "client-next-hour",
+      "sessions": [{"client_name": "Mary", "wa_number": "2773...", "session_time": "09:00"}]
+    }
     """
     payload = request.get_json(force=True)
     job_type = (payload.get("type") or "").strip()

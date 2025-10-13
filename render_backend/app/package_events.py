@@ -1,14 +1,14 @@
 #render_backend/app/package_events.py
 """
-app/package_events.py
+package_events.py
 ────────────────────────────────────────────
 Handles package-related updates from Google Sheets.
 
 Endpoints:
- • POST /tasks/package-events
-     → Low-balance alerts, renewals, or summary updates.
+ • POST /package-events
+   → Handles low-balance alerts, renewals, or admin summaries.
 
-Expected payload example:
+Expected payload examples:
 {
   "type": "client-generic-alert",
   "message": "Hi Mary, only 2 sessions left in your pack. Renew soon!",
@@ -31,19 +31,14 @@ TEMPLATE_ADMIN = "admin_generic_alert_us"
 TEMPLATE_LANG = "en_US"
 
 
-def _clean(v: str | None) -> str:
-    """Trim value safely for template parameters."""
-    return (v or "").strip()
-
-
 def _send_generic_alert(to: str, msg: str) -> bool:
-    """Send a simple WhatsApp message using the generic client template."""
+    """Send a WhatsApp alert using a generic client template."""
     try:
         resp = utils.send_whatsapp_template(
             to=to,
             name=TEMPLATE_GENERIC,
             lang=TEMPLATE_LANG,
-            variables=[_clean(msg)],
+            variables=[str(msg or "").strip()],
         )
         ok = resp.get("ok", False)
         log.info(f"[package-alert] to={to} ok={ok} msg={msg}")
@@ -54,9 +49,9 @@ def _send_generic_alert(to: str, msg: str) -> bool:
 
 
 @bp.route("/package-events", methods=["POST"])
-@safe_execute
+@safe_execute()
 def handle_package_events():
-    """Receive package events (low balance, renewals, etc.) from Apps Script."""
+    """Receive package events (low balance, renewals, or admin summaries)."""
     payload = request.get_json(force=True)
     event_type = (payload.get("type") or "").strip()
     log.info(f"[package-events] Received type={event_type}")
@@ -76,7 +71,7 @@ def handle_package_events():
                 to=NADINE_WA,
                 name=TEMPLATE_ADMIN,
                 lang=TEMPLATE_LANG,
-                variables=[_clean(msg)],
+                variables=[str(msg or "").strip()],
             )
             log.info(f"[package-events] Admin alert sent to Nadine: {msg}")
         return jsonify({"ok": True, "message": msg})
