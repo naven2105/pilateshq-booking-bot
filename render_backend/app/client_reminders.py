@@ -1,11 +1,16 @@
-# render_backend_app/client_reminders.py
+#app/client_reminders.py
 """
 client_reminders.py
 ────────────────────────────────────────────
 Handles reminder jobs sent from Google Apps Script.
+
 Supports both:
  • Job-based reminders (night-before, week-ahead, next-hour)
  • Direct single reminders from Apps Script payloads
+
+Includes:
+ - Normalisation of session_type ("reformer single" → "single")
+ - Safe fallback to admin alert if unrecognised
 ────────────────────────────────────────────
 """
 
@@ -66,17 +71,21 @@ def handle_client_reminders():
         wa_number = str(payload.get("wa_number"))
         client_name = payload.get("client_name", "there")
 
-        # Merge and normalise all session type possibilities
-        stype_raw = (
-            payload.get("session_type")
-            or payload.get("type")
-            or ""
-        ).lower().strip()
+        # Prefer explicit session_type over type
+        session_type_raw = payload.get("session_type")
+        type_fallback = payload.get("type")
+
+        # Decide final string to check
+        stype_raw = (session_type_raw or type_fallback or "").lower().strip()
+
+        # If both exist and differ, ignore "type"
+        if session_type_raw and type_fallback and session_type_raw.lower() != type_fallback.lower():
+            log.info(f"Ignoring fallback type '{type_fallback}' because session_type='{session_type_raw}'")
 
         session_date = payload.get("date") or payload.get("session_date")
         session_time = payload.get("start_time", "08:00")
 
-        # Normalise known keywords
+        # Normalise known phrases
         if "single" in stype_raw:
             session_type = "single"
             tpl = TPL_SINGLE
@@ -88,7 +97,7 @@ def handle_client_reminders():
             tpl = TPL_TRIO
         else:
             # Unknown → notify admin for investigation
-            combined = f"{payload.get('session_type')} / {payload.get('type')}"
+            combined = f"{session_type_raw} / {type_fallback}"
             admin_wa = payload.get("admin_number")
             warn_msg = f"⚠️ Unknown client reminder type: {combined}"
             log.warning(warn_msg)
