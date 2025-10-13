@@ -18,7 +18,7 @@ import logging
 from flask import Blueprint, request, jsonify
 from datetime import datetime
 from . import utils
-from .utils import sanitize_param, safe_execute
+from .utils import safe_execute
 
 bp = Blueprint("client_reminders", __name__)
 log = logging.getLogger(__name__)
@@ -31,9 +31,15 @@ TPL_WEEK = "client_weekly_schedule_us"
 TPL_NEXT_HOUR = "client_session_next_hour_us"
 TEMPLATE_LANG = "en_US"
 
+
 # ──────────────────────────────────────────────
 # Helper
 # ──────────────────────────────────────────────
+def _clean(v: str | None) -> str:
+    """Trim value safely for template parameters."""
+    return (v or "").strip()
+
+
 def _send_template(to: str, tpl: str, vars: dict):
     """Simple wrapper for WhatsApp template send."""
     try:
@@ -41,13 +47,13 @@ def _send_template(to: str, tpl: str, vars: dict):
             to=to,
             name=tpl,
             lang=TEMPLATE_LANG,
-            variables=[sanitize_param(v) for v in vars.values()],
+            variables=[_clean(v) for v in vars.values()],
         )
         ok = resp.get("ok", False)
         log.info(f"[send_template] tpl={tpl} to={to} ok={ok}")
         return ok
     except Exception as e:
-        log.warning(f"[send_template] failed to {to}: {e}")
+        log.warning(f"[send_template] failed to send to {to}: {e}")
         return False
 
 
@@ -58,14 +64,11 @@ def _send_template(to: str, tpl: str, vars: dict):
 @safe_execute
 def handle_client_reminders():
     """
-    Payload examples:
-    ───────────────────────────────
-    { "type": "client-night-before", "sessions": [
-        {"client_name": "Mary", "wa_number": "2773...", "session_time": "08:00", "session_type": "duo"}
-    ]}
+    Handles reminder jobs from Google Apps Script.
 
-    { "type": "client-week-ahead", "sessions": [
-        {"client_name": "Mary", "wa_number": "2773...", "session_date": "Mon 07 Oct", "session_time": "08:00", "session_type": "duo"}
+    Example payloads:
+    { "type": "client-night-before", "sessions": [
+        {"client_name": "Mary", "wa_number": "2773...", "session_time": "08:00"}
     ]}
     """
     payload = request.get_json(force=True)

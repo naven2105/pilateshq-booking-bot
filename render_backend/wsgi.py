@@ -3,42 +3,17 @@
 wsgi.py
 ────────────────────────────────────────────
 Main entry point for Gunicorn on Render.
-Initialises the Flask app and registers routes.
+Loads Flask app via create_app() from render_backend.app.
 
-✅ Fixed: absolute imports use render_backend.app.*
+✅ Simplified structure:
+ - Single import from render_backend.app
+ - All routes registered automatically in app/__init__.py
+ - Clean and Render-ready for deployment
 """
 
-from flask import Flask, jsonify
+from render_backend.app import create_app
 
-# ✅ Correct absolute imports for Render
-from render_backend.app.router_webhook import router_bp
-from render_backend.app.tasks_router import tasks_bp
-from render_backend.app.tasks_sheets import bp as tasks_sheets_bp
-
-
-def create_app():
-    """Initialise and configure the Flask app."""
-    app = Flask(__name__)
-
-    # Register blueprints
-    app.register_blueprint(router_bp)
-    app.register_blueprint(tasks_bp)
-    app.register_blueprint(tasks_sheets_bp)
-
-    # ── Health check for Render uptime probes ─────────────
-    @app.route("/", methods=["GET"])
-    def health():
-        """Simple health check endpoint."""
-        return jsonify({
-            "status": "ok",
-            "service": "PilatesHQ Booking Bot",
-            "version": "1.0.0"
-        }), 200
-
-    return app
-
-
-# ── Gunicorn entrypoint ─────────────────────────────────
+# ── Gunicorn entrypoint ─────────────────────────────
 app = create_app()
 
 if __name__ == "__main__":

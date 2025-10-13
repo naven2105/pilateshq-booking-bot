@@ -8,7 +8,7 @@ Endpoints:
  • POST /tasks/package-events
      → Low-balance alerts, renewals, or summary updates.
 
-Expected payload examples from Apps Script:
+Expected payload example:
 {
   "type": "client-generic-alert",
   "message": "Hi Mary, only 2 sessions left in your pack. Renew soon!",
@@ -21,23 +21,29 @@ import logging
 from flask import Blueprint, request, jsonify
 from datetime import datetime
 from . import utils
-from .utils import sanitize_param, safe_execute
+from .utils import safe_execute
 
 bp = Blueprint("package_events", __name__)
 log = logging.getLogger(__name__)
 
 TEMPLATE_GENERIC = "client_generic_alert_us"
+TEMPLATE_ADMIN = "admin_generic_alert_us"
 TEMPLATE_LANG = "en_US"
 
 
+def _clean(v: str | None) -> str:
+    """Trim value safely for template parameters."""
+    return (v or "").strip()
+
+
 def _send_generic_alert(to: str, msg: str) -> bool:
-    """Send a simple WhatsApp message using the generic template."""
+    """Send a simple WhatsApp message using the generic client template."""
     try:
         resp = utils.send_whatsapp_template(
             to=to,
             name=TEMPLATE_GENERIC,
             lang=TEMPLATE_LANG,
-            variables=[sanitize_param(msg)],
+            variables=[_clean(msg)],
         )
         ok = resp.get("ok", False)
         log.info(f"[package-alert] to={to} ok={ok} msg={msg}")
@@ -60,7 +66,7 @@ def handle_package_events():
         wa_number = payload.get("wa_number", "")
         ok = _send_generic_alert(wa_number, msg)
         return jsonify({"ok": ok, "message": msg})
-    
+
     elif event_type == "admin-generic-alert":
         msg = payload.get("message", "")
         from os import getenv
@@ -68,13 +74,12 @@ def handle_package_events():
         if NADINE_WA:
             utils.send_whatsapp_template(
                 to=NADINE_WA,
-                name="admin_generic_alert_us",
-                lang="en_US",
-                variables=[sanitize_param(msg)],
+                name=TEMPLATE_ADMIN,
+                lang=TEMPLATE_LANG,
+                variables=[_clean(msg)],
             )
             log.info(f"[package-events] Admin alert sent to Nadine: {msg}")
         return jsonify({"ok": True, "message": msg})
-
 
     log.warning(f"[package-events] Unknown type: {event_type}")
     return jsonify({"ok": False, "error": f"Unknown type: {event_type}"}), 400
