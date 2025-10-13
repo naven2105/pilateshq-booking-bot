@@ -8,9 +8,9 @@ Jobs supported:
  • client-week-ahead    (Sunday 20h00)
  • client-next-hour     (hourly)
 
-Now supports both:
- • Client-facing WhatsApp templates
- • Admin confirmation messages
+Dual-mode:
+ • Sends WhatsApp templates to clients
+ • Sends confirmation summaries to admin
 """
 
 from __future__ import annotations
@@ -62,7 +62,19 @@ def _notify_admin(admin_number: str, text: str):
 def handle_client_reminders():
     """
     Receives payloads like:
-    { "type": "client-night-before", "sessions": [...] }
+    {
+      "type": "client-night-before",
+      "sessions": [
+        {
+          "wa_number": "27735534607",
+          "client_name": "John Test",
+          "session_type": "single",
+          "session_time": "08:00",
+          "session_date": "2025-10-14"
+        }
+      ],
+      "admin_number": "27627597357"
+    }
     """
     payload = request.get_json(force=True)
     job_type = (payload.get("type") or "").strip()
