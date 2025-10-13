@@ -110,3 +110,18 @@ def handle_client_reminders():
 def test_route():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify({"ok": True, "timestamp": now})
+
+
+@bp.route("/client-reminders/debug", methods=["POST"])
+def debug_reminder_payload():
+    """Diagnostic endpoint to inspect raw payload and parsed type logic."""
+    payload = request.get_json(force=True)
+    stype_raw = (payload.get("session_type") or payload.get("type") or "").lower().strip()
+    if "reformer" in stype_raw:
+        stype_raw = stype_raw.replace("reformer", "").strip()
+    log.info(f"[DEBUG] Raw session_type={payload.get('session_type')} | type={payload.get('type')} | normalised={stype_raw}")
+    return jsonify({
+        "session_type": payload.get("session_type"),
+        "type": payload.get("type"),
+        "normalised": stype_raw
+    })
