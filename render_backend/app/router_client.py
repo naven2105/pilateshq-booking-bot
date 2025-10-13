@@ -1,47 +1,63 @@
+#app/router_client
 """
 router_client.py
 ────────────────
 Handles client messages (non-admin).
 Delegates to client_commands (bookings, cancel, message Nadine).
 Now defaults to the interactive FAQ menu for unrecognised messages.
+
+✅ Rewritten to remove all DB dependencies.
+Uses Google Sheets via webhook to fetch client info.
 """
 
 import logging
 from flask import jsonify
 from . import client_commands
-from .utils import send_whatsapp_text, safe_execute
-from .db import get_session
-from sqlalchemy import text
+from .utils import send_whatsapp_text, safe_execute, post_to_webhook, normalize_wa
 from .client_faqs import handle_faq_message, handle_faq_button
 from .client_nlp import parse_client_command
 from .reschedule_forwarder import forward_reschedule
-from .config import NADINE_WA
+from .config import NADINE_WA, WEBHOOK_BASE
 
 log = logging.getLogger(__name__)
 
 
+# ───────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────
 def client_get(wa: str):
-    """Fetch client record by WhatsApp number."""
-    with get_session() as s:
-        row = s.execute(
-            text("SELECT id, name FROM clients WHERE wa_number=:wa"),
-            {"wa": wa},
-        ).first()
-        if row:
-            return {"id": row[0], "name": row[1]}
+    """Fetch client record by WhatsApp number from Google Sheets."""
+    try:
+        wa_norm = normalize_wa(wa)
+        payload = {"action": "get_clients"}
+        res = post_to_webhook(f"{WEBHOOK_BASE}/sheets", payload)
+        clients = res.get("clients", []) if isinstance(res, dict) else []
+
+        for c in clients:
+            if normalize_wa(c.get("phone", "")) == wa_norm:
+                return {"id": c.get("id", ""), "name": c.get("name", "Client")}
+
+        log.warning(f"[client_get] No match found for WA={wa}")
+        return None
+
+    except Exception as e:
+        log.error(f"❌ Error fetching client by WA={wa}: {e}")
         return None
 
 
+# ───────────────────────────────────────────────
+# Main Client Handler
+# ───────────────────────────────────────────────
 def handle_client(msg, wa: str, text_in: str, client: dict):
     """Handle messages from registered clients."""
-    txt = text_in.strip()
+    txt = (text_in or "").strip()
     msg_type = msg.get("type")
     intent_data = parse_client_command(txt)
 
     # ── Handle interactive FAQ buttons
     if msg_type == "button":
-        button_id = msg["button"]["payload"]
-        if handle_faq_button(wa, button_id):
+        button_id = msg.get("button", {}).get("payload")
+        if button_id and handle_faq_button(wa, button_id):
             return jsonify({"status": "ok", "role": "client_faq_button"}), 200
 
     # ── NLP-driven intents
@@ -70,7 +86,7 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
 
         # Reschedule
         if intent == "reschedule_request":
-            forward_reschedule(client["name"], wa)
+            forward_reschedule(client.get("name", "Client"), wa)
             safe_execute(
                 send_whatsapp_text,
                 wa,
@@ -80,7 +96,7 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
             safe_execute(
                 send_whatsapp_text,
                 NADINE_WA,
-                f"🔁 *Reschedule Request*\nClient: {client['name']}\nWA: {wa}",
+                f"🔁 *Reschedule Request*\nClient: {client.get('name', 'Unknown')}\nWA: {wa}",
                 label="reschedule_admin_alert"
             )
             return jsonify({"status": "ok", "role": "client_reschedule"}), 200
@@ -96,7 +112,7 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
             safe_execute(
                 send_whatsapp_text,
                 NADINE_WA,
-                f"💸 *Payment confirmation received*\nClient: {client['name']}\nWA: {wa}",
+                f"💸 *Payment confirmation received*\nClient: {client.get('name', 'Unknown')}\nWA: {wa}",
                 label="payment_admin_alert"
             )
             return jsonify({"status": "ok", "role": "client_payment_confirmation"}), 200
@@ -122,21 +138,22 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
             safe_execute(
                 send_whatsapp_text,
                 NADINE_WA,
-                f"📞 *Client wants to contact you*\nName: {client['name']}\nWA: {wa}\nMessage: {txt}",
+                f"📞 *Client wants to contact you*\nName: {client.get('name', 'Unknown')}\nWA: {wa}\nMessage: {txt}",
                 label="admin_contact_alert"
             )
             return jsonify({"status": "ok", "role": "client_contact_admin"}), 200
 
         # Greeting → polite default
         if intent == "greeting":
+            name_short = client.get("name", "there").split()[0]
             safe_execute(
                 send_whatsapp_text,
                 wa,
-                f"Hi {client['name'].split()[0]} 👋\nHow can I assist today?\nYou can type *bookings*, *faq*, or *message Nadine*.",
+                f"Hi {name_short} 👋\nHow can I assist today?\nYou can type *bookings*, *faq*, or *message Nadine*.",
                 label="client_greeting"
             )
             return jsonify({"status": "ok", "role": "client_greeting"}), 200
 
-    # ── Default fallback → show FAQ
+    # ── Default fallback → FAQ menu
     handle_faq_message(wa, "faq")
     return jsonify({"status": "ok", "role": "client_faq_default"}), 200

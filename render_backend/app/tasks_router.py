@@ -15,7 +15,7 @@ Routes:
 import os
 import logging
 from flask import Blueprint, request, jsonify
-from render_backend.app.utils import send_whatsapp_template
+from .utils import send_whatsapp_template
 
 # ── Setup ──────────────────────────────────────────────────────
 log = logging.getLogger(__name__)

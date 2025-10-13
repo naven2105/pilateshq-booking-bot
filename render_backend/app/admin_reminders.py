@@ -1,61 +1,61 @@
-from __future__ import annotations
+#app/admin_reminders
+"""
+admin_reminders.py
+────────────────────────────────────────────
+Generates daily admin summaries from Google Sheets.
+
+Replaces SQL lookups with webhook integration (Sheets backend).
+Sends WhatsApp template messages:
+ - Morning summary (06h00)
+ - Evening preview (20h00)
+"""
+
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict
 
-from sqlalchemy import text
-
-from .config import ADMIN_NUMBERS
-from .db import get_session
+from .config import ADMIN_NUMBERS, WEBHOOK_BASE
 from . import utils
 
 log = logging.getLogger(__name__)
 TZ = ZoneInfo("Africa/Johannesburg")
 
 
-def _fetch_today_hourly_names() -> Dict[str, List[str]]:
-    """Dict 'HH:MM' -> [client names...] for today's confirmed bookings."""
-    today = datetime.now(TZ).date()
-    sql = text("""
-        SELECT to_char(s.start_time, 'HH24:MI') AS hhmm, c.name AS client_name
-        FROM sessions s
-        JOIN bookings b ON b.session_id = s.id
-        JOIN clients  c ON c.id = b.client_id
-        WHERE s.session_date = :today
-          AND b.status = 'confirmed'
-        ORDER BY s.start_time, c.name
-    """)
-    by_hour: Dict[str, List[str]] = {}
-    with get_session() as s:
-        rows = s.execute(sql, {"today": today}).all()
-    for hhmm, name in rows:
-        by_hour.setdefault(hhmm, []).append(name)
-    return by_hour
+# ───────────────────────────────────────────────
+# Helpers (fetch + format)
+# ───────────────────────────────────────────────
+def _fetch_sessions(target_date: datetime.date) -> Dict[str, List[str]]:
+    """
+    Fetch confirmed sessions for the given date from Google Sheets.
+    Returns dict { 'HH:MM': ['Client1', 'Client2', ...] }.
+    """
+    try:
+        payload = {"action": "get_sessions"}
+        res = utils.post_to_webhook(f"{WEBHOOK_BASE}/sheets", payload)
+        rows = res.get("sessions", []) if isinstance(res, dict) else []
 
+        by_hour: Dict[str, List[str]] = {}
+        date_str = target_date.strftime("%Y-%m-%d")
 
-def _fetch_tomorrow_hourly_names() -> Dict[str, List[str]]:
-    """Dict 'HH:MM' -> [client names...] for tomorrow’s confirmed bookings."""
-    tomorrow = datetime.now(TZ).date() + timedelta(days=1)
-    sql = text("""
-        SELECT to_char(s.start_time, 'HH24:MI') AS hhmm, c.name AS client_name
-        FROM sessions s
-        JOIN bookings b ON b.session_id = s.id
-        JOIN clients  c ON c.id = b.client_id
-        WHERE s.session_date = :tomorrow
-          AND b.status = 'confirmed'
-        ORDER BY s.start_time, c.name
-    """)
-    by_hour: Dict[str, List[str]] = {}
-    with get_session() as s:
-        rows = s.execute(sql, {"tomorrow": tomorrow}).all()
-    for hhmm, name in rows:
-        by_hour.setdefault(hhmm, []).append(name)
-    return by_hour
+        for row in rows:
+            session_date = row.get("session_date")
+            time = row.get("start_time")
+            client = row.get("client_name")
+            status = (row.get("status") or "").lower()
+
+            if session_date == date_str and status == "confirmed":
+                by_hour.setdefault(time, []).append(client)
+
+        return by_hour
+
+    except Exception as e:
+        log.error(f"❌ Error fetching sessions for {target_date}: {e}")
+        return {}
 
 
 def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
-    """One-line summary: '06:00(3): A, B, C • 07:00(2): D, E'"""
+    """Format into compact summary text."""
     if not by_hour:
         return "No sessions scheduled."
     parts: List[str] = []
@@ -66,9 +66,9 @@ def _format_admin_summary_line(by_hour: Dict[str, List[str]]) -> str:
 
 
 def _send_to_admins(tpl_name: str, count: int, details: str, context_label: str) -> int:
-    """Send using US-approved templates only, fallback to plain text if needed."""
+    """Send WhatsApp templates to all admins, fallback to text."""
     sent_ok = 0
-    log.info("→ using template=%s", tpl_name)
+    log.info(f"[{context_label}] Using template {tpl_name}")
 
     for admin in ADMIN_NUMBERS:
         resp = utils.send_whatsapp_template(
@@ -81,14 +81,13 @@ def _send_to_admins(tpl_name: str, count: int, details: str, context_label: str)
         status = resp.get("status_code")
 
         log.info(
-            "[%s][send] to=%s tpl=%s lang=en_US status=%s ok=%s count=%s",
+            "[%s][send] to=%s tpl=%s status=%s ok=%s count=%s",
             context_label, admin, tpl_name, status, ok, count
         )
 
         if ok:
             sent_ok += 1
         else:
-            # fallback plain text with explicit log marker
             body = f"PilatesHQ {context_label}\nTotal sessions: {count}\n{details}"
             utils.send_whatsapp_text(admin, body)
             log.error(
@@ -99,9 +98,13 @@ def _send_to_admins(tpl_name: str, count: int, details: str, context_label: str)
     return sent_ok
 
 
+# ───────────────────────────────────────────────
+# Main jobs
+# ───────────────────────────────────────────────
 def run_admin_morning() -> int:
     """06:00 SAST morning brief using 'admin_morning_us' template."""
-    by_hour = _fetch_today_hourly_names()
+    today = datetime.now(TZ).date()
+    by_hour = _fetch_sessions(today)
     details = _format_admin_summary_line(by_hour)
     count = len(by_hour)
     return _send_to_admins("admin_morning_us", count, details, "admin-morning")
@@ -109,7 +112,8 @@ def run_admin_morning() -> int:
 
 def run_admin_daily() -> int:
     """20:00 SAST evening preview using 'admin_20h00_us' template."""
-    by_hour = _fetch_tomorrow_hourly_names()
+    tomorrow = datetime.now(TZ).date() + timedelta(days=1)
+    by_hour = _fetch_sessions(tomorrow)
     details = _format_admin_summary_line(by_hour)
     count = len(by_hour)
     return _send_to_admins("admin_20h00_us", count, details, "admin-daily")
