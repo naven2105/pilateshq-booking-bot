@@ -6,7 +6,7 @@ Handles task webhook calls from Google Apps Script.
 Routes:
  - /tasks/run-reminders          → Admin morning/evening summaries
  - /tasks/client-next-hour       → Client next-hour reminders
- - /tasks/client-reminders       → Client night-before / week-ahead
+ - /tasks/client-reminders       → (⚠️ now handled by app.client_reminders)
  - /tasks/package-events         → Package low-balance, unused credits
  - /tasks/client-behaviour       → Weekly attendance analytics
 ────────────────────────────────────────────
@@ -100,8 +100,12 @@ def client_next_hour():
 
 
 # ─────────────────────────────────────────────────────────────
-# ROUTE: Client night-before / week-ahead reminders
+# ROUTE: Client night-before / week-ahead reminders (LEGACY)
 # ─────────────────────────────────────────────────────────────
+# ⚠️ Deprecated: This route is now handled by `app.client_reminders`
+# to support richer payload structures and multi-client dispatch.
+# Keeping commented for reference in case rollback is needed.
+"""
 @tasks_bp.route("/client-reminders", methods=["POST"])
 def client_reminders():
     data = request.get_json(force=True)
@@ -117,6 +121,7 @@ def client_reminders():
         _send_admin_message(f"⚠️ Unknown client reminder type: {msg_type}")
 
     return jsonify({"ok": True, "message": msg_type})
+"""
 
 
 # ─────────────────────────────────────────────────────────────
