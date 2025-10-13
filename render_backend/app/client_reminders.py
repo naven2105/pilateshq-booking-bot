@@ -30,6 +30,7 @@ TPL_DUO = "client_duo_reminder_us"
 TPL_TRIO = "client_trio_reminder_us"
 TEMPLATE_LANG = "en_US"
 
+
 # ──────────────────────────────────────────────
 # Helper
 # ──────────────────────────────────────────────
@@ -44,8 +45,9 @@ def _send_template(to: str, tpl: str, vars: dict):
         [str(v or "").strip() for v in vars.values()],
     )
 
+
 # ──────────────────────────────────────────────
-# POST endpoint from Apps Script (Direct)
+# POST endpoint from Apps Script
 # ──────────────────────────────────────────────
 @bp.route("/client-reminders", methods=["POST"])
 def handle_client_reminders():
@@ -54,45 +56,49 @@ def handle_client_reminders():
     • Job-style payloads from Apps Script (type + sessions list)
     • Direct single-session payloads from Apps Script (wa_number + session_type + date)
     """
-
     payload = request.get_json(force=True)
     log.info(f"[Tasks] /client-reminders payload: {payload}")
 
-    # Direct payload (used by Apps Script runTestScenario / sendOneTestPOST)
+    # ──────────────────────────────────────────────
+    # Direct single-session payload (from Apps Script)
+    # ──────────────────────────────────────────────
     if "wa_number" in payload:
         wa_number = str(payload.get("wa_number"))
         client_name = payload.get("client_name", "there")
-        session_type = (payload.get("session_type") or payload.get("type") or "").lower().strip()
+
+        # Merge and normalise all session type possibilities
+        stype_raw = (
+            payload.get("session_type")
+            or payload.get("type")
+            or ""
+        ).lower().strip()
+
         session_date = payload.get("date") or payload.get("session_date")
         session_time = payload.get("start_time", "08:00")
 
-        # ── Normalise session_type ────────────────────────────────
-        if "single" in session_type:
+        # Normalise known keywords
+        if "single" in stype_raw:
             session_type = "single"
             tpl = TPL_SINGLE
-        elif "duo" in session_type:
+        elif "duo" in stype_raw:
             session_type = "duo"
             tpl = TPL_DUO
-        elif "trio" in session_type:
+        elif "trio" in stype_raw:
             session_type = "trio"
             tpl = TPL_TRIO
         else:
-            # Unknown → alert admin
+            # Unknown → notify admin for investigation
+            combined = f"{payload.get('session_type')} / {payload.get('type')}"
             admin_wa = payload.get("admin_number")
-            warn_msg = f"⚠️ Unknown client reminder type: {payload.get('session_type')}"
+            warn_msg = f"⚠️ Unknown client reminder type: {combined}"
             log.warning(warn_msg)
             if admin_wa:
                 _send_template(admin_wa, "admin_generic_alert_us", {"1": warn_msg})
             return jsonify({"ok": True, "note": "Unknown session_type"}), 200
 
-        # ── Compose message variables ─────────────────────────────
-        vars = {
-            "1": client_name,
-            "2": session_date,
-            "3": session_time,
-        }
+        # Build template variables
+        vars = {"1": client_name, "2": session_date, "3": session_time}
 
-        # ── Send the WhatsApp message ─────────────────────────────
         ok = _send_template(wa_number, tpl, vars)
         if ok:
             log.info(f"✅ Sent {session_type} reminder → {wa_number}")
@@ -109,6 +115,7 @@ def handle_client_reminders():
     log.info(f"[client-reminders] Received job={job_type}, count={len(sessions)}")
 
     sent = 0
+
     if job_type == "client-night-before":
         for s in sessions:
             ok = _send_template(
@@ -142,6 +149,7 @@ def handle_client_reminders():
 
     log.info(f"[client-reminders] Job={job_type} → Sent={sent}")
     return jsonify({"ok": True, "sent": sent})
+
 
 # ──────────────────────────────────────────────
 # Health check
