@@ -5,18 +5,15 @@ wsgi.py
 Main entry point for Gunicorn on Render.
 Initialises the Flask app and registers routes.
 
-✅ Updated for Render compatibility:
- • Imports fixed to match current files
- • No references to removed modules
- • Works with tasks_router and tasks_sheets
+✅ Fixed: absolute imports use render_backend.app.*
 """
 
 from flask import Flask, jsonify
 
-# ✅ Correct relative imports
-from app.router_webhook import router_bp
-from app.tasks_router import tasks_bp
-from app.tasks_sheets import bp as tasks_sheets_bp
+# ✅ Correct absolute imports for Render
+from render_backend.app.router_webhook import router_bp
+from render_backend.app.tasks_router import tasks_bp
+from render_backend.app.tasks_sheets import bp as tasks_sheets_bp
 
 
 def create_app():
