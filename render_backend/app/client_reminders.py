@@ -1,17 +1,16 @@
-# render_backend_app/client_reminders.py
 """
 client_reminders.py
 ────────────────────────────────────────────
 Handles reminder jobs sent from Google Apps Script.
-No database required.
 
 Jobs supported:
  • client-night-before  (daily 20h00)
  • client-week-ahead    (Sunday 20h00)
  • client-next-hour     (hourly)
 
-Each job includes a JSON list of sessions/clients.
-Dispatches WhatsApp templates via utils.send_whatsapp_template.
+Now supports both:
+ • Client-facing WhatsApp templates
+ • Admin confirmation messages
 """
 
 from __future__ import annotations
@@ -25,16 +24,17 @@ bp = Blueprint("client_reminders", __name__)
 log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
-# Constants (template names)
+# WhatsApp Templates
 # ──────────────────────────────────────────────
-TPL_NIGHT = "client_session_tomorrow_us"
-TPL_WEEK = "client_weekly_schedule_us"
-TPL_NEXT_HOUR = "client_session_next_hour_us"
+TPL_NIGHT = "client_session_tomorrow_us"      # Client: Night-before
+TPL_WEEK = "client_weekly_schedule_us"        # Client: Week ahead
+TPL_NEXT_HOUR = "client_session_next_hour_us" # Client: Next-hour
+TPL_ADMIN = "admin_generic_alert_us"          # Admin: Summary
 TEMPLATE_LANG = "en_US"
 
 
 # ──────────────────────────────────────────────
-# Helper
+# Helper wrappers
 # ──────────────────────────────────────────────
 def _send_template(to: str, tpl: str, vars: dict):
     """Send a WhatsApp template message safely."""
@@ -46,6 +46,13 @@ def _send_template(to: str, tpl: str, vars: dict):
         TEMPLATE_LANG,
         [str(v or "").strip() for v in vars.values()],
     )
+
+
+def _notify_admin(admin_number: str, text: str):
+    """Send admin confirmation summary."""
+    if not admin_number:
+        return
+    _send_template(admin_number, TPL_ADMIN, {"1": text})
 
 
 # ──────────────────────────────────────────────
@@ -60,19 +67,23 @@ def handle_client_reminders():
     payload = request.get_json(force=True)
     job_type = (payload.get("type") or "").strip()
     sessions = payload.get("sessions", [])
+    admin_number = payload.get("admin_number")
     log.info(f"[client-reminders] Received job={job_type}, count={len(sessions)}")
 
-    sent = 0
+    sent_clients = 0
 
+    # ─── CLIENT NIGHT-BEFORE ─────────────────────────────
     if job_type == "client-night-before":
         for s in sessions:
             ok = _send_template(
                 s.get("wa_number"),
                 TPL_NIGHT,
-                {"1": s.get("session_time", "")},
+                {"1": s.get("session_time", "08:00")},
             )
-            sent += 1 if ok else 0
+            sent_clients += 1 if ok else 0
+        _notify_admin(admin_number, f"🌙 Sent client night-before reminders ({sent_clients}).")
 
+    # ─── CLIENT WEEK-AHEAD ───────────────────────────────
     elif job_type == "client-week-ahead":
         for s in sessions:
             msg = f"{s.get('session_date')} – {s.get('session_time')} ({s.get('session_type')})"
@@ -81,8 +92,10 @@ def handle_client_reminders():
                 TPL_WEEK,
                 {"1": s.get("client_name", 'there'), "2": msg},
             )
-            sent += 1 if ok else 0
+            sent_clients += 1 if ok else 0
+        _notify_admin(admin_number, f"📅 Sent client week-ahead reminders ({sent_clients}).")
 
+    # ─── CLIENT NEXT-HOUR ────────────────────────────────
     elif job_type == "client-next-hour":
         for s in sessions:
             ok = _send_template(
@@ -90,13 +103,15 @@ def handle_client_reminders():
                 TPL_NEXT_HOUR,
                 {"1": s.get("session_time", "")},
             )
-            sent += 1 if ok else 0
+            sent_clients += 1 if ok else 0
+        _notify_admin(admin_number, f"⏰ Sent client next-hour reminders ({sent_clients}).")
 
     else:
+        _notify_admin(admin_number, f"⚠️ Unknown client reminder type: {job_type}")
         return jsonify({"ok": False, "error": f"Unknown job type: {job_type}"}), 400
 
-    log.info(f"[client-reminders] Job={job_type} → Sent={sent}")
-    return jsonify({"ok": True, "sent": sent})
+    log.info(f"[client-reminders] Job={job_type} → Sent={sent_clients}")
+    return jsonify({"ok": True, "sent_clients": sent_clients, "message": job_type})
 
 
 # ──────────────────────────────────────────────
