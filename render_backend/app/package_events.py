@@ -33,23 +33,17 @@ TEMPLATE_LANG = "en_US"
 
 def _send_generic_alert(to: str, msg: str) -> bool:
     """Send a WhatsApp alert using a generic client template."""
-    try:
-        resp = utils.send_whatsapp_template(
-            to=to,
-            name=TEMPLATE_GENERIC,
-            lang=TEMPLATE_LANG,
-            variables=[str(msg or "").strip()],
-        )
-        ok = resp.get("ok", False)
-        log.info(f"[package-alert] to={to} ok={ok} msg={msg}")
-        return ok
-    except Exception as e:
-        log.warning(f"[package-alert] failed to send to {to}: {e}")
-        return False
+    return safe_execute(
+        f"send_package_alert to {to}",
+        utils.send_whatsapp_template,
+        to,
+        TEMPLATE_GENERIC,
+        TEMPLATE_LANG,
+        [str(msg or "").strip()],
+    )
 
 
 @bp.route("/package-events", methods=["POST"])
-@safe_execute()
 def handle_package_events():
     """Receive package events (low balance, renewals, or admin summaries)."""
     payload = request.get_json(force=True)
@@ -67,11 +61,13 @@ def handle_package_events():
         from os import getenv
         NADINE_WA = getenv("NADINE_WA", "")
         if NADINE_WA:
-            utils.send_whatsapp_template(
-                to=NADINE_WA,
-                name=TEMPLATE_ADMIN,
-                lang=TEMPLATE_LANG,
-                variables=[str(msg or "").strip()],
+            safe_execute(
+                "send_admin_package_alert",
+                utils.send_whatsapp_template,
+                NADINE_WA,
+                TEMPLATE_ADMIN,
+                TEMPLATE_LANG,
+                [str(msg or "").strip()],
             )
             log.info(f"[package-events] Admin alert sent to Nadine: {msg}")
         return jsonify({"ok": True, "message": msg})

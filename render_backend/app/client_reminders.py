@@ -37,44 +37,25 @@ TEMPLATE_LANG = "en_US"
 # Helper
 # ──────────────────────────────────────────────
 def _send_template(to: str, tpl: str, vars: dict):
-    """Send a WhatsApp template message."""
-    try:
-        resp = utils.send_whatsapp_template(
-            to=to,
-            name=tpl,
-            lang=TEMPLATE_LANG,
-            variables=[str(v or "").strip() for v in vars.values()],
-        )
-        ok = resp.get("ok", False)
-        log.info(f"[send_template] tpl={tpl} to={to} ok={ok}")
-        return ok
-    except Exception as e:
-        log.warning(f"[send_template] failed for {to}: {e}")
-        return False
+    """Send a WhatsApp template message safely."""
+    return safe_execute(
+        f"send_template {tpl}",
+        utils.send_whatsapp_template,
+        to,
+        tpl,
+        TEMPLATE_LANG,
+        [str(v or "").strip() for v in vars.values()],
+    )
 
 
 # ──────────────────────────────────────────────
 # POST endpoint from Apps Script
 # ──────────────────────────────────────────────
 @bp.route("/client-reminders", methods=["POST"])
-@safe_execute()
 def handle_client_reminders():
     """
-    Payload examples:
-    {
-      "type": "client-night-before",
-      "sessions": [{"client_name": "Mary", "wa_number": "2773...", "session_time": "08:00"}]
-    }
-
-    {
-      "type": "client-week-ahead",
-      "sessions": [{"client_name": "Mary", "wa_number": "2773...", "session_date": "Mon 07 Oct", "session_time": "08:00", "session_type": "duo"}]
-    }
-
-    {
-      "type": "client-next-hour",
-      "sessions": [{"client_name": "Mary", "wa_number": "2773...", "session_time": "09:00"}]
-    }
+    Receives payloads like:
+    { "type": "client-night-before", "sessions": [...] }
     """
     payload = request.get_json(force=True)
     job_type = (payload.get("type") or "").strip()
@@ -88,7 +69,7 @@ def handle_client_reminders():
             ok = _send_template(
                 s.get("wa_number"),
                 TPL_NIGHT,
-                {"1": s.get("session_time", "")}
+                {"1": s.get("session_time", "")},
             )
             sent += 1 if ok else 0
 
@@ -98,7 +79,7 @@ def handle_client_reminders():
             ok = _send_template(
                 s.get("wa_number"),
                 TPL_WEEK,
-                {"1": s.get("client_name", 'there'), "2": msg}
+                {"1": s.get("client_name", 'there'), "2": msg},
             )
             sent += 1 if ok else 0
 
@@ -107,7 +88,7 @@ def handle_client_reminders():
             ok = _send_template(
                 s.get("wa_number"),
                 TPL_NEXT_HOUR,
-                {"1": s.get("session_time", "")}
+                {"1": s.get("session_time", "")},
             )
             sent += 1 if ok else 0
 
