@@ -16,20 +16,20 @@ Routes:
 ────────────────────────────────────────────
 """
 
-import os
 import logging
 from flask import Blueprint, request, jsonify
-from datetime import datetime
-from sqlalchemy import text
-from .db import get_session
-from .utils import send_whatsapp_template, safe_execute
+from .utils import send_whatsapp_template
+import os
+import datetime
 
+# ── Setup ─────────────────────────────────────────────
 log = logging.getLogger(__name__)
 bp = Blueprint("attendance_bp", __name__)
 
 # ── Environment Variables ──────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
+
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
 TPL_CLIENT_CONFIRM = "client_generic_alert_us"   # ✅ client confirmation
 WEB_APP_URL = os.getenv("WEB_APP_URL", "")       # Optional Google Sheet sync
