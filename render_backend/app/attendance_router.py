@@ -79,29 +79,19 @@ def _log_reschedule(wa_number: str, client_name: str = None):
     log.info(f"🗒️ Logged reschedule for {wa_number}")
 
 
+# ─────────────────────────────────────────────────────────────
+# Stub: Update booking status (Google Sheets version)
+# ─────────────────────────────────────────────────────────────
 def _update_booking_status(wa_number: str):
-    """Mark the client’s latest upcoming booking as pending_reschedule."""
-    with get_session() as s:
-        result = s.execute(
-            text(
-                """
-                UPDATE bookings
-                SET status = 'pending_reschedule'
-                WHERE client_id = (
-                    SELECT id FROM clients WHERE wa_number = :wa LIMIT 1
-                )
-                AND session_id IN (
-                    SELECT id FROM sessions WHERE session_date >= CURRENT_DATE
-                )
-                RETURNING id
-                """
-            ),
-            {"wa": wa_number},
-        )
-        count = result.rowcount
-        s.commit()
-    log.info(f"🔄 Updated {count} booking(s) → pending_reschedule")
-    return count
+    """
+    Log the reschedule request for the client (Google Sheets version).
+    Since we are not using PostgreSQL, this will be replaced later
+    with a Sheets API write or webhook trigger.
+    """
+    log.info(f"[attendance_router] (Sheets mode) Logging reschedule for {wa_number}")
+    # Placeholder: In future, you’ll append this info to a 'Reschedules' sheet
+    return True
+
 
 
 def _notify_script(wa_number: str):
@@ -121,22 +111,29 @@ def process_attendance():
     data = request.get_json(force=True)
     log.info(f"[attendance_router] Incoming payload: {data}")
 
-    wa_number = str(data.get("wa_number", "")).strip()
-    client_name = data.get("client_name", "")
-    message_text = str(data.get("message", "")).lower().strip()
+    wa_number = data.get("wa_number")
+    client_name = data.get("client_name")
+    message = data.get("message", "").lower()
 
-    if not wa_number or not message_text:
-        return jsonify({"ok": False, "error": "Missing wa_number or message"}), 400
+    if "reschedule" in message:
+        _update_booking_status(wa_number)
 
-    if not any(k in message_text for k in RESCHEDULE_KEYWORDS):
-        log.info(f"⚠ No reschedule keyword detected in: {message_text}")
-        return jsonify({"ok": True, "ignored": True, "reason": "no match"})
+        # ✅ Notify client
+        send_whatsapp_template(
+            to=wa_number,
+            name="client_generic_alert_us",
+            lang="en_US",
+            variables=[f"Hi {client_name}, we’ve received your reschedule request. Nadine will confirm a new time soon 🤸‍♀️"]
+        )
 
-    # Process reschedule
-    _update_booking_status(wa_number)
-    _log_reschedule(wa_number, client_name)
-    _notify_admin(client_name, wa_number)
-    _notify_client(wa_number)
-    _notify_script(wa_number)
+        # ✅ Notify Nadine
+        send_whatsapp_template(
+            to=os.getenv("NADINE_WA"),
+            name="admin_generic_alert_us",
+            lang="en_US",
+            variables=[f"🔄 {client_name} requested to reschedule their session."]
+        )
 
-    return jsonify({"ok": True, "action": "pending_reschedule"})
+        return jsonify({"ok": True, "action": "reschedule"})
+
+    return jsonify({"ok": False, "reason": "no reschedule keyword found"}), 400
