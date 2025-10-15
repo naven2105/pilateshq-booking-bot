@@ -1,4 +1,3 @@
-# booking/requirements.txt
 # === PilatesHQ WhatsApp Bot – Google Sheets Edition ===
 # Clean version with no database dependencies.
 
@@ -6,6 +5,7 @@ Flask==3.0.3
 gunicorn==22.0.0
 requests==2.32.3
 python-dotenv>=1.0.1
+pytz==2024.1   # ✅ Added for timezone handling (attendance_router.py)
 
 # Optional (keep only if used elsewhere)
 reportlab>=4.0.4      # For PDF generation
