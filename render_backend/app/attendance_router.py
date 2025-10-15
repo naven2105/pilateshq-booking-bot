@@ -1,3 +1,4 @@
+# app/attendance_router.py
 """
 attendance_router.py
 ────────────────────────────────────────────
@@ -14,19 +15,16 @@ import datetime
 from flask import Blueprint, request, jsonify
 from .utils import send_whatsapp_template
 
-# ── Setup ──────────────────────────────────────────────────────
 bp = Blueprint("attendance_bp", __name__)
 log = logging.getLogger(__name__)
 
-# ── Environment configuration ──────────────────────────────────
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
-GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK")  # ✅ Apps Script WebApp URL
-CLIENT_SHEET_ID = os.getenv("CLIENT_SHEET_ID")            # ✅ PilatesHQ Sheet ID
+# ── Environment ──────────────────────────────────────────────────────────
+GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK")
+CLIENT_SHEET_ID = os.getenv("CLIENT_SHEET_ID")
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 TZ_NAME = os.getenv("TZ_NAME", "Africa/Johannesburg")
 
-# ── Templates ──────────────────────────────────────────────────
 TPL_CLIENT_ALERT = "client_generic_alert_us"
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
 
@@ -40,24 +38,22 @@ def _now_local() -> str:
 
 
 def _notify_client(wa_number: str, client_name: str):
-    """Notify client that reschedule request was received."""
     send_whatsapp_template(
         to=wa_number,
         name=TPL_CLIENT_ALERT,
         lang=TEMPLATE_LANG,
         variables=[
-            f"Hi {client_name}, we’ve received your reschedule request. Nadine will confirm a new time soon 🤸‍♀️"
+            f"Hi {client_name}, we’ve received your reschedule request. Nadine will confirm a new time soon."
         ],
     )
 
 
 def _notify_admin(client_name: str, date: str, time: str, message: str):
-    """Notify Nadine of a new reschedule request with date/time context."""
     if not NADINE_WA:
         log.warning("⚠️ NADINE_WA not configured.")
         return
 
-    alert = f"🔄 *Reschedule Request*\n{client_name} — {date} {time}\n“{message}”"
+    alert = f"Reschedule Request: {client_name} — {date} {time}. Msg: {message}"
     send_whatsapp_template(
         to=NADINE_WA,
         name=TPL_ADMIN_ALERT,
@@ -67,7 +63,6 @@ def _notify_admin(client_name: str, date: str, time: str, message: str):
 
 
 def _append_to_sheet(client_name: str, wa_number: str, date: str, time: str, message: str):
-    """Append reschedule record to Google Sheets via Apps Script."""
     if not GOOGLE_SHEET_WEBHOOK:
         log.warning("⚠️ GOOGLE_SHEET_WEBHOOK not configured.")
         return
@@ -94,7 +89,6 @@ def _append_to_sheet(client_name: str, wa_number: str, date: str, time: str, mes
 
 # ─────────────────────────────────────────────────────────────
 # ROUTE: /attendance/log
-# Called when client sends a WhatsApp reschedule message
 # ─────────────────────────────────────────────────────────────
 @bp.route("/attendance/log", methods=["POST"])
 def log_attendance():
@@ -108,20 +102,16 @@ def log_attendance():
     if not wa_number or not client_name:
         return jsonify({"ok": False, "error": "Missing required fields"}), 400
 
-    # ✅ Only handle messages that contain the word "reschedule"
     if "reschedule" not in message.lower():
         return jsonify({"ok": False, "reason": "no reschedule keyword found"}), 400
 
-    # Basic parsing for date/time mentions (optional, for audit clarity)
-    date_guess = ""
-    time_guess = ""
+    date_guess, time_guess = "", ""
     for token in message.split():
         if ":" in token or "h" in token:
             time_guess = token.replace("h", ":")
         if any(d in token.lower() for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun", "day"]):
             date_guess = token
 
-    # Log to sheet and notify both parties
     _append_to_sheet(client_name, wa_number, date_guess, time_guess, message)
     _notify_client(wa_number, client_name)
     _notify_admin(client_name, date_guess or "-", time_guess or "-", message)
@@ -130,7 +120,7 @@ def log_attendance():
 
 
 # ─────────────────────────────────────────────────────────────
-# ROUTE: /attendance/close (Admin command “Close <name>”)
+# ROUTE: /attendance/close
 # ─────────────────────────────────────────────────────────────
 @bp.route("/attendance/close", methods=["POST"])
 def close_reschedule():
@@ -141,7 +131,6 @@ def close_reschedule():
         return jsonify({"ok": False, "error": "Missing client name"}), 400
 
     payload = {"action": "close_reschedule", "client": client_name, "sheet_id": CLIENT_SHEET_ID}
-
     try:
         resp = requests.post(GOOGLE_SHEET_WEBHOOK, json=payload, timeout=10)
         result = resp.json() if resp.ok else {"ok": False, "error": "Script error"}
@@ -160,9 +149,6 @@ def close_reschedule():
     return jsonify(result)
 
 
-# ─────────────────────────────────────────────────────────────
-# HEALTH CHECK
-# ─────────────────────────────────────────────────────────────
 @bp.route("/attendance", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "Attendance Router"}), 200
