@@ -1,14 +1,9 @@
-#app/admin_bookings.py
 """
 admin_bookings.py
 ────────────────────────────────────────────
 Handles booking-related admin commands using Google Sheets integration.
-Supports:
- - Single bookings
- - Recurring bookings
- - Multi-day recurring bookings
- - Cancel next booking
- - Mark sick / no-show today
+Now auto-closes any related reschedule once booking succeeds.
+────────────────────────────────────────────
 """
 
 import logging
@@ -18,9 +13,10 @@ from .utils import (
     safe_execute,
     send_whatsapp_button,
     post_to_webhook,
+    post_with_retry,  # ✅ new import for retry-enabled POST
 )
 from .admin_utils import _find_client_matches, _confirm_or_disambiguate
-from .config import WEBHOOK_BASE
+from .config import WEBHOOK_BASE, NADINE_WA
 
 log = logging.getLogger(__name__)
 
@@ -41,9 +37,7 @@ def normalize_time(t: str) -> str:
 
 
 def _add_session_to_sheet(client_name, wa_number, session_date, start_time, slot_type, status="confirmed", notes=""):
-    """
-    Append a booking row to the Google Sheet via Apps Script endpoint.
-    """
+    """Append a booking row to the Google Sheet via Apps Script endpoint."""
     payload = {
         "action": "add_session",
         "client_name": client_name,
@@ -73,10 +67,27 @@ def _notify_booking(client_name, wa_number, session_date, session_time, slot_typ
     )
 
 
+def _auto_close_reschedule(client_name: str):
+    """Automatically close any open reschedule for this client with retry and merged admin alert."""
+    try:
+        payload = {"client_name": client_name}
+        resp = post_with_retry(f"{WEBHOOK_BASE}/attendance/close", payload, retries=3)
+
+        if resp and resp.ok:
+            log.info(f"[AUTO CLOSE] Reschedule closed for {client_name}")
+            msg = f"✅ {client_name} rebooked and reschedule closed successfully."
+            safe_execute("notify_admin_merge", send_whatsapp_text, NADINE_WA, msg)
+        else:
+            log.warning(f"[AUTO CLOSE] Failed to close reschedule for {client_name} after retries.")
+    except Exception as e:
+        log.warning(f"[AUTO CLOSE] Unexpected error closing reschedule for {client_name}: {e}")
+
+
 # ── Main Dispatcher ─────────────────────────────────────
 def handle_booking_command(parsed: dict, wa: str):
     """
     Routes parsed admin booking commands to Google Sheets integration.
+    Automatically closes any open reschedule for the booked client.
     """
     intent = parsed["intent"]
     if "slot_type" not in parsed and "type" in parsed:
@@ -102,6 +113,9 @@ def handle_booking_command(parsed: dict, wa: str):
             label="book_single_ok",
         )
         _notify_booking(cname, wnum, parsed["date"], time_str, parsed["slot_type"])
+
+        # 🔄 Automatically close any open reschedule
+        _auto_close_reschedule(cname)
         return
 
     # ── Recurring Booking (weekly) ───────────────────
@@ -131,6 +145,9 @@ def handle_booking_command(parsed: dict, wa: str):
             f"📅 Created {created} weekly bookings for {cname} ({slot_type}).",
             label="book_recurring",
         )
+
+        # 🔄 Auto-close any existing reschedule for this client
+        _auto_close_reschedule(cname)
         return
 
     # ── Multi-day Recurring ──────────────────────────
@@ -155,6 +172,9 @@ def handle_booking_command(parsed: dict, wa: str):
             f"📅 Created {created} recurring bookings for {cname} across multiple days.",
             label="book_multi",
         )
+
+        # 🔄 Auto-close any existing reschedule
+        _auto_close_reschedule(cname)
         return
 
     # ── Cancel Next ───────────────────────────────

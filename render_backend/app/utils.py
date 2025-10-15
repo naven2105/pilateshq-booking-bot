@@ -197,3 +197,24 @@ def send_with_delay(messages, delay=1.0):
             msg.get("vars", []),
         )
         time.sleep(delay)
+
+# ─────────────────────────────────────────────────────────────
+# Reliable Webhook Poster with Retries
+# ─────────────────────────────────────────────────────────────
+def post_with_retry(url: str, payload: dict, retries: int = 3, delay: float = 2.0):
+    """
+    POST to a webhook with automatic retries and backoff.
+    Used for critical actions (e.g., attendance close).
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.ok:
+                log.info(f"✅ [RETRY OK] {url} ({attempt}/{retries}) → {resp.status_code}")
+                return resp
+            log.warning(f"⚠️ [RETRY WARN] {url} attempt {attempt}/{retries} → {resp.status_code}")
+        except Exception as e:
+            log.warning(f"⚠️ [RETRY ERR] {url} attempt {attempt}/{retries} → {e}")
+        time.sleep(delay * attempt)
+    log.error(f"❌ [RETRY FAIL] All attempts failed for {url}")
+    return None
