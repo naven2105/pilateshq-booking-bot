@@ -1,9 +1,8 @@
-#app/attendance_router
 """
 attendance_router.py
 ────────────────────────────────────────────
-Handles client attendance actions such as reschedule or cancellations.
-Simplified Reschedule Workflow with Date/Time + Handled columns.
+Handles client attendance actions such as reschedule.
+Records into Google Sheets via Apps Script with timestamp, date/time, and status.
 ────────────────────────────────────────────
 """
 
@@ -53,7 +52,7 @@ def _notify_client(wa_number: str, client_name: str):
 
 
 def _notify_admin(client_name: str, date: str, time: str, message: str):
-    """Notify Nadine of a new reschedule request."""
+    """Notify Nadine of a new reschedule request with date/time context."""
     if not NADINE_WA:
         log.warning("⚠️ NADINE_WA not configured.")
         return
@@ -95,7 +94,7 @@ def _append_to_sheet(client_name: str, wa_number: str, date: str, time: str, mes
 
 # ─────────────────────────────────────────────────────────────
 # ROUTE: /attendance/log
-# Called when client sends a WhatsApp reschedule or cancel message
+# Called when client sends a WhatsApp reschedule message
 # ─────────────────────────────────────────────────────────────
 @bp.route("/attendance/log", methods=["POST"])
 def log_attendance():
@@ -106,31 +105,28 @@ def log_attendance():
     client_name = data.get("name") or data.get("client_name") or "Unknown"
     message = (data.get("message") or "").strip()
 
-    # Extract date/time text (optional best-effort)
+    if not wa_number or not client_name:
+        return jsonify({"ok": False, "error": "Missing required fields"}), 400
+
+    # ✅ Only handle messages that contain the word "reschedule"
+    if "reschedule" not in message.lower():
+        return jsonify({"ok": False, "reason": "no reschedule keyword found"}), 400
+
+    # Basic parsing for date/time mentions (optional, for audit clarity)
     date_guess = ""
     time_guess = ""
     for token in message.split():
         if ":" in token or "h" in token:
             time_guess = token.replace("h", ":")
-        if any(m in token.lower() for m in ["mon", "tue", "wed", "thu", "fri", "sat", "sun", "day"]):
+        if any(d in token.lower() for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun", "day"]):
             date_guess = token
 
-    if not wa_number or not client_name:
-        return jsonify({"ok": False, "error": "Missing required fields"}), 400
+    # Log to sheet and notify both parties
+    _append_to_sheet(client_name, wa_number, date_guess, time_guess, message)
+    _notify_client(wa_number, client_name)
+    _notify_admin(client_name, date_guess or "-", time_guess or "-", message)
 
-    if "reschedule" in message.lower():
-        _append_to_sheet(client_name, wa_number, date_guess, time_guess, message)
-        _notify_client(wa_number, client_name)
-        _notify_admin(client_name, date_guess or "-", time_guess or "-", message)
-        return jsonify({"ok": True, "action": "reschedule"})
-
-    if "cancel" in message.lower():
-        _append_to_sheet(client_name, wa_number, date_guess, time_guess, message)
-        _notify_client(wa_number, client_name)
-        _notify_admin(client_name, date_guess or "-", time_guess or "-", message)
-        return jsonify({"ok": True, "action": "cancel"})
-
-    return jsonify({"ok": False, "reason": "no attendance keyword found"}), 400
+    return jsonify({"ok": True, "action": "reschedule"})
 
 
 # ─────────────────────────────────────────────────────────────
