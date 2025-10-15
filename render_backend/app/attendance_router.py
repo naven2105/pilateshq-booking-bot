@@ -81,7 +81,7 @@ def _append_to_sheet(client_name: str, wa_number: str, date: str, time: str, mes
     }
 
     try:
-        resp = requests.post(GOOGLE_SHEET_WEBHOOK, json=payload, timeout=10)
+        resp = requests.post(GOOGLE_SHEET_WEBHOOK, json=payload, timeout=30)
         log.info(f"[attendance_router] Sheet append → {resp.status_code} | {resp.text}")
     except Exception as e:
         log.error(f"[attendance_router] Failed to append to Google Sheet: {e}")
@@ -107,7 +107,7 @@ def log_attendance():
 
     date_guess, time_guess = "", ""
     for token in message.split():
-        if ":" in token or "h" in token:
+        if ":" in token or ("h" in token and token.lower().replace("h", "").isdigit()):
             time_guess = token.replace("h", ":")
         if any(d in token.lower() for d in ["mon", "tue", "wed", "thu", "fri", "sat", "sun", "day"]):
             date_guess = token
@@ -132,7 +132,7 @@ def close_reschedule():
 
     payload = {"action": "close_reschedule", "client": client_name, "sheet_id": CLIENT_SHEET_ID}
     try:
-        resp = requests.post(GOOGLE_SHEET_WEBHOOK, json=payload, timeout=10)
+        resp = requests.post(GOOGLE_SHEET_WEBHOOK, json=payload, timeout=30)
         result = resp.json() if resp.ok else {"ok": False, "error": "Script error"}
     except Exception as e:
         log.error(f"[attendance_router] Failed to close reschedule: {e}")

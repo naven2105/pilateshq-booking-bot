@@ -89,17 +89,6 @@ def webhook():
                 except Exception as e:
                     print(f"⚠️ Could not forward attendance log: {e}")
 
-                # Admin alert (simple one-line format to avoid template 400)
-                if NADINE_WA:
-                    alert = f"Client {profile_name} ({wa_number}) requested to reschedule."
-                    send_whatsapp_template(
-                        to=NADINE_WA,
-                        name="admin_generic_alert_us",
-                        lang=TEMPLATE_LANG,
-                        variables=[alert],
-                    )
-                    print("📲 Sent admin alert to Nadine.")
-
                 return jsonify({"status": "reschedule handled"}), 200
 
             # ────────────────────────────────────────────────────────────
