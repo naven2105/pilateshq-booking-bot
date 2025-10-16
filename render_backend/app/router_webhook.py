@@ -1,4 +1,3 @@
-#app/router_webhook.py
 """
 router_webhook.py
 ────────────────────────────────────────────
@@ -6,6 +5,7 @@ Handles incoming Meta Webhook events (GET verify + POST messages).
 
 ✅ Updates:
  • Extracts contact name from 'contacts' → no more "Unknown"
+ • Adds admin standing-slot commands (book / suspend / resume)
  • Removes internal loopback timeout (no self-call hang)
  • Simplifies admin alert text (no line breaks)
 ────────────────────────────────────────────
@@ -25,6 +25,7 @@ WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 ATTENDANCE_ENDPOINT = f"{WEBHOOK_BASE}/attendance/log"
+STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"  # new endpoint
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
 
 
@@ -70,14 +71,34 @@ def webhook():
             msg_text = msg.get("text", {}).get("body", "").strip()
             lower_text = msg_text.lower()
 
-            # ✅ Extract client name correctly from 'contacts'
+            # ✅ Extract client/admin name from contacts
             contacts = value.get("contacts", [])
             profile_name = contacts[0]["profile"]["name"] if contacts else "Unknown"
 
             print(f"💬 Incoming message from {profile_name} ({wa_number}): {msg_text}")
 
             # ────────────────────────────────────────────────────────────
-            # 🔁 Handle RESCHEDULE only
+            # ⚙️ ADMIN STANDING SLOT COMMANDS
+            # ────────────────────────────────────────────────────────────
+            if (
+                wa_number == NADINE_WA
+                and (
+                    lower_text.startswith("book ")
+                    or lower_text.startswith("suspend ")
+                    or lower_text.startswith("resume ")
+                )
+            ):
+                print(f"⚙️ Forwarding standing slot command → {STANDING_ENDPOINT}")
+                try:
+                    payload = {"from": wa_number, "text": msg_text}
+                    r = requests.post(STANDING_ENDPOINT, json=payload, timeout=10)
+                    print(f"📤 Standing command forwarded → {r.status_code} | {r.text}")
+                except Exception as e:
+                    print(f"⚠️ Could not forward standing command: {e}")
+                return jsonify({"status": "standing command handled"}), 200
+
+            # ────────────────────────────────────────────────────────────
+            # 🔁 Handle RESCHEDULE
             # ────────────────────────────────────────────────────────────
             if "reschedule" in lower_text:
                 print(f"🔁 Attendance event from {profile_name} ({wa_number}) → reschedule")
