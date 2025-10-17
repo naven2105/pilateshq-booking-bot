@@ -62,3 +62,7 @@ TEMPLATE_LANG = os.environ.get("TEMPLATE_LANG", "en_US")
 # ── Startup logging ──────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 logger.info(f"[CONFIG] Loaded ADMIN_NUMBERS={ADMIN_NUMBERS}, NADINE_WA={NADINE_WA}, TEMPLATE_LANG={TEMPLATE_LANG}")
+
+# ── Legacy variable aliases (for backward compatibility) ─────────────────────
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
+TIMEZONE = TZ_NAME
