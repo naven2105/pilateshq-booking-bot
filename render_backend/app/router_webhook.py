@@ -4,10 +4,10 @@ router_webhook.py
 Handles incoming Meta Webhook events (GET verify + POST messages).
 
 ✅ Updates:
- • Extracts contact name from 'contacts' → no more "Unknown"
+ • Extracts contact name from 'contacts'
  • Adds admin standing-slot commands (book / suspend / resume)
+ • Adds invoice command ("invoice {client}")
  • Removes internal loopback timeout (no self-call hang)
- • Simplifies admin alert text (no line breaks)
 ────────────────────────────────────────────
 """
 
@@ -24,8 +24,11 @@ VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
+
+# Endpoints
 ATTENDANCE_ENDPOINT = f"{WEBHOOK_BASE}/attendance/log"
-STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"  # new endpoint
+STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
+INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
 
 
@@ -71,11 +74,11 @@ def webhook():
             msg_text = msg.get("text", {}).get("body", "").strip()
             lower_text = msg_text.lower()
 
-            # ✅ Extract client/admin name from contacts
+            # ✅ Extract contact name
             contacts = value.get("contacts", [])
             profile_name = contacts[0]["profile"]["name"] if contacts else "Unknown"
 
-            print(f"💬 Incoming message from {profile_name} ({wa_number}): {msg_text}")
+            print(f"💬 Message from {profile_name} ({wa_number}): {msg_text}")
 
             # ────────────────────────────────────────────────────────────
             # ⚙️ ADMIN STANDING SLOT COMMANDS
@@ -98,18 +101,33 @@ def webhook():
                 return jsonify({"status": "standing command handled"}), 200
 
             # ────────────────────────────────────────────────────────────
-            # 🔁 Handle RESCHEDULE
+            # 🧾 ADMIN INVOICE COMMAND
+            # ────────────────────────────────────────────────────────────
+            if wa_number == NADINE_WA and lower_text.startswith("invoice "):
+                client_name = msg_text.split(" ", 1)[1].strip() if " " in msg_text else ""
+                if not client_name:
+                    return jsonify({"status": "missing client name"}), 200
+
+                print(f"🧾 Invoice request detected for {client_name}")
+                try:
+                    payload = {"client_name": client_name}
+                    r = requests.post(INVOICE_ENDPOINT, json=payload, timeout=10)
+                    print(f"📤 Forwarded invoice review → {r.status_code} | {r.text}")
+                except Exception as e:
+                    print(f"⚠️ Could not forward invoice review: {e}")
+                return jsonify({"status": "invoice command handled"}), 200
+
+            # ────────────────────────────────────────────────────────────
+            # 🔁 CLIENT RESCHEDULE
             # ────────────────────────────────────────────────────────────
             if "reschedule" in lower_text:
-                print(f"🔁 Attendance event from {profile_name} ({wa_number}) → reschedule")
-
+                print(f"🔁 Reschedule event from {profile_name} ({wa_number})")
                 try:
                     payload = {"from": wa_number, "name": profile_name, "message": msg_text}
                     r = requests.post(ATTENDANCE_ENDPOINT, json=payload, timeout=5)
                     print(f"📤 Forwarded to /attendance/log → {r.status_code}")
                 except Exception as e:
                     print(f"⚠️ Could not forward attendance log: {e}")
-
                 return jsonify({"status": "reschedule handled"}), 200
 
             # ────────────────────────────────────────────────────────────
@@ -117,20 +135,11 @@ def webhook():
             # ────────────────────────────────────────────────────────────
             if lower_text in ["credits", "unused credits"]:
                 print("📊 Admin requested live credits summary")
-
-                send_whatsapp_template(
-                    to=wa_number,
-                    name="admin_generic_alert_us",
-                    lang=TEMPLATE_LANG,
-                    variables=["Fetching latest credits summary..."],
-                )
-
                 if APPS_SCRIPT_URL:
                     try:
                         requests.post(APPS_SCRIPT_URL, json={"action": "get_unused_credits"}, timeout=10)
                     except Exception as e:
-                        print(f"❌ Failed to request unused credits → {e}")
-
+                        print(f"❌ Failed to request credits → {e}")
                 return jsonify({"status": "credits summary requested"}), 200
 
             # ────────────────────────────────────────────────────────────
