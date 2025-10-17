@@ -1,4 +1,3 @@
-#app/crud.py
 """
 crud.py
 ──────────────────────────────
@@ -14,10 +13,29 @@ All operations now use:
 import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from .utils import post_to_webhook, normalize_wa
+import requests
+from .utils import normalize_wa
 from .config import WEBHOOK_BASE, TIMEZONE
 
 log = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────
+# Legacy-safe webhook helper
+# ──────────────────────────────────────────────
+def post_to_webhook(url: str, payload: dict) -> dict:
+    """
+    Legacy compatibility helper to post JSON payloads to Google Apps Script or webhook endpoints.
+    Returns parsed JSON or an {ok: False} fallback on error.
+    """
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.ok:
+            return r.json()
+        log.warning(f"⚠️ post_to_webhook: {url} returned {r.status_code}")
+        return {"ok": False, "status": r.status_code, "text": r.text}
+    except Exception as e:
+        log.error(f"❌ post_to_webhook failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 # ──────────────────────────────────────────────
