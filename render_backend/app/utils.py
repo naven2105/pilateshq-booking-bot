@@ -218,3 +218,54 @@ def post_with_retry(url: str, payload: dict, retries: int = 3, delay: float = 2.
         time.sleep(delay * attempt)
     log.error(f"❌ [RETRY FAIL] All attempts failed for {url}")
     return None
+
+# ─────────────────────────────────────────────────────────────
+# HYBRID MESSAGE ROUTER (Final Production Version)
+# ─────────────────────────────────────────────────────────────
+def send_safe_message(
+    to: str,
+    message: str = "",
+    *,
+    label: str = "auto",
+    is_template: bool = False,
+    template_name: str = None,
+    variables: list | None = None,
+):
+    """
+    Smart WhatsApp message router.
+    Handles Meta 24-hour re-engagement rules automatically.
+
+    - Timer-based jobs → always use approved template
+    - Admin/client replies → send free text if session open
+    - If Meta returns error 131047, fallback to template delivery
+    """
+    try:
+        # ─── Use template immediately for timed/system messages ───
+        if is_template and template_name:
+            log.info(f"[SAFE MSG] Template {template_name} → {to}")
+            return send_whatsapp_template(to, template_name, TEMPLATE_LANG, variables or [])
+
+        # ─── Otherwise, try free text ───
+        log.info(f"[SAFE MSG] Free text → {to}")
+        resp = send_whatsapp_text(to, message)
+        resp_json = resp if isinstance(resp, dict) else {}
+
+        # ─── Check for 24h session expiry ───
+        if "131047" in json.dumps(resp_json) or "Re-engagement" in json.dumps(resp_json):
+            log.warning(f"[SAFE MSG] 24h window closed for {to}. Re-sending via template.")
+            tmpl = template_name or "admin_generic_alert_us"
+            vars_ = variables or [message]
+            return send_whatsapp_template(to, tmpl, TEMPLATE_LANG, vars_)
+
+        # ─── Normal success path ───
+        if resp_json.get("messages"):
+            msg_id = resp_json["messages"][0].get("id")
+            log.info(f"[SAFE MSG] Delivered {label} → {to} | {msg_id}")
+        else:
+            log.debug(f"[SAFE MSG] {to} response: {resp_json}")
+
+        return resp_json
+
+    except Exception as e:
+        log.error(f"[send_safe_message] {label} :: {e}")
+        return {"ok": False, "error": str(e)}

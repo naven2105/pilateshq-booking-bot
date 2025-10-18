@@ -1,47 +1,37 @@
-# render_backend/app/tasks_router.py
 """
 tasks_router.py
 ────────────────────────────────────────────
 Handles task webhook calls from Google Apps Script.
-Routes:
- - /tasks/run-reminders          → Admin morning/evening summaries
- - /tasks/client-next-hour       → Client next-hour reminders
- - /tasks/client-reminders       → (⚠️ now handled by app.client_reminders)
- - /tasks/package-events         → Package low-balance, unused credits
- - /tasks/client-behaviour       → Weekly attendance analytics
 ────────────────────────────────────────────
 """
 
 import os
 import logging
 from flask import Blueprint, request, jsonify
-from .utils import send_whatsapp_template
+from .utils import send_safe_message
 
-# ── Setup ──────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
 tasks_bp = Blueprint("tasks_bp", __name__)
 
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
-
-# Templates used across events
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
 TPL_CLIENT_REMINDER = "client_generic_alert_us"
 
 
 # ─────────────────────────────────────────────────────────────
-# Helper: send message safely
+# Helper: send admin message safely
 # ─────────────────────────────────────────────────────────────
-def _send_admin_message(msg: str):
-    """Send a WhatsApp message to Nadine."""
+def _send_admin_message(msg: str, label="admin_alert"):
     if not NADINE_WA:
         log.warning("⚠️ NADINE_WA not configured.")
         return
-    send_whatsapp_template(
+    send_safe_message(
         to=NADINE_WA,
-        name=TPL_ADMIN_ALERT,
-        lang=TEMPLATE_LANG,
+        is_template=True,
+        template_name=TPL_ADMIN_ALERT,
         variables=[msg],
+        label=label
     )
     log.info(f"📲 Sent admin WhatsApp alert → {msg}")
 
@@ -65,7 +55,7 @@ def run_reminders():
     else:
         msg = f"🕐 Unknown reminder type received ({msg_type})."
 
-    _send_admin_message(msg)
+    _send_admin_message(msg, label=f"run_reminders_{msg_type}")
     return jsonify({"ok": True, "message": msg})
 
 
@@ -88,44 +78,20 @@ def client_next_hour():
         if not wa:
             continue
 
-        send_whatsapp_template(
+        send_safe_message(
             to=wa,
-            name=TPL_CLIENT_REMINDER,
-            lang=TEMPLATE_LANG,
+            is_template=True,
+            template_name=TPL_CLIENT_REMINDER,
             variables=[f"Hi {name}, this is a friendly reminder for your class at {time}. See you soon! 💪"],
+            label="client_next_hour"
         )
 
-    _send_admin_message(f"⏰ Sent {len(clients)} next-hour client reminders.")
+    _send_admin_message(f"⏰ Sent {len(clients)} next-hour client reminders.", label="client_next_hour_summary")
     return jsonify({"ok": True, "count": len(clients)})
 
 
 # ─────────────────────────────────────────────────────────────
-# ROUTE: Client night-before / week-ahead reminders (LEGACY)
-# ─────────────────────────────────────────────────────────────
-# ⚠️ Deprecated: This route is now handled by `app.client_reminders`
-# to support richer payload structures and multi-client dispatch.
-# Keeping commented for reference in case rollback is needed.
-"""
-@tasks_bp.route("/client-reminders", methods=["POST"])
-def client_reminders():
-    data = request.get_json(force=True)
-    log.info(f"[Tasks] /client-reminders payload: {data}")
-
-    msg_type = data.get("type")
-
-    if msg_type == "client-night-before":
-        _send_admin_message("🌙 Sent client night-before reminders.")
-    elif msg_type == "client-week-ahead":
-        _send_admin_message("📅 Sent client week-ahead summaries.")
-    else:
-        _send_admin_message(f"⚠️ Unknown client reminder type: {msg_type}")
-
-    return jsonify({"ok": True, "message": msg_type})
-"""
-
-
-# ─────────────────────────────────────────────────────────────
-# ROUTE: Package events (credits, low-balance, reschedule)
+# ROUTE: Package events (credits, low-balance, etc.)
 # ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/package-events", methods=["POST"])
 def package_events():
@@ -133,8 +99,7 @@ def package_events():
     log.info(f"[Tasks] /package-events payload: {data}")
 
     message = data.get("message", "No message")
-    _send_admin_message(message)
-
+    _send_admin_message(message, label="package_event")
     return jsonify({"ok": True, "message": "Sent to Nadine"})
 
 
@@ -150,20 +115,3 @@ def client_behaviour():
     cancels = data.get("cancellations", [])
     inactive = data.get("inactive", [])
 
-    summary = (
-        "📊 Client Behaviour Summary (last 30 days):\n"
-        f"• No-shows (2+): {len(no_shows)}\n"
-        f"• Frequent cancellations (3+): {len(cancels)}\n"
-        f"• Inactive (>30 days): {len(inactive)}"
-    )
-
-    _send_admin_message(summary)
-    return jsonify({"ok": True, "summary": summary})
-
-
-# ─────────────────────────────────────────────────────────────
-# HEALTH CHECK
-# ─────────────────────────────────────────────────────────────
-@tasks_bp.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "PilatesHQ Tasks Router"}), 200

@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from . import invoices
-from .utils import send_whatsapp_template, send_whatsapp_text
+from .utils import send_safe_message
 
 bp = Blueprint("invoices_bp", __name__)
 log = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def list_draft_invoices():
         result = resp.json() if resp.ok else {"ok": False, "message": "Could not fetch invoices."}
         msg = result.get("message", "⚠️ No response from Apps Script.")
 
-        send_whatsapp_text(NADINE_WA, f"📋 {msg}")
+        send_safe_message(to=NADINE_WA, message=f"📋 {msg}", label="invoice_review_list")
         log.info(f"[invoices_router] Draft invoices listed → {msg}")
         return jsonify({"ok": True, "message": msg})
     except Exception as e:
@@ -78,17 +78,19 @@ def review_one_invoice():
         variable_text = f"{client_name} - {month_text}"
 
         if exists:
-            send_whatsapp_template(
+            send_safe_message(
                 to=NADINE_WA,
-                name=TPL_ADMIN_INVOICE_REVIEW,
-                lang=TEMPLATE_LANG,
+                is_template=True,
+                template_name=TPL_ADMIN_INVOICE_REVIEW,
                 variables=[variable_text],
+                label="invoice_review_one"
             )
             msg = f"📑 Invoice review sent for {variable_text}"
         else:
-            send_whatsapp_text(
-                NADINE_WA,
-                f"⚠️ No draft invoice found for {client_name}. Please run 'generate invoices' first."
+            send_safe_message(
+                to=NADINE_WA,
+                message=f"⚠️ No draft invoice found for {client_name}. Please run 'generate invoices' first.",
+                label="invoice_review_missing"
             )
             msg = f"No draft invoice found for {client_name}"
 
@@ -104,10 +106,7 @@ def review_one_invoice():
 # ─────────────────────────────────────────────────────────────
 @bp.route("/invoices/callback", methods=["POST"])
 def handle_invoice_callback():
-    """
-    Meta button postbacks (Send Invoice / Edit).
-    Each postback includes {action, client_name, wa_number}.
-    """
+    """Handles Meta button postbacks (Send Invoice / Edit)."""
     try:
         data = request.get_json(force=True)
         action = data.get("action", "").lower()
@@ -116,34 +115,24 @@ def handle_invoice_callback():
         client_id = data.get("client_id")
         month_spec = data.get("month_spec", "this month")
 
-        # ✅ 1. SEND INVOICE ACTION
+        # ✅ SEND INVOICE ACTION
         if action == "send_invoice":
             invoices.send_invoice(wa_number, client_id, client_name, month_spec)
 
-            payload = {
-                "action": "mark_invoice_sent",
-                "sheet_id": SHEET_ID,
-                "client_name": client_name
-            }
+            payload = {"action": "mark_invoice_sent", "sheet_id": SHEET_ID, "client_name": client_name}
             try:
                 requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
             except Exception as e:
                 log.warning(f"[callback] Failed to mark invoice as sent: {e}")
 
-            send_whatsapp_text(NADINE_WA, f"✅ Invoice sent to {client_name}")
+            send_safe_message(to=NADINE_WA, message=f"✅ Invoice sent to {client_name}", label="invoice_sent")
             return jsonify({"ok": True, "action": "sent"})
 
-        # ✏️ 2. EDIT INVOICE ACTION (Mark for later editing)
+        # ✏️ EDIT INVOICE ACTION
         elif action == "edit_invoice":
-            payload = {
-                "action": "mark_invoice_edit",
-                "sheet_id": SHEET_ID,
-                "client_name": client_name,
-            }
-
+            payload = {"action": "mark_invoice_edit", "sheet_id": SHEET_ID, "client_name": client_name}
             try:
                 requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
-                log.info(f"[callback] Invoice for {client_name} marked as edit_pending.")
             except Exception as e:
                 log.warning(f"[callback] Failed to mark invoice as edit_pending: {e}")
 
@@ -153,12 +142,12 @@ def handle_invoice_callback():
                 f"You can review and adjust from your PC or laptop when ready:\n"
                 f"{sheet_link}"
             )
-            send_whatsapp_text(NADINE_WA, msg)
+            send_safe_message(to=NADINE_WA, message=msg, label="invoice_edit_pending")
             return jsonify({"ok": True, "action": "edit_pending"})
 
-        # ⚠️ 3. UNKNOWN ACTION
+        # ⚠️ UNKNOWN ACTION
         else:
-            send_whatsapp_text(NADINE_WA, "⚠️ Unknown button action received.")
+            send_safe_message(to=NADINE_WA, message="⚠️ Unknown button action received.", label="invoice_unknown_action")
             return jsonify({"ok": False, "error": "Unknown action"})
 
     except Exception as e:
@@ -187,8 +176,7 @@ def send_invoice_to_client():
         except Exception as e:
             log.warning(f"[send_invoice] Failed to mark sent: {e}")
 
-        send_whatsapp_text(NADINE_WA, f"✅ Invoice sent to {client_name}")
-        log.info(f"[invoices_router] Invoice sent → {client_name}")
+        send_safe_message(to=NADINE_WA, message=f"✅ Invoice sent to {client_name}", label="invoice_manual_send")
         return jsonify({"ok": True})
     except Exception as e:
         log.error(f"[invoices_router] send_invoice_to_client error: {e}")
@@ -212,7 +200,7 @@ def edit_invoice():
             f"open the Invoices tab:\n{sheet_link}\n\n"
             "Make changes and set status = 'edited' when done."
         )
-        send_whatsapp_text(NADINE_WA, msg)
+        send_safe_message(to=NADINE_WA, message=msg, label="invoice_edit_link")
         log.info(f"[invoices_router] Edit link sent for {client_name}")
         return jsonify({"ok": True, "link": sheet_link})
     except Exception as e:

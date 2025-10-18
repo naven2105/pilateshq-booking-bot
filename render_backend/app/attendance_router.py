@@ -1,12 +1,7 @@
-# app/attendance_router.py
 """
 attendance_router.py
 ────────────────────────────────────────────
-Purpose: Handles everything related to reschedules and reschedule summaries.
-Handles all attendance-related events:
- • Client says “Reschedule” → Logs in Google Sheet
- • Nadine books new session → Auto-closes reschedule (via onEdit trigger)
- • Nadine types “Reschedules” → Lists all open cases
+Purpose: Handles everything related to reschedules and summaries.
 ────────────────────────────────────────────
 """
 
@@ -14,12 +9,11 @@ import os
 import requests
 import logging
 from flask import Blueprint, request, jsonify
-from .utils import send_whatsapp_template
+from .utils import send_safe_message
 
 bp = Blueprint("attendance_bp", __name__)
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
 GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK")
 CLIENT_SHEET_ID = os.getenv("CLIENT_SHEET_ID")
@@ -28,6 +22,7 @@ TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
 TPL_CLIENT_ALERT = "client_generic_alert_us"
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
+
 
 # ─────────────────────────────────────────────────────────────
 # CLIENT → RESCHEDULE
@@ -56,20 +51,21 @@ def log_attendance():
     except Exception as e:
         log.error(f"[attendance_router] Failed to append to Google Sheet: {e}")
 
-    # Notify client
-    send_whatsapp_template(
+    # Notify client & admin using templates (safe)
+    send_safe_message(
         to=wa_number,
-        name=TPL_CLIENT_ALERT,
-        lang=TEMPLATE_LANG,
-        variables=[f"Hi {client_name}, we’ve received your reschedule request. Nadine will confirm a new time soon 🤸‍♀️"],
+        is_template=True,
+        template_name=TPL_CLIENT_ALERT,
+        variables=[f"Hi {client_name}, we’ve received your reschedule request. Nadine will confirm soon 🤸‍♀️"],
+        label="client_reschedule_ack"
     )
 
-    # Notify admin
-    send_whatsapp_template(
+    send_safe_message(
         to=NADINE_WA,
-        name=TPL_ADMIN_ALERT,
-        lang=TEMPLATE_LANG,
+        is_template=True,
+        template_name=TPL_ADMIN_ALERT,
         variables=[f"Client {client_name} ({wa_number}) requested to reschedule."],
+        label="admin_reschedule_alert"
     )
 
     return jsonify({"ok": True, "action": "reschedule"})
@@ -87,11 +83,12 @@ def list_open_reschedules():
         result = resp.json() if resp.ok else {"ok": False, "error": "Sheet request failed"}
         message = result.get("message", "⚠️ Could not fetch list")
 
-        send_whatsapp_template(
+        send_safe_message(
             to=NADINE_WA,
-            name=TPL_ADMIN_ALERT,
-            lang=TEMPLATE_LANG,
+            is_template=True,
+            template_name=TPL_ADMIN_ALERT,
             variables=[message],
+            label="admin_reschedule_list"
         )
         return jsonify({"ok": True, "message": message})
     except Exception as e:
