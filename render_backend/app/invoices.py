@@ -1,4 +1,3 @@
-# app/invoices.py
 """
 invoices.py
 ───────────────────────────────────────────────
@@ -19,20 +18,22 @@ BASE_URL = os.getenv("BASE_URL", "https://pilateshq-booking-bot.onrender.com")
 # ──────────────────────────────────────────────
 # PDF GENERATOR
 # ──────────────────────────────────────────────
-def generate_invoice_pdf(client: str, month_spec: str = "this month") -> bytes:
+def generate_invoice_pdf(client: str, wa_number: str, month_spec: str = "this month") -> bytes:
     """
     Generate a simple invoice PDF summarising the client’s sessions and charges.
+    Displays mobile number in header (for admin verification).
     """
     buffer = BytesIO()
     p = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
+
     p.setFont("Helvetica-Bold", 16)
     p.drawString(50, height - 50, f"PilatesHQ Invoice — {client}")
     p.setFont("Helvetica", 12)
-    p.drawString(50, height - 80, f"Period: {month_spec}")
+    p.drawString(50, height - 75, f"Period: {month_spec}")
+    p.drawString(50, height - 95, f"Mobile: {wa_number}")
 
-    # Dummy total for PDF fallback
-    p.drawString(50, height - 110, "For detailed summary, please view your WhatsApp invoice.")
+    p.drawString(50, height - 130, "For detailed summary, please view your WhatsApp invoice.")
     p.showPage()
     p.save()
     buffer.seek(0)
@@ -42,7 +43,8 @@ def generate_invoice_pdf(client: str, month_spec: str = "this month") -> bytes:
 # ──────────────────────────────────────────────
 # WHATSAPP INVOICE GENERATOR
 # ──────────────────────────────────────────────
-def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str, client_id: int | None = None) -> str:
+def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str,
+                              client_id: int | None = None, wa_number: str | None = None) -> str:
     """
     Build WhatsApp-friendly invoice message including:
     - All session dates & types
@@ -50,46 +52,46 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str, 
     - Total
     - Banking details
     """
-    # Parse month/year from month_spec if possible
     today = datetime.now()
-    year = today.year
-    month = today.month
-    if "sep" in month_spec.lower():
-        month = 9
-    elif "oct" in month_spec.lower():
-        month = 10
-    elif "nov" in month_spec.lower():
-        month = 11
-    elif "dec" in month_spec.lower():
-        month = 12
+    year, month = today.year, today.month
 
-    # ── Fetch session data from DB
+    month_lookup = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+    }
+    for key, val in month_lookup.items():
+        if key in month_spec.lower():
+            month = val
+            break
+
     sessions = []
     total = 0
     if client_id:
         sessions = crud.get_client_sessions_for_month(client_id, year, month)
-
         for s in sessions:
             price = crud.get_session_price(s["type"])
             s["price"] = price
             total += price
 
-    # ── Build session summary
     if sessions:
-        session_lines = []
-        for s in sessions:
-            session_lines.append(
-                f"• {s['date']} at {s['time']} — {s['type'].capitalize()} (R{s['price']})"
-            )
+        session_lines = [
+            f"• {s['date']} at {s['time']} — {s['type'].capitalize()} (R{s['price']})"
+            for s in sessions
+        ]
         session_text = "\n".join(session_lines)
     else:
         session_text = "No confirmed sessions found this month."
 
     total_text = f"💰 *Total Due: R{total}*"
-    pdf_link = f"{base_url}/diag/invoice-pdf?client={client_name.replace(' ', '%20')}&month={month_spec.replace(' ', '%20')}"
+    pdf_link = (
+        f"{base_url}/diag/invoice-pdf?"
+        f"client={client_name.replace(' ', '%20')}"
+        f"&month={month_spec.replace(' ', '%20')}"
+        f"&mobile={wa_number or ''}"
+    )
 
-    # ── Compose WhatsApp invoice message
-    return (
+    # ── Compose WhatsApp invoice message (client-friendly)
+    message = (
         f"📑 *PilatesHQ Invoice — {client_name}*\n"
         f"📅 Period: {month_spec.capitalize()}\n\n"
         f"{session_text}\n\n"
@@ -103,13 +105,16 @@ def generate_invoice_whatsapp(client_name: str, month_spec: str, base_url: str, 
         f"🔗 *Download PDF Invoice:* {pdf_link}"
     )
 
+    return message
+
 
 # ──────────────────────────────────────────────
 # SEND INVOICE VIA WHATSAPP
 # ──────────────────────────────────────────────
-def send_invoice(wa_number: str, client_id: int, client_name: str, month_spec: str = "this month"):
+def send_invoice(wa_number: str, client_id: int, client_name: str,
+                 month_spec: str = "this month"):
     """
     Send invoice message to client via WhatsApp.
     """
-    message = generate_invoice_whatsapp(client_name, month_spec, BASE_URL, client_id)
+    message = generate_invoice_whatsapp(client_name, month_spec, BASE_URL, client_id, wa_number)
     send_whatsapp_text(wa_number, message)

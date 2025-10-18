@@ -6,12 +6,9 @@ Handles Nadine’s invoice review workflow via WhatsApp.
 Endpoints:
  - /invoices/review       → list all draft invoices
  - /invoices/review-one   → review a specific client's invoice
- - /invoices/send         → deliver invoice to client (uses invoices.py)
+ - /invoices/send         → deliver invoice to client
  - /invoices/edit         → reply with Google Sheet link
  - /invoices/callback     → handles Meta button postbacks
- - /invoices              → health check
-
-Integrates with Google Apps Script (Invoices tab) for real data.
 ───────────────────────────────────────────────
 """
 
@@ -26,7 +23,7 @@ from .utils import send_whatsapp_template, send_whatsapp_text
 bp = Blueprint("invoices_bp", __name__)
 log = logging.getLogger(__name__)
 
-# ── Environment Variables ────────────────────────────────────────────────
+# ── Environment Variables ────────────────────────────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
@@ -40,7 +37,7 @@ TPL_ADMIN_INVOICE_REVIEW = "client_invoice_review_us"  # Meta template with butt
 # ─────────────────────────────────────────────────────────────
 # 1️⃣  LIST DRAFT INVOICES
 # ─────────────────────────────────────────────────────────────
-@bp.route("/review", methods=["POST"])
+@bp.route("/invoices/review", methods=["POST"])
 def list_draft_invoices():
     """Triggered when Nadine types 'review invoices' on WhatsApp."""
     try:
@@ -58,9 +55,9 @@ def list_draft_invoices():
 
 
 # ─────────────────────────────────────────────────────────────
-# 2️⃣  REVIEW ONE CLIENT INVOICE
+# 2️⃣  REVIEW ONE CLIENT INVOICE (Triggered by "invoice Fatima")
 # ─────────────────────────────────────────────────────────────
-@bp.route("/review-one", methods=["POST"])
+@bp.route("/invoices/review-one", methods=["POST"])
 def review_one_invoice():
     """Triggered when Nadine types 'invoice {client_name}'."""
     try:
@@ -71,6 +68,7 @@ def review_one_invoice():
         if not client_name:
             return jsonify({"ok": False, "error": "Missing client name"}), 400
 
+        # Optional: verify draft existence
         payload = {"action": "list_draft_invoices", "sheet_id": SHEET_ID}
         resp = requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
         available = resp.json().get("message", "") if resp.ok else ""
@@ -102,11 +100,14 @@ def review_one_invoice():
 
 
 # ─────────────────────────────────────────────────────────────
-# 3️⃣  META BUTTON CALLBACK HANDLER
+# 3️⃣  META BUTTON CALLBACK HANDLER (Updated for Edit Pending)
 # ─────────────────────────────────────────────────────────────
-@bp.route("/callback", methods=["POST"])
+@bp.route("/invoices/callback", methods=["POST"])
 def handle_invoice_callback():
-    """Meta button postbacks (Send Invoice / Edit Later)."""
+    """
+    Meta button postbacks (Send Invoice / Edit).
+    Each postback includes {action, client_name, wa_number}.
+    """
     try:
         data = request.get_json(force=True)
         action = data.get("action", "").lower()
@@ -115,26 +116,47 @@ def handle_invoice_callback():
         client_id = data.get("client_id")
         month_spec = data.get("month_spec", "this month")
 
+        # ✅ 1. SEND INVOICE ACTION
         if action == "send_invoice":
             invoices.send_invoice(wa_number, client_id, client_name, month_spec)
-            payload = {"action": "mark_invoice_sent", "sheet_id": SHEET_ID, "client_name": client_name}
+
+            payload = {
+                "action": "mark_invoice_sent",
+                "sheet_id": SHEET_ID,
+                "client_name": client_name
+            }
             try:
                 requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
             except Exception as e:
                 log.warning(f"[callback] Failed to mark invoice as sent: {e}")
+
             send_whatsapp_text(NADINE_WA, f"✅ Invoice sent to {client_name}")
             return jsonify({"ok": True, "action": "sent"})
 
+        # ✏️ 2. EDIT INVOICE ACTION (Mark for later editing)
         elif action == "edit_invoice":
+            payload = {
+                "action": "mark_invoice_edit",
+                "sheet_id": SHEET_ID,
+                "client_name": client_name,
+            }
+
+            try:
+                requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
+                log.info(f"[callback] Invoice for {client_name} marked as edit_pending.")
+            except Exception as e:
+                log.warning(f"[callback] Failed to mark invoice as edit_pending: {e}")
+
             sheet_link = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit#gid=0"
             msg = (
-                f"✏️ To edit *{client_name}'s* invoice for {month_spec}, "
-                f"open the Invoices tab:\n{sheet_link}\n\n"
-                "Make changes and set status = 'edited' when done."
+                f"✏️ Marked *{client_name}* invoice for later editing.\n"
+                f"You can review and adjust from your PC or laptop when ready:\n"
+                f"{sheet_link}"
             )
             send_whatsapp_text(NADINE_WA, msg)
-            return jsonify({"ok": True, "action": "edit"})
+            return jsonify({"ok": True, "action": "edit_pending"})
 
+        # ⚠️ 3. UNKNOWN ACTION
         else:
             send_whatsapp_text(NADINE_WA, "⚠️ Unknown button action received.")
             return jsonify({"ok": False, "error": "Unknown action"})
@@ -147,7 +169,7 @@ def handle_invoice_callback():
 # ─────────────────────────────────────────────────────────────
 # 4️⃣  MANUAL SEND ENDPOINT
 # ─────────────────────────────────────────────────────────────
-@bp.route("/send", methods=["POST"])
+@bp.route("/invoices/send", methods=["POST"])
 def send_invoice_to_client():
     """Triggered manually or by callback handler."""
     try:
@@ -174,9 +196,9 @@ def send_invoice_to_client():
 
 
 # ─────────────────────────────────────────────────────────────
-# 5️⃣  EDIT LINK ENDPOINT
+# 5️⃣  EDIT LINK ENDPOINT (Legacy manual call)
 # ─────────────────────────────────────────────────────────────
-@bp.route("/edit", methods=["POST"])
+@bp.route("/invoices/edit", methods=["POST"])
 def edit_invoice():
     """Triggered manually or via callback."""
     try:
@@ -201,17 +223,16 @@ def edit_invoice():
 # ─────────────────────────────────────────────────────────────
 # HEALTH CHECK
 # ─────────────────────────────────────────────────────────────
-@bp.route("/", methods=["GET"])
+@bp.route("/invoices", methods=["GET"])
 def health():
-    """Basic health check for invoices blueprint."""
     return jsonify({
         "status": "ok",
         "service": "Invoices Router",
-        "endpoints": [
+        "endpoints": {
             "/invoices/review",
             "/invoices/review-one",
             "/invoices/send",
             "/invoices/edit",
             "/invoices/callback"
-        ]
+        }
     }), 200

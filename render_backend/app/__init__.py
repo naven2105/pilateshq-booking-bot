@@ -27,6 +27,7 @@ from render_backend.app.client_reminders import bp as client_reminders_bp
 from render_backend.app.package_events import bp as package_events_bp
 from render_backend.app.attendance_router import bp as attendance_bp
 from render_backend.app.invoices_router import bp as invoices_bp   # ✅ NEW
+from render_backend.app.router_diag import bp as diag_bp
 
 # ── Setup logging ─────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +45,7 @@ def create_app() -> Flask:
     app.register_blueprint(package_events_bp)                          # /package-events
     app.register_blueprint(attendance_bp)                              # /attendance
     app.register_blueprint(invoices_bp, url_prefix="/invoices")        # ✅ NEW
+    app.register_blueprint(diag_bp) 
 
     log.info("✅ All blueprints registered successfully (including invoices router).")
 
