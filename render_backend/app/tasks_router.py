@@ -49,9 +49,9 @@ def run_reminders():
     schedule = data.get("schedule", "No sessions")
 
     if msg_type == "morning":
-        msg = f"🌅 Morning job ran successfully.\nSessions today: {total}\nSchedule: {schedule}"
+        msg = f"🌅 PilatesHQ Morning Summary: {total} sessions today. Schedule: {schedule}"
     elif msg_type == "evening":
-        msg = f"🌙 Evening preview – Tomorrow has {total} sessions booked.\nSchedule: {schedule}\nSleep well! 💤"
+        msg = f"🌙 PilatesHQ Evening Preview: {total} sessions tomorrow. Schedule: {schedule}. Sleep well! 💤"
     else:
         msg = f"🕐 Unknown reminder type received ({msg_type})."
 
