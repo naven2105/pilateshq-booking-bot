@@ -11,7 +11,7 @@ existing approved template: admin_generic_alert_us
 import os
 import logging
 from flask import Blueprint, request, jsonify
-from .utils import send_safe_message
+from .utils import send_whatsapp_template  # ✅ use explicit template sender
 
 bp = Blueprint("dashboard_bp", __name__)
 log = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 # ── Environment ─────────────────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
-TPL_WEEKLY_SUMMARY = "admin_generic_alert_us"   # ✅ Reuse existing approved template
+TPL_WEEKLY_SUMMARY = "admin_generic_alert_us"   # ✅ Reuse approved template
 
 # ── Route: /dashboard/weekly-summary ─────────────────────────
 @bp.route("/weekly-summary", methods=["POST"])
@@ -32,7 +32,7 @@ def weekly_summary():
         count = int(data.get("outstanding_count", 0))
         chart = data.get("chart_url", "").strip()
 
-        # Build WhatsApp message (single text param for template {{1}})
+        # Build WhatsApp message (single parameter for {{1}})
         summary_text = (
             f"📊 *PilatesHQ Weekly Studio Snapshot*\n"
             f"💰 Revenue: R{revenue:,.0f}\n"
@@ -42,11 +42,11 @@ def weekly_summary():
             f"Have a great week ahead 💪"
         )
 
-        # Send message using admin_generic_alert_us
-        send_safe_message(
+        # ✅ Send using the approved template
+        send_whatsapp_template(
             NADINE_WA,
-            summary_text,
-            template=TPL_WEEKLY_SUMMARY,
+            TPL_WEEKLY_SUMMARY,
+            [summary_text],
             lang=TEMPLATE_LANG,
         )
 
