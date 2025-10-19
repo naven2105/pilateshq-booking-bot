@@ -22,7 +22,7 @@ TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 TPL_WEEKLY_SUMMARY = "admin_generic_alert_us"   # ✅ Reuse existing approved template
 
 # ── Route: /dashboard/weekly-summary ─────────────────────────
-@bp.route("/dashboard/weekly-summary", methods=["POST"])
+@bp.route("/weekly-summary", methods=["POST"])
 def weekly_summary():
     try:
         data = request.get_json(force=True)
