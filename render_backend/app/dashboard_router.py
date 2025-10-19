@@ -47,7 +47,6 @@ def weekly_summary():
             NADINE_WA,
             TPL_WEEKLY_SUMMARY,
             [summary_text],
-            lang=TEMPLATE_LANG,
         )
 
         log.info("✅ Weekly dashboard summary sent via admin_generic_alert_us.")
