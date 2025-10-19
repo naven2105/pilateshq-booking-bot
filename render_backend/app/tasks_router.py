@@ -10,6 +10,7 @@ import logging
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message
 
+# ── Setup ──────────────────────────────────────────────────────
 log = logging.getLogger(__name__)
 tasks_bp = Blueprint("tasks_bp", __name__)
 
@@ -23,9 +24,11 @@ TPL_CLIENT_REMINDER = "client_generic_alert_us"
 # Helper: send admin message safely
 # ─────────────────────────────────────────────────────────────
 def _send_admin_message(msg: str, label="admin_alert"):
+    """Send WhatsApp alert to Nadine safely using template."""
     if not NADINE_WA:
         log.warning("⚠️ NADINE_WA not configured.")
         return
+
     send_safe_message(
         to=NADINE_WA,
         is_template=True,
@@ -37,14 +40,15 @@ def _send_admin_message(msg: str, label="admin_alert"):
 
 
 # ─────────────────────────────────────────────────────────────
-# ROUTE: Admin morning/evening reminders
+# ROUTE: Admin morning/evening/week-ahead reminders
 # ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/run-reminders", methods=["POST"])
 def run_reminders():
+    """Handles admin summary notifications (morning, evening, week-ahead)."""
     data = request.get_json(force=True)
     log.info(f"[Tasks] /run-reminders payload: {data}")
 
-    msg_type = data.get("type")
+    msg_type = data.get("type", "")
     total = data.get("total", 0)
     schedule = data.get("schedule", "No sessions")
 
@@ -52,6 +56,8 @@ def run_reminders():
         msg = f"🌅 PilatesHQ Morning Summary: {total} sessions today. Schedule: {schedule}"
     elif msg_type == "evening":
         msg = f"🌙 PilatesHQ Evening Preview: {total} sessions tomorrow. Schedule: {schedule}. Sleep well! 💤"
+    elif msg_type == "week_ahead_admin":
+        msg = f"📆 PilatesHQ Week-Ahead Preview: {total} sessions scheduled. Schedule: {schedule}"
     else:
         msg = f"🕐 Unknown reminder type received ({msg_type})."
 
@@ -64,6 +70,7 @@ def run_reminders():
 # ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/client-next-hour", methods=["POST"])
 def client_next_hour():
+    """Handles reminders sent 1 hour before client sessions."""
     data = request.get_json(force=True)
     log.info(f"[Tasks] /client-next-hour payload: {data}")
 
@@ -95,6 +102,7 @@ def client_next_hour():
 # ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/package-events", methods=["POST"])
 def package_events():
+    """Sends admin alerts for package or credit events."""
     data = request.get_json(force=True)
     log.info(f"[Tasks] /package-events payload: {data}")
 
@@ -108,6 +116,7 @@ def package_events():
 # ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/client-behaviour", methods=["POST"])
 def client_behaviour():
+    """Handles weekly analytics of client behaviour."""
     data = request.get_json(force=True)
     log.info(f"[Tasks] /client-behaviour payload: {data}")
 
@@ -115,3 +124,12 @@ def client_behaviour():
     cancels = data.get("cancellations", [])
     inactive = data.get("inactive", [])
 
+    summary = (
+        f"📊 Client Behaviour Summary\n"
+        f"❌ No-shows: {len(no_shows)}\n"
+        f"💤 Inactive: {len(inactive)}\n"
+        f"↩️ Cancellations: {len(cancels)}"
+    )
+
+    _send_admin_message(summary, label="client_behaviour_summary")
+    return jsonify({"ok": True, "message": summary})
