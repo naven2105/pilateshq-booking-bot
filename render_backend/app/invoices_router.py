@@ -1,226 +1,87 @@
 """
-invoices_router.py
-───────────────────────────────────────────────
-Handles Nadine’s invoice review workflow via WhatsApp.
-
-Endpoints:
- - /invoices/review       → list all draft invoices
- - /invoices/review-one   → review a specific client's invoice
- - /invoices/send         → deliver invoice to client
- - /invoices/edit         → reply with Google Sheet link
- - /invoices/callback     → handles Meta button postbacks
-───────────────────────────────────────────────
+invoices_router.py – Phase 5
+────────────────────────────────────────────
+Adds:
+ • /invoices/unpaid → returns all unpaid or partial invoices
+ • Streamlined “unpaid invoices” WhatsApp summary for Nadine
+────────────────────────────────────────────
 """
 
-import os
-import requests
-import logging
-from datetime import datetime
+import os, logging, requests
 from flask import Blueprint, request, jsonify
-from . import invoices
 from .utils import send_safe_message
 
 bp = Blueprint("invoices_bp", __name__)
 log = logging.getLogger(__name__)
 
-# ── Environment Variables ────────────────────────────────────────────────────────
+# ── Environment ──────────────────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
-TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
-
-# Templates
-TPL_ADMIN_GENERIC = "admin_generic_alert_us"
-TPL_ADMIN_INVOICE_REVIEW = "client_invoice_review_us"  # Meta template with buttons
-
 
 # ─────────────────────────────────────────────────────────────
-# 1️⃣  LIST DRAFT INVOICES
+# Utility: Unified Apps Script POST
 # ─────────────────────────────────────────────────────────────
-@bp.route("/invoices/review", methods=["POST"])
-def list_draft_invoices():
-    """Triggered when Nadine types 'review invoices' on WhatsApp."""
+def _post_to_gas(payload: dict) -> dict:
     try:
-        payload = {"action": "list_draft_invoices", "sheet_id": SHEET_ID}
-        resp = requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
-        result = resp.json() if resp.ok else {"ok": False, "message": "Could not fetch invoices."}
-        msg = result.get("message", "⚠️ No response from Apps Script.")
-
-        send_safe_message(to=NADINE_WA, message=f"📋 {msg}", label="invoice_review_list")
-        log.info(f"[invoices_router] Draft invoices listed → {msg}")
-        return jsonify({"ok": True, "message": msg})
+        if not GAS_INVOICE_URL:
+            raise ValueError("Missing GAS_INVOICE_URL env.")
+        r = requests.post(GAS_INVOICE_URL, json=payload, timeout=15)
+        if not r.ok:
+            log.error(f"Apps Script HTTP {r.status_code}: {r.text}")
+            return {"ok": False, "error": f"Apps Script HTTP {r.status_code}"}
+        return r.json()
     except Exception as e:
-        log.error(f"[invoices_router] list_draft_invoices error: {e}")
+        log.error(f"[invoices_router] GAS POST failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────
+# /invoices/unpaid  → triggered by “unpaid invoices”
+# ─────────────────────────────────────────────────────────────
+@bp.route("/invoices/unpaid", methods=["POST"])
+def list_unpaid_invoices():
+    """Return a summary list of all unpaid or partially paid invoices."""
+    try:
+        result = _post_to_gas({"action": "list_overdue_invoices", "sheet_id": SHEET_ID})
+        overdue = result.get("overdue", [])
+
+        if not overdue:
+            send_safe_message(to=NADINE_WA, message="✅ All invoices are fully paid!")
+            return jsonify({"ok": True, "message": "All invoices are paid."})
+
+        # Build WhatsApp summary message
+        lines = ["📋 *Unpaid Invoices Summary:*"]
+        for rec in overdue:
+            name = rec.get("client_name", "")
+            amt = rec.get("amount_due", "")
+            status = (rec.get("status") or "").replace("_", " ").capitalize()
+            if name and amt:
+                lines.append(f"• {name} — R{amt} ({status})")
+
+        msg = "\n".join(lines)
+        send_safe_message(to=NADINE_WA, message=msg, label="invoice_unpaid_list")
+
+        return jsonify({"ok": True, "count": len(overdue), "message": msg})
+    except Exception as e:
+        log.error(f"list_unpaid_invoices error: {e}")
+        send_safe_message(to=NADINE_WA, message=f"⚠️ Error fetching unpaid invoices: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────
-# 2️⃣  REVIEW ONE CLIENT INVOICE (Triggered by "invoice Fatima")
-# ─────────────────────────────────────────────────────────────
-@bp.route("/invoices/review-one", methods=["POST"])
-def review_one_invoice():
-    """Triggered when Nadine types 'invoice {client_name}'."""
-    try:
-        data = request.get_json(force=True)
-        client_name = data.get("client_name", "").strip()
-        month_spec = data.get("month_spec", "this month")
-
-        if not client_name:
-            return jsonify({"ok": False, "error": "Missing client name"}), 400
-
-        # Optional: verify draft existence
-        payload = {"action": "list_draft_invoices", "sheet_id": SHEET_ID}
-        resp = requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
-        available = resp.json().get("message", "") if resp.ok else ""
-        exists = client_name.lower() in available.lower()
-
-        month_text = datetime.now().strftime("%b %Y")
-        variable_text = f"{client_name} - {month_text}"
-
-        if exists:
-            send_safe_message(
-                to=NADINE_WA,
-                is_template=True,
-                template_name=TPL_ADMIN_INVOICE_REVIEW,
-                variables=[variable_text],
-                label="invoice_review_one"
-            )
-            msg = f"📑 Invoice review sent for {variable_text}"
-        else:
-            send_safe_message(
-                to=NADINE_WA,
-                message=f"⚠️ No draft invoice found for {client_name}. Please run 'generate invoices' first.",
-                label="invoice_review_missing"
-            )
-            msg = f"No draft invoice found for {client_name}"
-
-        log.info(f"[invoices_router] {msg}")
-        return jsonify({"ok": True, "message": msg})
-    except Exception as e:
-        log.error(f"[invoices_router] review_one_invoice error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# 3️⃣  META BUTTON CALLBACK HANDLER (Updated for Edit Pending)
-# ─────────────────────────────────────────────────────────────
-@bp.route("/invoices/callback", methods=["POST"])
-def handle_invoice_callback():
-    """Handles Meta button postbacks (Send Invoice / Edit)."""
-    try:
-        data = request.get_json(force=True)
-        action = data.get("action", "").lower()
-        client_name = data.get("client_name", "")
-        wa_number = data.get("wa_number", "")
-        client_id = data.get("client_id")
-        month_spec = data.get("month_spec", "this month")
-
-        # ✅ SEND INVOICE ACTION
-        if action == "send_invoice":
-            invoices.send_invoice(wa_number, client_id, client_name, month_spec)
-
-            payload = {"action": "mark_invoice_sent", "sheet_id": SHEET_ID, "client_name": client_name}
-            try:
-                requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
-            except Exception as e:
-                log.warning(f"[callback] Failed to mark invoice as sent: {e}")
-
-            send_safe_message(to=NADINE_WA, message=f"✅ Invoice sent to {client_name}", label="invoice_sent")
-            return jsonify({"ok": True, "action": "sent"})
-
-        # ✏️ EDIT INVOICE ACTION
-        elif action == "edit_invoice":
-            payload = {"action": "mark_invoice_edit", "sheet_id": SHEET_ID, "client_name": client_name}
-            try:
-                requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
-            except Exception as e:
-                log.warning(f"[callback] Failed to mark invoice as edit_pending: {e}")
-
-            sheet_link = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit#gid=0"
-            msg = (
-                f"✏️ Marked *{client_name}* invoice for later editing.\n"
-                f"You can review and adjust from your PC or laptop when ready:\n"
-                f"{sheet_link}"
-            )
-            send_safe_message(to=NADINE_WA, message=msg, label="invoice_edit_pending")
-            return jsonify({"ok": True, "action": "edit_pending"})
-
-        # ⚠️ UNKNOWN ACTION
-        else:
-            send_safe_message(to=NADINE_WA, message="⚠️ Unknown button action received.", label="invoice_unknown_action")
-            return jsonify({"ok": False, "error": "Unknown action"})
-
-    except Exception as e:
-        log.error(f"[invoices_router] handle_invoice_callback error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# 4️⃣  MANUAL SEND ENDPOINT
-# ─────────────────────────────────────────────────────────────
-@bp.route("/invoices/send", methods=["POST"])
-def send_invoice_to_client():
-    """Triggered manually or by callback handler."""
-    try:
-        data = request.get_json(force=True)
-        client_id = data.get("client_id")
-        client_name = data.get("client_name")
-        wa_number = data.get("wa_number")
-        month_spec = data.get("month_spec", "this month")
-
-        invoices.send_invoice(wa_number, client_id, client_name, month_spec)
-
-        payload = {"action": "mark_invoice_sent", "sheet_id": SHEET_ID, "client_name": client_name}
-        try:
-            requests.post(GAS_INVOICE_URL, json=payload, timeout=10)
-        except Exception as e:
-            log.warning(f"[send_invoice] Failed to mark sent: {e}")
-
-        send_safe_message(to=NADINE_WA, message=f"✅ Invoice sent to {client_name}", label="invoice_manual_send")
-        return jsonify({"ok": True})
-    except Exception as e:
-        log.error(f"[invoices_router] send_invoice_to_client error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# 5️⃣  EDIT LINK ENDPOINT (Legacy manual call)
-# ─────────────────────────────────────────────────────────────
-@bp.route("/invoices/edit", methods=["POST"])
-def edit_invoice():
-    """Triggered manually or via callback."""
-    try:
-        data = request.get_json(force=True)
-        client_name = data.get("client_name", "")
-        month_spec = data.get("month_spec", "this month")
-        sheet_link = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit#gid=0"
-
-        msg = (
-            f"✏️ To edit *{client_name}'s* invoice for {month_spec}, "
-            f"open the Invoices tab:\n{sheet_link}\n\n"
-            "Make changes and set status = 'edited' when done."
-        )
-        send_safe_message(to=NADINE_WA, message=msg, label="invoice_edit_link")
-        log.info(f"[invoices_router] Edit link sent for {client_name}")
-        return jsonify({"ok": True, "link": sheet_link})
-    except Exception as e:
-        log.error(f"[invoices_router] edit_invoice error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# HEALTH CHECK
+# Health Check
 # ─────────────────────────────────────────────────────────────
 @bp.route("/invoices", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
         "service": "Invoices Router",
-        "endpoints": {
+        "endpoints": [
+            "/invoices/unpaid",
+            "/invoices/mark-paid",
             "/invoices/review",
-            "/invoices/review-one",
             "/invoices/send",
-            "/invoices/edit",
-            "/invoices/callback"
-        }
+            "/invoices/edit"
+        ]
     }), 200
