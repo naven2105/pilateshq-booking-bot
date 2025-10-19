@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 META_BASE_URL = "https://graph.facebook.com/v19.0"
 META_PHONE_ID = os.getenv("META_PHONE_ID", "")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
-DEFAULT_LANG = os.getenv("TEMPLATE_LANG", "en_US")
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en_US")
 
 # ─────────────────────────────────────────────────────────────
 # WhatsApp number normaliser
@@ -243,7 +243,7 @@ def send_safe_message(
         # ─── Use template immediately for timed/system messages ───
         if is_template and template_name:
             log.info(f"[SAFE MSG] Template {template_name} → {to}")
-            return send_whatsapp_template(to, template_name, TEMPLATE_LANG, variables or [])
+            return send_whatsapp_template(to, template_name, DEFAULT_LANG, variables or [])
 
         # ─── Otherwise, try free text ───
         log.info(f"[SAFE MSG] Free text → {to}")
@@ -255,7 +255,7 @@ def send_safe_message(
             log.warning(f"[SAFE MSG] 24h window closed for {to}. Re-sending via template.")
             tmpl = template_name or "admin_generic_alert_us"
             vars_ = variables or [message]
-            return send_whatsapp_template(to, tmpl, TEMPLATE_LANG, vars_)
+            return send_whatsapp_template(to, tmpl, DEFAULT_LANG, vars_)
 
         # ─── Normal success path ───
         if resp_json.get("messages"):
