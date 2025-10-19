@@ -1,10 +1,12 @@
 """
-dashboard_router.py – Phase 6 (Final Stable)
+dashboard_router.py – Phase 6 (Final – Compact Summary)
 ────────────────────────────────────────────
 Handles weekly studio dashboard summaries.
 Receives data from Google Apps Script and
 sends WhatsApp summary to Nadine using the
-existing approved template: admin_generic_alert_us
+approved template: admin_generic_alert_us
+
+✅ Compact one-line summary (Meta-safe)
 ────────────────────────────────────────────
 """
 
@@ -32,17 +34,15 @@ def weekly_summary():
         count = int(data.get("outstanding_count", 0))
         chart = data.get("chart_url", "").strip()
 
-        # Build WhatsApp message (single parameter for {{1}})
+        # ✅ Compact one-line summary (Meta-safe)
         summary_text = (
-            f"📊 *PilatesHQ Weekly Studio Snapshot*\n"
-            f"💰 Revenue: R{revenue:,.0f}\n"
-            f"🧍 Attendance: {attendance}%\n"
-            f"📉 Outstanding Invoices: {count} (R{outstanding:,.0f})\n"
-            f"📈 View Monthly Chart: {chart}\n"
-            f"Have a great week ahead 💪"
+            f"PilatesHQ Weekly: Revenue R{revenue:,.0f}, "
+            f"Attendance {attendance}%, "
+            f"Outstanding {count} (R{outstanding:,.0f}). "
+            f"Chart: {chart}"
         )
 
-        # ✅ Correct argument order: (to, name, lang, variables)
+        # ✅ Send using approved template (safe format)
         send_whatsapp_template(
             NADINE_WA,
             TPL_WEEKLY_SUMMARY,
