@@ -3,11 +3,15 @@ router_webhook.py
 ────────────────────────────────────────────
 Handles incoming Meta Webhook events (GET verify + POST messages).
 
-✅ Updates:
+✅ Includes:
  • Extracts contact name from 'contacts'
- • Adds admin standing-slot commands (book / suspend / resume)
- • Adds invoice command ("invoice {client}")
- • Removes internal loopback timeout (no self-call hang)
+ • Admin commands:
+     - book / suspend / resume  → standing slot management
+     - invoice {client}         → single client invoice review
+     - unpaid invoices          → full unpaid invoice summary
+     - credits                  → unused credits summary
+ • Client reschedule detection
+ • Default new lead capture
 ────────────────────────────────────────────
 """
 
@@ -15,7 +19,7 @@ import os
 import requests
 from flask import Blueprint, request, jsonify
 from .admin_nudge import notify_new_lead
-from .utils import send_whatsapp_template
+from .utils import send_safe_message, send_whatsapp_template
 
 router_bp = Blueprint("router_bp", __name__)
 
@@ -29,6 +33,7 @@ TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 ATTENDANCE_ENDPOINT = f"{WEBHOOK_BASE}/attendance/log"
 STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
+UNPAID_ENDPOINT = f"{WEBHOOK_BASE}/invoices/unpaid"
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
 
 
@@ -116,6 +121,19 @@ def webhook():
                 except Exception as e:
                     print(f"⚠️ Could not forward invoice review: {e}")
                 return jsonify({"status": "invoice command handled"}), 200
+
+            # ────────────────────────────────────────────────────────────
+            # 💰 ADMIN UNPAID INVOICES COMMAND
+            # ────────────────────────────────────────────────────────────
+            if wa_number == NADINE_WA and lower_text in ["unpaid invoices", "check invoices"]:
+                print(f"💰 Admin requested unpaid invoices summary → {UNPAID_ENDPOINT}")
+                try:
+                    payload = {"action": "list_overdue_invoices"}
+                    r = requests.post(UNPAID_ENDPOINT, json=payload, timeout=15)
+                    print(f"📤 Unpaid invoices forwarded → {r.status_code} | {r.text}")
+                except Exception as e:
+                    print(f"⚠️ Could not forward unpaid invoices: {e}")
+                return jsonify({"status": "unpaid invoices handled"}), 200
 
             # ────────────────────────────────────────────────────────────
             # 🔁 CLIENT RESCHEDULE
