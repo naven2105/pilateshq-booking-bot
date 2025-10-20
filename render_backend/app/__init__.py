@@ -5,7 +5,6 @@ Initialises all Flask blueprints for the Render backend.
 
 Now includes:
  • dashboard_router  → Weekly studio insights
- • test_router       → WhatsApp template test endpoint
 ────────────────────────────────────────────
 """
 
@@ -22,7 +21,6 @@ from render_backend.app.attendance_router import bp as attendance_bp
 from render_backend.app.invoices_router import bp as invoices_bp
 from render_backend.app.dashboard_router import bp as dashboard_bp
 from render_backend.app.router_diag import bp as diag_bp
-from render_backend.app.test_router import bp as test_bp   # ✅ NEW – Test Routes
 
 # ── Setup logging ─────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +40,7 @@ def create_app() -> Flask:
     app.register_blueprint(invoices_bp, url_prefix="/invoices")
     app.register_blueprint(dashboard_bp, url_prefix="/dashboard")
     app.register_blueprint(diag_bp)
-    app.register_blueprint(test_bp, url_prefix="/test")     # ✅ NEW – Added for test sending
+    #app.register_blueprint(test_bp, url_prefix="/test")     # ✅ NEW – Added for test sending
 
     log.info("✅ All blueprints registered successfully (including dashboard & test routers).")
 
