@@ -133,3 +133,61 @@ def client_behaviour():
 
     _send_admin_message(summary, label="client_behaviour_summary")
     return jsonify({"ok": True, "message": summary})
+
+# ─────────────────────────────────────────────────────────────
+# ROUTE: Sends admin alert for upcoming birthdays
+# ─────────────────────────────────────────────────────────────
+@tasks_bp.route("/birthdays", methods=["POST"])
+def birthdays():
+    data = request.get_json(force=True)
+    log.info(f"[Tasks] /birthdays payload: {data}")
+
+    birthdays = data.get("birthdays", [])
+    if not birthdays:
+        return jsonify({"ok": True, "message": "No upcoming birthdays"})
+
+    names = ", ".join([f"{b['name']} ({b['date']})" for b in birthdays])
+    msg = f"🎉 PilatesHQ Birthday Planner: {names}"
+
+    _send_admin_message(msg, label="birthday_alert")
+    return jsonify({"ok": True, "message": msg})
+
+@tasks_bp.route("/birthday-greetings", methods=["POST"])
+def birthday_greetings():
+    """
+    Sends personalised birthday greetings to clients using
+    the approved template: client_generic_alert_us.
+    """
+    data = request.get_json(force=True)
+    log.info(f"[Tasks] /birthday-greetings payload: {data}")
+
+    birthdays = data.get("birthdays", [])
+    if not birthdays:
+        return jsonify({"ok": True, "message": "No client birthdays today"})
+
+    for b in birthdays:
+        name = b.get("name")
+        wa = b.get("wa_number")
+        if not wa:
+            continue
+
+        message = (
+            f"🎉 Happy Birthday {name}! "
+            f"Wishing you health, strength, and balance for the year ahead."
+        )
+
+        send_safe_message(
+            to=wa,
+            is_template=True,
+            template_name="client_generic_alert_us",
+            variables=[message],
+            label="client_birthday_greeting"
+        )
+        log.info(f"🎂 Sent birthday greeting to {name} ({wa})")
+
+    # Optional: Notify Nadine which birthdays were sent
+    names = ", ".join([b["name"] for b in birthdays])
+    admin_msg = f"🎂 PilatesHQ Birthday Greetings sent to: {names}"
+    _send_admin_message(admin_msg, label="birthday_greetings_summary")
+
+    return jsonify({"ok": True, "sent": len(birthdays), "message": admin_msg})
