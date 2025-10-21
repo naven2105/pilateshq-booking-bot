@@ -1,9 +1,9 @@
 """
-invoices_router.py – Phase 7 (Logo Constants + PDF Enhancements)
+invoices_router.py – Phase 7 (Meta Template Enhancement)
 ────────────────────────────────────────────
 Adds:
- • Constants for logo directory & file name
- • Improved logo handling for Render
+ • Uses client_generic_alert_us template for all invoice link messages
+ • Constants for logo directory and file name
  • Client mobile beside name
  • Split banking details
 ────────────────────────────────────────────
@@ -25,7 +25,7 @@ NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
-TPL_CLIENT_ALERT = "client_generic_alert_us"
+TPL_CLIENT_ALERT = "client_generic_alert_us"   # ✅ Approved client Meta template
 BASE_URL = os.getenv("BASE_URL", "https://pilateshq-booking-bot.onrender.com")
 
 # ── Static paths and assets ──────────────────────────────────────────────
@@ -130,8 +130,15 @@ def create_invoice_link():
         token = generate_invoice_token(client_name, invoice_id)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
+        # ✅ Use approved Meta template to send this message
         msg = f"🔐 Secure invoice link for *{client_name}*:\n{view_url}\n(Expires in 48 h)"
-        send_safe_message(NADINE_WA, msg)
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name=TPL_CLIENT_ALERT,
+            variables=[msg],
+            label="invoice_link_template"
+        )
 
         return jsonify({
             "ok": True,
@@ -272,8 +279,10 @@ def health():
             "/invoices/test-send"
         ]
     }), 200
+
+
 # ─────────────────────────────────────────────────────────────
-# Log logo path on startup (for Render verification)
+# Log logo path on startup
 # ─────────────────────────────────────────────────────────────
 if os.path.exists(LOGO_PATH):
     log.info(f"✅ Logo found at {LOGO_PATH}")
