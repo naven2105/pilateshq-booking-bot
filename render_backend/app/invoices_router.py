@@ -145,16 +145,11 @@ def create_invoice_link():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → Verify token + generate PDF with logo
+# /invoices/view/<token> → Verify token + generate PDF with logo + client mobile
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
-    """
-    Secure endpoint:
-     • Validates signed token (expires after 48 h)
-     • Generates and streams PDF directly to browser
-     • Includes PilatesHQ logo
-    """
+    """Generate PilatesHQ invoice PDF with logo and client mobile."""
     check = verify_invoice_token(token)
     if not check or not check.get("client"):
         return jsonify({"ok": False, "error": check.get("error", "Invalid token")}), 403
@@ -162,7 +157,10 @@ def view_invoice(token):
     client_name = check["client"]
     invoice_id = check["invoice"]
 
-    # ── Placeholder invoice data (replace later)
+    # Optional: fetch client number (placeholder for now)
+    client_mobile = "(+27 62 759 7357)"  # Replace later with live lookup
+
+    # ── Example invoice items
     items = [
         ("02 Oct 2025 – Duo Session", 250),
         ("04 Oct 2025 – Duo Session", 250),
@@ -175,20 +173,20 @@ def view_invoice(token):
     pdf = canvas.Canvas(buf, pagesize=A4)
     pdf.setTitle(f"{client_name} Invoice {invoice_id}")
 
-    # ── Logo path and header
+    # ── Header with logo
     logo_path = os.path.join(os.path.dirname(__file__), "../static/pilateshq_logo.png")
     if os.path.exists(logo_path):
-        pdf.drawImage(logo_path, 50, 760, width=120, height=50, preserveAspectRatio=True)
+        pdf.drawImage(logo_path, 50, 760, width=100, height=50, preserveAspectRatio=True)
 
     pdf.setFont("Helvetica-Bold", 14)
     pdf.drawString(200, 790, "PilatesHQ – Client Invoice")
     pdf.setFont("Helvetica", 11)
     pdf.drawString(200, 770, f"Invoice: {invoice_id}")
     pdf.drawString(200, 755, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
-    pdf.drawString(200, 740, f"Client: {client_name}")
+    pdf.drawString(200, 740, f"Client: {client_name} {client_mobile}")
     pdf.line(50, 730, 550, 730)
 
-    # ── Invoice body
+    # ── Body
     y = 710
     for desc, amt in items:
         pdf.drawString(60, y, desc)
@@ -197,8 +195,18 @@ def view_invoice(token):
     pdf.line(50, y, 550, y)
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawRightString(520, y - 20, f"Total: R {total:.2f}")
+
+    # ── Banking details neatly formatted
     pdf.setFont("Helvetica", 10)
-    pdf.drawString(50, y - 60, "Banking Details – Pilates HQ (Pty) Ltd / Absa 4117151887")
+    y -= 70
+    pdf.drawString(50, y, "Banking Details:")
+    y -= 15
+    pdf.drawString(70, y, "Pilates HQ (Pty) Ltd (Reg 2024/737238/07)")
+    y -= 15
+    pdf.drawString(70, y, "Bank: ABSA")
+    y -= 15
+    pdf.drawString(70, y, "Current Account: 4117151887")
+
     pdf.save()
     buf.seek(0)
 
