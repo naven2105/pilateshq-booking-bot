@@ -1,11 +1,9 @@
 """
-invoices_router.py – Phase 7 (Meta Template Enhancement)
+invoices_router.py – Phase 7 (Template Compliance + Logo Fix)
 ────────────────────────────────────────────
-Adds:
- • Uses client_generic_alert_us template for all invoice link messages
- • Constants for logo directory and file name
- • Client mobile beside name
- • Split banking details
+Fixes:
+ • WhatsApp API 400 (#132018) by removing newline characters in variables
+ • Adds static logo verification for Render deployment
 ────────────────────────────────────────────
 """
 
@@ -130,8 +128,9 @@ def create_invoice_link():
         token = generate_invoice_token(client_name, invoice_id)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        # ✅ Use approved Meta template to send this message
-        msg = f"🔐 Secure invoice link for *{client_name}*:\n{view_url}\n(Expires in 48 h)"
+        # ✅ WhatsApp template variables cannot contain newlines
+        msg = f"🔐 Secure invoice link for *{client_name}*: {view_url} (Expires in 48 h)"
+
         send_safe_message(
             to=NADINE_WA,
             is_template=True,
@@ -238,13 +237,9 @@ def test_send_invoice():
 
         message = (
             f"{month_name} Invoice: "
-            f"02, 04 Duo (R250)x2; 11, 18 Single (R300)x2.\n"
-            f"💰 *Total R1,100 | Paid R600 | Balance R500.*\n"
-            f"🏦 *Banking Details:*\n"
-            f"Pilates HQ Pty Ltd\n"
-            f"Absa Bank — Current Account\n"
-            f"Account No: 4117151887\n"
-            f"Reference: Your Name\n"
+            f"02, 04 Duo (R250)x2; 11, 18 Single (R300)x2. "
+            f"💰 *Total R1,100 | Paid R600 | Balance R500.* "
+            f"🏦 Pilates HQ Pty Ltd — ABSA 4117151887. "
             f"📎 PDF: https://pilateshq.co.za/invoices/sample.pdf"
         )
 
