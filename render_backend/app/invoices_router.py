@@ -1,11 +1,10 @@
 """
-invoices_router.py – Phase 7 (Secure PDF Link)
+invoices_router.py – Phase 7 (Secure PDF + Logo)
 ────────────────────────────────────────────
 Adds:
  • /invoices/link        → creates signed expiring link
  • /invoices/view/<tok>  → validates token + generates live PDF
-Keeps:
- • /unpaid, /test-send from Phase 6
+ • Embedded PilatesHQ logo in invoice header
 ────────────────────────────────────────────
 """
 
@@ -118,10 +117,6 @@ def list_unpaid_invoices():
 def create_invoice_link():
     """
     Creates a short-lived, signed link for client invoice view/download.
-    Example:
-    curl -X POST {BASE_URL}/invoices/link \
-      -H "Content-Type: application/json" \
-      -d '{"client_name":"Mary Smith","invoice_id":"OCT2025"}'
     """
     try:
         data = request.get_json(force=True)
@@ -134,7 +129,6 @@ def create_invoice_link():
         token = generate_invoice_token(client_name, invoice_id)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        # Optionally send this secure link to Nadine
         msg = f"🔐 Secure invoice link for *{client_name}*:\n{view_url}\n(Expires in 48 h)"
         send_safe_message(NADINE_WA, msg)
 
@@ -151,7 +145,7 @@ def create_invoice_link():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → Verify token + generate PDF instantly
+# /invoices/view/<token> → Verify token + generate PDF with logo
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -159,6 +153,7 @@ def view_invoice(token):
     Secure endpoint:
      • Validates signed token (expires after 48 h)
      • Generates and streams PDF directly to browser
+     • Includes PilatesHQ logo
     """
     check = verify_invoice_token(token)
     if not check or not check.get("client"):
@@ -176,20 +171,33 @@ def view_invoice(token):
     ]
     total = sum(i[1] for i in items)
 
-    # ── Generate PDF in memory
     buf = io.BytesIO()
     pdf = canvas.Canvas(buf, pagesize=A4)
     pdf.setTitle(f"{client_name} Invoice {invoice_id}")
-    pdf.drawString(50, 800, f"PilatesHQ – Invoice {invoice_id}")
-    pdf.drawString(50, 780, f"Client: {client_name}")
-    pdf.drawString(50, 760, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
-    y = 730
+
+    # ── Logo path and header
+    logo_path = os.path.join(os.path.dirname(__file__), "../static/pilateshq_logo.png")
+    if os.path.exists(logo_path):
+        pdf.drawImage(logo_path, 50, 760, width=120, height=50, preserveAspectRatio=True)
+
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(200, 790, "PilatesHQ – Client Invoice")
+    pdf.setFont("Helvetica", 11)
+    pdf.drawString(200, 770, f"Invoice: {invoice_id}")
+    pdf.drawString(200, 755, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
+    pdf.drawString(200, 740, f"Client: {client_name}")
+    pdf.line(50, 730, 550, 730)
+
+    # ── Invoice body
+    y = 710
     for desc, amt in items:
         pdf.drawString(60, y, desc)
         pdf.drawRightString(520, y, f"R {amt:.2f}")
         y -= 20
     pdf.line(50, y, 550, y)
+    pdf.setFont("Helvetica-Bold", 11)
     pdf.drawRightString(520, y - 20, f"Total: R {total:.2f}")
+    pdf.setFont("Helvetica", 10)
     pdf.drawString(50, y - 60, "Banking Details – Pilates HQ (Pty) Ltd / Absa 4117151887")
     pdf.save()
     buf.seek(0)
@@ -199,7 +207,7 @@ def view_invoice(token):
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/test-send → Simple test message
+# /invoices/test-send → Simple WhatsApp test
 # ─────────────────────────────────────────────────────────────
 @bp.route("/test-send", methods=["POST"])
 def test_send_invoice():
