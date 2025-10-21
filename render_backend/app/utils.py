@@ -1,4 +1,3 @@
-# render_backend/app/utils.py
 """
 utils.py
 ────────────────────────────────────────────
@@ -16,6 +15,7 @@ Includes:
 import os
 import logging
 import requests
+import json          # ✅ Added for safe JSON handling
 import time
 from datetime import datetime
 
@@ -26,6 +26,7 @@ META_BASE_URL = "https://graph.facebook.com/v19.0"
 META_PHONE_ID = os.getenv("META_PHONE_ID", "")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en_US")
+
 
 # ─────────────────────────────────────────────────────────────
 # WhatsApp number normaliser
@@ -51,7 +52,6 @@ def normalize_dob(dob: str | None) -> str | None:
     for fmt in ("%d %B %Y", "%d %b %Y", "%d %B", "%d %b"):
         try:
             dt = datetime.strptime(dob, fmt)
-            # Replace missing year with current year
             if dt.year == 1900:
                 dt = dt.replace(year=datetime.now().year)
             return dt.strftime("%Y-%m-%d")
@@ -88,14 +88,7 @@ def safe_execute(label, func, *args, **kwargs):
 # Send WhatsApp Template Message
 # ─────────────────────────────────────────────────────────────
 def send_whatsapp_template(to: str, name: str, lang: str = DEFAULT_LANG, variables=None):
-    """
-    Send a pre-approved WhatsApp template message.
-    Args:
-        to: recipient phone number (string)
-        name: template name (string)
-        lang: language code (default: en_US)
-        variables: list of string replacements for {{1}}, {{2}}, etc.
-    """
+    """Send a pre-approved WhatsApp template message."""
     if not META_PHONE_ID or not META_ACCESS_TOKEN:
         log.warning("⚠️ Meta credentials missing, cannot send message.")
         return {"ok": False, "error": "missing credentials"}
@@ -110,10 +103,7 @@ def send_whatsapp_template(to: str, name: str, lang: str = DEFAULT_LANG, variabl
         "messaging_product": "whatsapp",
         "to": normalize_wa(to),
         "type": "template",
-        "template": {
-            "name": name,
-            "language": {"code": lang},
-        },
+        "template": {"name": name, "language": {"code": lang}},
     }
 
     if variables:
@@ -181,12 +171,7 @@ def send_whatsapp_text(to: str, text: str):
 # Rate-limit safe send helper
 # ─────────────────────────────────────────────────────────────
 def send_with_delay(messages, delay=1.0):
-    """
-    Send multiple messages with spacing to avoid Meta rate limits.
-    Args:
-        messages: list of dicts, each with keys {to, name, vars}
-        delay: seconds between sends
-    """
+    """Send multiple messages with spacing to avoid Meta rate limits."""
     for msg in messages:
         safe_execute(
             f"Send to {msg.get('to')}",
@@ -198,14 +183,12 @@ def send_with_delay(messages, delay=1.0):
         )
         time.sleep(delay)
 
+
 # ─────────────────────────────────────────────────────────────
 # Reliable Webhook Poster with Retries
 # ─────────────────────────────────────────────────────────────
 def post_with_retry(url: str, payload: dict, retries: int = 3, delay: float = 2.0):
-    """
-    POST to a webhook with automatic retries and backoff.
-    Used for critical actions (e.g., attendance close).
-    """
+    """POST to a webhook with automatic retries and backoff."""
     for attempt in range(1, retries + 1):
         try:
             resp = requests.post(url, json=payload, timeout=10)
@@ -219,8 +202,9 @@ def post_with_retry(url: str, payload: dict, retries: int = 3, delay: float = 2.
     log.error(f"❌ [RETRY FAIL] All attempts failed for {url}")
     return None
 
+
 # ─────────────────────────────────────────────────────────────
-# HYBRID MESSAGE ROUTER (Final Production Version)
+# HYBRID MESSAGE ROUTER (Production)
 # ─────────────────────────────────────────────────────────────
 def send_safe_message(
     to: str,
@@ -234,10 +218,6 @@ def send_safe_message(
     """
     Smart WhatsApp message router.
     Handles Meta 24-hour re-engagement rules automatically.
-
-    - Timer-based jobs → always use approved template
-    - Admin/client replies → send free text if session open
-    - If Meta returns error 131047, fallback to template delivery
     """
     try:
         # ─── Use template immediately for timed/system messages ───
@@ -248,7 +228,12 @@ def send_safe_message(
         # ─── Otherwise, try free text ───
         log.info(f"[SAFE MSG] Free text → {to}")
         resp = send_whatsapp_text(to, message)
-        resp_json = resp if isinstance(resp, dict) else {}
+
+        # ✅ Safe JSON extraction
+        try:
+            resp_json = resp if isinstance(resp, dict) else (resp.json() if hasattr(resp, "json") else {})
+        except Exception:
+            resp_json = {}
 
         # ─── Check for 24h session expiry ───
         if "131047" in json.dumps(resp_json) or "Re-engagement" in json.dumps(resp_json):
@@ -258,7 +243,7 @@ def send_safe_message(
             return send_whatsapp_template(to, tmpl, DEFAULT_LANG, vars_)
 
         # ─── Normal success path ───
-        if resp_json.get("messages"):
+        if isinstance(resp_json, dict) and resp_json.get("messages"):
             msg_id = resp_json["messages"][0].get("id")
             log.info(f"[SAFE MSG] Delivered {label} → {to} | {msg_id}")
         else:
