@@ -1,10 +1,11 @@
 """
-invoices_router.py – Phase 7 (Secure PDF + Logo)
+invoices_router.py – Phase 7 (Logo Constants + PDF Enhancements)
 ────────────────────────────────────────────
 Adds:
- • /invoices/link        → creates signed expiring link
- • /invoices/view/<tok>  → validates token + generates live PDF
- • Embedded PilatesHQ logo in invoice header
+ • Constants for logo directory & file name
+ • Improved logo handling for Render
+ • Client mobile beside name
+ • Split banking details
 ────────────────────────────────────────────
 """
 
@@ -26,6 +27,11 @@ SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
 TPL_CLIENT_ALERT = "client_generic_alert_us"
 BASE_URL = os.getenv("BASE_URL", "https://pilateshq-booking-bot.onrender.com")
+
+# ── Static paths and assets ──────────────────────────────────────────────
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
+LOGO_FILENAME = "pilateshq_logo.png"
+LOGO_PATH = os.path.normpath(os.path.join(STATIC_DIR, LOGO_FILENAME))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -51,10 +57,7 @@ def _post_to_gas(payload: dict) -> dict:
 # ─────────────────────────────────────────────────────────────
 @bp.route("/unpaid", methods=["GET", "POST"])
 def list_unpaid_invoices():
-    """
-    Returns all unpaid or partially paid invoices from Google Apps Script.
-    POST also triggers WhatsApp summary to Nadine.
-    """
+    """Return all unpaid or partially paid invoices from Google Apps Script."""
     try:
         result = _post_to_gas({"action": "list_overdue_invoices", "sheet_id": SHEET_ID})
         overdue = result.get("overdue", []) or result.get("unpaid", [])
@@ -115,9 +118,7 @@ def list_unpaid_invoices():
 # ─────────────────────────────────────────────────────────────
 @bp.route("/link", methods=["POST"])
 def create_invoice_link():
-    """
-    Creates a short-lived, signed link for client invoice view/download.
-    """
+    """Create a short-lived, signed link for client invoice view/download."""
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name")
@@ -145,7 +146,7 @@ def create_invoice_link():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → Verify token + generate PDF with logo + client mobile
+# /invoices/view/<token> → Generate PDF with logo + mobile + bank details
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -156,9 +157,7 @@ def view_invoice(token):
 
     client_name = check["client"]
     invoice_id = check["invoice"]
-
-    # Optional: fetch client number (placeholder for now)
-    client_mobile = "(+27 62 759 7357)"  # Replace later with live lookup
+    client_mobile = "(+27 62 759 7357)"  # Placeholder; will later fetch live number
 
     # ── Example invoice items
     items = [
@@ -173,10 +172,14 @@ def view_invoice(token):
     pdf = canvas.Canvas(buf, pagesize=A4)
     pdf.setTitle(f"{client_name} Invoice {invoice_id}")
 
-    # ── Header with logo
-    logo_path = os.path.join(os.path.dirname(__file__), "../static/pilateshq_logo.png")
-    if os.path.exists(logo_path):
-        pdf.drawImage(logo_path, 50, 760, width=100, height=50, preserveAspectRatio=True)
+    # ── Header with logo (using constants)
+    try:
+        if os.path.exists(LOGO_PATH):
+            pdf.drawImage(LOGO_PATH, 50, 760, width=100, height=50, preserveAspectRatio=True)
+        else:
+            log.warning(f"Logo not found at {LOGO_PATH}")
+    except Exception as e:
+        log.warning(f"Logo load failed: {e}")
 
     pdf.setFont("Helvetica-Bold", 14)
     pdf.drawString(200, 790, "PilatesHQ – Client Invoice")
@@ -196,7 +199,7 @@ def view_invoice(token):
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawRightString(520, y - 20, f"Total: R {total:.2f}")
 
-    # ── Banking details neatly formatted
+    # ── Banking details block
     pdf.setFont("Helvetica", 10)
     y -= 70
     pdf.drawString(50, y, "Banking Details:")
@@ -269,3 +272,10 @@ def health():
             "/invoices/test-send"
         ]
     }), 200
+# ─────────────────────────────────────────────────────────────
+# Log logo path on startup (for Render verification)
+# ─────────────────────────────────────────────────────────────
+if os.path.exists(LOGO_PATH):
+    log.info(f"✅ Logo found at {LOGO_PATH}")
+else:
+    log.warning(f"⚠️ Logo missing at {LOGO_PATH}")
