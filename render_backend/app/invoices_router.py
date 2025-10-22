@@ -1,10 +1,11 @@
 """
-invoices_router.py – Phase 7 (Template Compliance + Logo Fix)
-────────────────────────────────────────────
-Fixes:
- • WhatsApp API 400 (#132018) by removing newline characters in variables
- • Adds static logo verification for Render deployment
-────────────────────────────────────────────
+invoices_router.py – Phase 9 (Dual-Channel Invoice Delivery)
+────────────────────────────────────────────────────────────
+Adds:
+ • Automatic email delivery via Google Apps Script (MailApp)
+ • WhatsApp and Email channels decoupled (email always executes)
+ • Detailed logging for both channels
+────────────────────────────────────────────────────────────
 """
 
 import os, io, time, logging, requests
@@ -23,14 +24,13 @@ NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
-TPL_CLIENT_ALERT = "client_generic_alert_us"   # ✅ Approved client Meta template
+TPL_CLIENT_ALERT = "client_generic_alert_us"
 BASE_URL = os.getenv("BASE_URL", "https://pilateshq-booking-bot.onrender.com")
 
 # ── Static paths and assets ──────────────────────────────────────────────
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
 LOGO_FILENAME = "pilateshq_logo.png"
 LOGO_PATH = os.path.normpath(os.path.join(STATIC_DIR, LOGO_FILENAME))
-
 
 # ─────────────────────────────────────────────────────────────
 # Utility: Unified Apps Script POST
@@ -49,123 +49,116 @@ def _post_to_gas(payload: dict) -> dict:
         log.error(f"[invoices_router] GAS POST failed: {e}")
         return {"ok": False, "error": str(e)}
 
-
 # ─────────────────────────────────────────────────────────────
-# /invoices/unpaid → Returns unpaid / partial invoices
+# /invoices/send → Dual Delivery (WhatsApp + Email)
 # ─────────────────────────────────────────────────────────────
-@bp.route("/unpaid", methods=["GET", "POST"])
-def list_unpaid_invoices():
-    """Return all unpaid or partially paid invoices from Google Apps Script."""
-    try:
-        result = _post_to_gas({"action": "list_overdue_invoices", "sheet_id": SHEET_ID})
-        overdue = result.get("overdue", []) or result.get("unpaid", [])
-
-        if not overdue:
-            send_safe_message(
-                to=NADINE_WA,
-                is_template=True,
-                template_name=TPL_ADMIN_ALERT,
-                variables=["✅ All invoices are fully paid. Enjoy your day! 😊"],
-                label="invoices_all_paid"
-            )
-            return jsonify({"ok": True, "message": "All invoices are paid."})
-
-        lines, total_due = [], 0.0
-        for rec in overdue:
-            name = rec.get("client_name", "").strip()
-            amt = float(rec.get("amount_due") or 0)
-            if not name or amt <= 0:
-                continue
-            total_due += amt
-            lines.append(f"{name} R{amt:,.0f}")
-
-        summary = f"📋 PilatesHQ Invoices: {len(lines)} unpaid totalling R{total_due:,.0f}: " + "; ".join(lines)
-        summary = " ".join(summary.split())
-
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_ADMIN_ALERT,
-            variables=[summary],
-            label="invoice_unpaid_summary"
-        )
-
-        log.info(f"✅ Unpaid invoice summary sent to Nadine ({len(lines)} clients).")
-        return jsonify({
-            "ok": True,
-            "count": len(lines),
-            "total_due": total_due,
-            "overdue": overdue,
-            "summary": summary
-        })
-
-    except Exception as e:
-        log.error(f"❌ list_unpaid_invoices error: {e}")
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_ADMIN_ALERT,
-            variables=[f"⚠️ Error fetching unpaid invoices: {e}"],
-            label="invoice_unpaid_error"
-        )
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/link → Generate a secure, expiring link
-# ─────────────────────────────────────────────────────────────
-@bp.route("/link", methods=["POST"])
-def create_invoice_link():
-    """Create a short-lived, signed link for client invoice view/download."""
+@bp.route("/send", methods=["POST"])
+def send_invoice_dual():
+    """
+    Dual delivery entrypoint.
+    1️⃣ Generate secure invoice link
+    2️⃣ Send via WhatsApp (non-blocking)
+    3️⃣ Always trigger Apps Script email delivery (with one retry)
+    """
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name")
+        wa_number = data.get("wa_number", "")
         invoice_id = data.get("invoice_id") or f"INV-{int(time.time())}"
 
         if not client_name:
             return jsonify({"ok": False, "error": "Missing client_name"}), 400
 
+        # ── Generate secure tokenised link
         token = generate_invoice_token(client_name, invoice_id)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        # ✅ WhatsApp template variables cannot contain newlines
-        msg = f"🔐 Secure invoice link for *{client_name}*: {view_url} (Expires in 48 h)"
+        # ── WhatsApp delivery (non-blocking)
+        try:
+            msg = f"🔐 PilatesHQ Invoice for *{client_name}*: {view_url} (48 h expiry)"
+            send_safe_message(
+                to=wa_number or NADINE_WA,
+                is_template=True,
+                template_name=TPL_CLIENT_ALERT,
+                variables=[msg],
+                label="invoice_dual_whatsapp"
+            )
+            wa_status = "Sent"
+        except Exception as e:
+            wa_status = f"Failed: {e}"
+            log.error(f"WhatsApp send failed for {client_name}: {e}")
 
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_CLIENT_ALERT,
-            variables=[msg],
-            label="invoice_link_template"
+        # ── Email delivery (must always run, with retry)
+        email_payload = {
+            "action": "send_invoice_email",
+            "sheet_id": SHEET_ID,
+            "client_name": client_name
+        }
+
+        email_result = _post_to_gas(email_payload)
+        email_status = "Sent" if email_result.get("ok") else f"Failed: {email_result.get('error')}"
+
+        # 🔁 Retry once after 30 s if failed
+        if not email_result.get("ok"):
+            log.warning(f"Retrying email for {client_name} in 30 s …")
+            time.sleep(30)
+            retry_result = _post_to_gas(email_payload)
+            if retry_result.get("ok"):
+                email_status = "Sent (Retry Success)"
+            else:
+                email_status = f"Failed (After Retry): {retry_result.get('error')}"
+                log.error(f"Email retry failed for {client_name}: {retry_result}")
+
+        # ── Logging summary
+        summary = (
+            f"📤 Invoice delivery summary for {client_name}\n"
+            f"• WhatsApp: {wa_status}\n"
+            f"• Email: {email_status}"
         )
+        log.info(summary)
+
+        if "Failed" in email_status:
+            send_safe_message(
+                to=NADINE_WA,
+                is_template=True,
+                template_name=TPL_ADMIN_ALERT,
+                variables=[f"⚠️ Invoice email failure for {client_name}: {email_status}"],
+                label="invoice_email_failure"
+            )
 
         return jsonify({
             "ok": True,
             "client_name": client_name,
             "invoice_id": invoice_id,
+            "whatsapp_status": wa_status,
+            "email_status": email_status,
             "link": view_url
         })
 
     except Exception as e:
-        log.exception("❌ create_invoice_link error")
+        log.exception("❌ send_invoice_dual error")
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name=TPL_ADMIN_ALERT,
+            variables=[f"⚠️ Error sending dual invoice: {e}"],
+            label="invoice_dual_error"
+        )
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → Generate PDF with logo + mobile + bank details
+# /invoices/view/<token> → PDF Generator (unchanged)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
-    """Generate PilatesHQ invoice PDF with logo and client mobile."""
     check = verify_invoice_token(token)
     if not check or not check.get("client"):
         return jsonify({"ok": False, "error": check.get("error", "Invalid token")}), 403
 
     client_name = check["client"]
     invoice_id = check["invoice"]
-    client_mobile = "(+27 62 759 7357)"  # Placeholder; will later fetch live number
+    client_mobile = "(+27 62 759 7357)"
 
-    # ── Example invoice items
     items = [
         ("02 Oct 2025 – Duo Session", 250),
         ("04 Oct 2025 – Duo Session", 250),
@@ -178,12 +171,9 @@ def view_invoice(token):
     pdf = canvas.Canvas(buf, pagesize=A4)
     pdf.setTitle(f"{client_name} Invoice {invoice_id}")
 
-    # ── Header with logo (using constants)
     try:
         if os.path.exists(LOGO_PATH):
             pdf.drawImage(LOGO_PATH, 50, 760, width=100, height=50, preserveAspectRatio=True)
-        else:
-            log.warning(f"Logo not found at {LOGO_PATH}")
     except Exception as e:
         log.warning(f"Logo load failed: {e}")
 
@@ -195,7 +185,6 @@ def view_invoice(token):
     pdf.drawString(200, 740, f"Client: {client_name} {client_mobile}")
     pdf.line(50, 730, 550, 730)
 
-    # ── Body
     y = 710
     for desc, amt in items:
         pdf.drawString(60, y, desc)
@@ -205,7 +194,6 @@ def view_invoice(token):
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawRightString(520, y - 20, f"Total: R {total:.2f}")
 
-    # ── Banking details block
     pdf.setFont("Helvetica", 10)
     y -= 70
     pdf.drawString(50, y, "Banking Details:")
@@ -222,43 +210,6 @@ def view_invoice(token):
     filename = f"{client_name.replace(' ', '_')}_{invoice_id}.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
 
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/test-send → Simple WhatsApp test
-# ─────────────────────────────────────────────────────────────
-@bp.route("/test-send", methods=["POST"])
-def test_send_invoice():
-    """Send a sample invoice message via WhatsApp template."""
-    try:
-        data = request.get_json(force=True)
-        to = data.get("to", NADINE_WA)
-        now = datetime.now()
-        month_name = now.strftime("%B %Y")
-
-        message = (
-            f"{month_name} Invoice: "
-            f"02, 04 Duo (R250)x2; 11, 18 Single (R300)x2. "
-            f"💰 *Total R1,100 | Paid R600 | Balance R500.* "
-            f"🏦 Pilates HQ Pty Ltd — ABSA 4117151887. "
-            f"📎 PDF: https://pilateshq.co.za/invoices/sample.pdf"
-        )
-
-        resp = send_safe_message(
-            to=to,
-            is_template=True,
-            template_name=TPL_CLIENT_ALERT,
-            variables=[message],
-            label="invoice_test_send_clean",
-        )
-
-        log.info(f"✅ Test invoice sent to {to}")
-        return jsonify({"ok": True, "to": to, "message": message, "response": resp})
-
-    except Exception as e:
-        log.error(f"❌ test_send_invoice error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
 # ─────────────────────────────────────────────────────────────
 # Health Check
 # ─────────────────────────────────────────────────────────────
@@ -268,13 +219,11 @@ def health():
         "status": "ok",
         "service": "Invoices Router",
         "endpoints": [
-            "/invoices/unpaid",
-            "/invoices/link",
+            "/invoices/send",
             "/invoices/view/<token>",
-            "/invoices/test-send"
+            "/invoices/unpaid"
         ]
     }), 200
-
 
 # ─────────────────────────────────────────────────────────────
 # Log logo path on startup
