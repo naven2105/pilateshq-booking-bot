@@ -242,11 +242,8 @@ def deliver_invoice():
             return jsonify({"ok": False, "error": "No pdf_link in response"}), 502
 
         # 2️⃣ WhatsApp message
-        message = (
-            f"📄 PilatesHQ Invoice ready for {client_name}\n"
-            f"View here: {pdf_link}\n"
-            f"(Available for 48 hours)"
-        )
+        message = f"📄 PilatesHQ Invoice ready for {client_name}. View here: {pdf_link} (Available for 48 hours)"
+
         send_safe_message(
             to=wa_number,
             is_template=True,
