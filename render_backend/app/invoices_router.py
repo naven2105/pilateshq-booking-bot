@@ -247,7 +247,13 @@ def deliver_invoice():
             f"View here: {pdf_link}\n"
             f"(Available for 48 hours)"
         )
-        send_safe_message(to=wa_number, body=message)
+        send_safe_message(
+            to=wa_number,
+            is_template=True,
+            template_name=TPL_CLIENT_ALERT,
+            variables=[message],
+            label="invoice_deliver"
+        )
         log.info(f"Invoice successfully delivered to {client_name} via WhatsApp")
 
         return jsonify({"ok": True, "client_name": client_name, "pdf_link": pdf_link})
@@ -256,7 +262,10 @@ def deliver_invoice():
         log.exception("deliver_invoice error")
         send_safe_message(
             to=NADINE_WA,
-            body=f"❌ deliver_invoice error: {e}"
+            is_template=True,
+            template_name=TPL_ADMIN_ALERT,
+            variables=[f"❌ deliver_invoice error: {e}"],
+            label="invoice_deliver_error"
         )
         return jsonify({"ok": False, "error": str(e)}), 500
 
