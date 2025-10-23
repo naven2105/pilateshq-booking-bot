@@ -206,7 +206,7 @@ def health():
     }), 200
 
 # invoices_router.py – WhatsApp Delivery Extension (Phase 12)
-@bp.route("/invoices/deliver", methods=["POST"])
+@bp.route("/deliver", methods=["POST"])
 def deliver_invoice():
     data = request.get_json(force=True)
     client_name = data.get("client_name")
