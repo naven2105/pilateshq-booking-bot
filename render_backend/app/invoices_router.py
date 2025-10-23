@@ -203,3 +203,23 @@ def health():
         "service": "Invoices Router",
         "endpoints": ["/invoices/send", "/invoices/view/<token>"]
     }), 200
+
+# invoices_router.py – WhatsApp Delivery Extension (Phase 12)
+@bp.route("/invoices/deliver", methods=["POST"])
+def deliver_invoice():
+    data = request.get_json(force=True)
+    client_name = data.get("client_name")
+
+    # 1️⃣ Generate invoice link
+    r = requests.post(GAS_INVOICE_URL, json={"action": "generate_invoice_pdf", "client_name": client_name})
+    resp = r.json()
+    if not resp.get("ok"):
+        return jsonify(resp)
+
+    pdf_link = resp["pdf_link"]
+
+    # 2️⃣ Send WhatsApp message
+    message = f"📄 PilatesHQ Invoice ready for {client_name}\nView here: {pdf_link}\n(Available for 48 hours)"
+    send_safe_message(to=data.get("wa_number"), body=message)
+
+    return jsonify({"ok": True, "message": f"Invoice sent to {client_name} via WhatsApp"})
