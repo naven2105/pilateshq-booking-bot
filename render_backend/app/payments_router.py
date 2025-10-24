@@ -1,5 +1,5 @@
 """
-payments_router.py – Phase 12
+payments_router.py – Phase 14 (Final)
 ────────────────────────────────────────────
 Logs client payments from WhatsApp-style messages and
 auto-matches them to invoices via the GAS Web App.
@@ -9,6 +9,7 @@ Endpoints:
     - Body (free text): {"text": "Fatima Khan paid R1,000 on 24 Oct"}
     - Body (structured): {"client_name":"Fatima Khan","amount":1000,"handled_by":"Nadine","source":"Bank"}
  • GET  /payments/health
+────────────────────────────────────────────
 """
 
 import os
@@ -18,7 +19,6 @@ import time
 import logging
 from datetime import datetime
 from typing import Optional, Tuple
-
 import requests
 from flask import Blueprint, request, jsonify
 
@@ -27,7 +27,7 @@ bp = Blueprint("payments_bp", __name__)
 log = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────
-# Re-use the same GAS endpoint you use for invoices (now supports append_payment)
+# Re-use the same GAS endpoint used for invoices (now supports append_payment)
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 TZ_NAME = os.getenv("TZ_NAME", "Africa/Johannesburg")
 
@@ -66,27 +66,20 @@ def _norm_amount(raw: str) -> float:
     if raw is None:
         return 0.0
     s = raw.strip()
-    # unify thousands/decimal: drop spaces/commas as thousand seps, keep final dot/comma as decimal
-    # heuristic: if both separators present, last one is decimal; otherwise treat '.' as decimal
     s = s.replace(" ", "")
     if "," in s and "." in s:
-        # remove thousand separator (assume comma thousands, dot decimal OR vice versa)
         if s.rfind(",") > s.rfind("."):
-            # comma after dot → comma decimal, dot thousands
             s = s.replace(".", "")
             s = s.replace(",", ".")
         else:
-            # dot decimal, comma thousands
             s = s.replace(",", "")
     else:
-        # single type of separator
         if "," in s:
-            # assume comma decimal if only one comma and there are exactly 2 digits after
             parts = s.split(",")
-            if len(parts[-1]) in (1,2):
+            if len(parts[-1]) in (1, 2):
                 s = ".".join(parts)
             else:
-                s = "".join(parts)  # treat commas as thousands
+                s = "".join(parts)
     s = s.lstrip("Rr")
     try:
         return float(s)
@@ -96,7 +89,6 @@ def _norm_amount(raw: str) -> float:
 def _parse_free_text(text: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
     """
     Parse "Name paid R1000 [on 24 Oct]" → (name, amount, date_str)
-    Returns (client_name, amount_float, date_text or None)
     """
     if not text:
         return None, None, None
@@ -117,7 +109,6 @@ def _post_to_gas(payload: dict, timeout: int = 20) -> dict:
         if r.ok:
             return r.json()
         log.error(f"GAS HTTP {r.status_code}: {r.text[:200]}")
-        # quick retry once for 5xx
         if 500 <= r.status_code < 600:
             time.sleep(2)
             r2 = requests.post(GAS_INVOICE_URL, json=payload, timeout=timeout)
@@ -125,7 +116,6 @@ def _post_to_gas(payload: dict, timeout: int = 20) -> dict:
         return {"ok": False, "error": f"GAS HTTP {r.status_code}"}
     except Exception as e:
         log.error(f"GAS POST failed: {e}")
-        # retry once on network error
         try:
             time.sleep(2)
             r2 = requests.post(GAS_INVOICE_URL, json=payload, timeout=timeout)
@@ -137,21 +127,16 @@ def _mk_date_iso(date_text: Optional[str]) -> str:
     """Convert loose date text to ISO yyyy-mm-dd in TZ_NAME when possible; else today."""
     try:
         if not date_text:
-            now = datetime.now()
-            return now.strftime("%Y-%m-%d")
-        # very lightweight parse: accept d[d] Mon or d[d]/m[m]/yyyy etc.
+            return datetime.now().strftime("%Y-%m-%d")
         dt_text = date_text.strip()
-        # Try common formats
         for fmt in ("%d %b %Y", "%d %b", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
             try:
                 dt = datetime.strptime(dt_text, fmt)
-                # if year omitted, assume current year
                 if fmt in ("%d %b",):
                     dt = dt.replace(year=datetime.now().year)
                 return dt.strftime("%Y-%m-%d")
             except ValueError:
                 continue
-        # fallback: today
         return datetime.now().strftime("%Y-%m-%d")
     except Exception:
         return datetime.now().strftime("%Y-%m-%d")
@@ -159,17 +144,17 @@ def _mk_date_iso(date_text: Optional[str]) -> str:
 # ─────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────
-@bp.route("/payments/health", methods=["GET"])
+@bp.route("/health", methods=["GET"])     # ✅ FIXED – no double prefix
 def health():
     return jsonify({
         "status": "ok",
         "service": "Payments Router",
         "gas_url_set": bool(GAS_INVOICE_URL),
         "timezone": TZ_NAME,
-        "endpoints": ["/payments/log", "/health"]
+        "endpoints": ["/payments/log", "/payments/health"]
     }), 200
 
-@bp.route("/payments/log", methods=["POST"])
+@bp.route("/log", methods=["POST"])       # ✅ FIXED – no double prefix
 def payments_log():
     """
     Accepts:
@@ -200,7 +185,6 @@ def payments_log():
         if dtxt and not date_str:
             date_str = dtxt
 
-    # Basic validation
     if not client_name:
         return jsonify({"ok": False, "error": "Missing client_name (or parse failed)"}), 400
     try:
@@ -210,7 +194,6 @@ def payments_log():
     if amount <= 0:
         return jsonify({"ok": False, "error": "Amount must be > 0"}), 400
 
-    # Normalize date to ISO for logging (GAS computes its own timestamp; we pass for message context only if you extend later)
     iso_date = _mk_date_iso(date_str)
 
     payload = {
@@ -218,16 +201,13 @@ def payments_log():
         "client_name": client_name,
         "amount": amount,
         "source": source,
-        "handled_by": handled_by,
-        # date is currently informational; GAS uses its own server timestamp.
-        # If you later want GAS to accept client-specified dates, add support in appendPayment_.
+        "handled_by": handled_by
     }
 
     gas_resp = _post_to_gas(payload)
     ok = bool(gas_resp.get("ok"))
     status_code = 200 if ok else 502
 
-    # Augment response with the parsed/normalized input for observability
     return jsonify({
         "ok": ok,
         "client_name": client_name,
