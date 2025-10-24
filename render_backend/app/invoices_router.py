@@ -1,13 +1,12 @@
 """
-invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix, Debug Check)
+invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix, ImageReader)
 ────────────────────────────────────────────
 Adds:
  • On-demand reissue of past invoices with expiring token link
  • Secure client-specific access (24 h validity)
  • GAS logging of 'LITE_REISSUE' and 'REISSUE_CREATED'
- • Preserves logo aspect ratio (no stretching)
- • Fixes WhatsApp newline template issue
- • Adds LOGO_PATH existence debug logging
+ • Uses ImageReader to fix PNG transparency issues on Render
+ • Preserves aspect ratio, includes debug logging
 ────────────────────────────────────────────
 """
 
@@ -16,14 +15,13 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify, send_file
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from .utils import send_safe_message
 from .tokens import generate_invoice_token, verify_invoice_token
 
-# ── Blueprint setup ─────────────────────────────────────────────
 bp = Blueprint("invoices_bp", __name__)
 log = logging.getLogger(__name__)
 
-# ── Environment ─────────────────────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
@@ -35,9 +33,6 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
 LOGO_PATH = os.path.join(STATIC_DIR, "pilateshq_logo.png")
 
 
-# ─────────────────────────────────────────────────────────────
-# Utility: Unified Apps Script POST
-# ─────────────────────────────────────────────────────────────
 def _post_to_gas(payload: dict) -> dict:
     try:
         if not GAS_INVOICE_URL:
@@ -52,9 +47,6 @@ def _post_to_gas(payload: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-# ─────────────────────────────────────────────────────────────
-# /invoices/send → Email + WhatsApp Dual Delivery
-# ─────────────────────────────────────────────────────────────
 @bp.route("/send", methods=["POST"])
 def send_invoice_dual():
     try:
@@ -126,9 +118,6 @@ def send_invoice_dual():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → PDF Viewer (with logo existence debug)
-# ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
     check = verify_invoice_token(token)
@@ -137,8 +126,6 @@ def view_invoice(token):
 
     client_name = check["client"]
     invoice_id = check.get("invoice") or check.get("month", "Unknown")
-
-    # 🔍 Debug log to confirm logo presence in Render
     log.info(f"LOGO_PATH={LOGO_PATH}, exists={os.path.exists(LOGO_PATH)}")
 
     _post_to_gas({
@@ -155,8 +142,9 @@ def view_invoice(token):
 
     try:
         if os.path.exists(LOGO_PATH):
+            img = ImageReader(LOGO_PATH)
             pdf.drawImage(
-                LOGO_PATH,
+                img,
                 50,
                 760,
                 width=90,
@@ -212,9 +200,6 @@ def view_invoice(token):
     )
 
 
-# ─────────────────────────────────────────────────────────────
-# /invoices/reissue → On-Demand Expiring Link (clean WhatsApp text)
-# ─────────────────────────────────────────────────────────────
 @bp.route("/reissue", methods=["POST"])
 def reissue_invoice():
     try:
@@ -266,9 +251,6 @@ def reissue_invoice():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─────────────────────────────────────────────────────────────
-# /invoices/deliver → Generate + WhatsApp Delivery
-# ─────────────────────────────────────────────────────────────
 @bp.route("/deliver", methods=["POST"])
 def deliver_invoice():
     try:
@@ -318,9 +300,6 @@ def deliver_invoice():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─────────────────────────────────────────────────────────────
-# Health Check
-# ─────────────────────────────────────────────────────────────
 @bp.route("", methods=["GET"])
 def health():
     return jsonify({
