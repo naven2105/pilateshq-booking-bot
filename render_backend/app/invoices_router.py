@@ -1,13 +1,13 @@
 """
-invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix, Template Error Fix)
+invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix, Debug Check)
 ────────────────────────────────────────────
 Adds:
  • On-demand reissue of past invoices with expiring token link
  • Secure client-specific access (24 h validity)
  • GAS logging of 'LITE_REISSUE' and 'REISSUE_CREATED'
  • Preserves logo aspect ratio (no stretching)
- • Fixes WhatsApp template newline error
- • Retains all Phase 12 functionality
+ • Fixes WhatsApp newline template issue
+ • Adds LOGO_PATH existence debug logging
 ────────────────────────────────────────────
 """
 
@@ -127,7 +127,7 @@ def send_invoice_dual():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → PDF Viewer (with logo fix)
+# /invoices/view/<token> → PDF Viewer (with logo existence debug)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -137,6 +137,9 @@ def view_invoice(token):
 
     client_name = check["client"]
     invoice_id = check.get("invoice") or check.get("month", "Unknown")
+
+    # 🔍 Debug log to confirm logo presence in Render
+    log.info(f"LOGO_PATH={LOGO_PATH}, exists={os.path.exists(LOGO_PATH)}")
 
     _post_to_gas({
         "action": "log_portal_view",
@@ -210,7 +213,7 @@ def view_invoice(token):
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/reissue → On-Demand Expiring Link (no newline in WA message)
+# /invoices/reissue → On-Demand Expiring Link (clean WhatsApp text)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reissue", methods=["POST"])
 def reissue_invoice():
@@ -230,7 +233,6 @@ def reissue_invoice():
         token = generate_invoice_token(client_name, month)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        # ⚙️ WhatsApp-safe text (no newlines/tabs)
         msg = f"📄 Your {month} invoice is ready. Link (valid 24 h): {view_url}"
         clean_msg = re.sub(r'[\n\t]+', ' ', msg)
         clean_msg = re.sub(r'\s{2,}', ' ', clean_msg)
