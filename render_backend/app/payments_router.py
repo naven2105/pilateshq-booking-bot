@@ -166,7 +166,7 @@ def health():
         "service": "Payments Router",
         "gas_url_set": bool(GAS_INVOICE_URL),
         "timezone": TZ_NAME,
-        "endpoints": ["/payments/log", "/payments/health"]
+        "endpoints": ["/payments/log", "/health"]
     }), 200
 
 @bp.route("/payments/log", methods=["POST"])
