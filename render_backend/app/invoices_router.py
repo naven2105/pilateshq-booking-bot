@@ -1,16 +1,17 @@
 """
-invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix)
+invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix, Template Error Fix)
 ────────────────────────────────────────────
 Adds:
  • On-demand reissue of past invoices with expiring token link
  • Secure client-specific access (24 h validity)
- • GAS logging of 'LITE_REISSUE' views
+ • GAS logging of 'LITE_REISSUE' and 'REISSUE_CREATED'
  • Preserves logo aspect ratio (no stretching)
+ • Fixes WhatsApp template newline error
  • Retains all Phase 12 functionality
 ────────────────────────────────────────────
 """
 
-import os, io, time, logging, requests
+import os, io, time, logging, requests, re
 from datetime import datetime
 from flask import Blueprint, request, jsonify, send_file
 from reportlab.lib.pagesizes import A4
@@ -155,8 +156,8 @@ def view_invoice(token):
                 LOGO_PATH,
                 50,
                 760,
-                width=90,                 # balanced size
-                preserveAspectRatio=True, # keeps natural ratio
+                width=90,
+                preserveAspectRatio=True,
                 anchor='nw',
                 mask='auto'
             )
@@ -204,12 +205,12 @@ def view_invoice(token):
         buf,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=f"{client_name.replace(' ','_')}_{invoice_id}.pdf"
+        download_name=f"{client_name.replace(' ', '_')}_{invoice_id}.pdf"
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/reissue → On-Demand Expiring Link
+# /invoices/reissue → On-Demand Expiring Link (no newline in WA message)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reissue", methods=["POST"])
 def reissue_invoice():
@@ -226,16 +227,19 @@ def reissue_invoice():
         if not resp.get("ok"):
             return jsonify({"ok": False, "error": resp.get("error", "GAS failure")}), 502
 
-        pdf_link = resp.get("pdf_link")
         token = generate_invoice_token(client_name, month)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        msg = f"📄 Your {month} invoice is ready – link valid 24 h:\n{view_url}"
+        # ⚙️ WhatsApp-safe text (no newlines/tabs)
+        msg = f"📄 Your {month} invoice is ready. Link (valid 24 h): {view_url}"
+        clean_msg = re.sub(r'[\n\t]+', ' ', msg)
+        clean_msg = re.sub(r'\s{2,}', ' ', clean_msg)
+
         send_safe_message(
             to=wa_number,
             is_template=True,
             template_name=TPL_CLIENT_ALERT,
-            variables=[msg],
+            variables=[clean_msg],
             label="invoice_reissue"
         )
 
