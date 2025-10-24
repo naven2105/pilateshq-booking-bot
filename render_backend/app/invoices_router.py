@@ -1,11 +1,12 @@
 """
-invoices_router.py – Phase 13 (Lite Invoice Reissue)
+invoices_router.py – Phase 13 (Lite Invoice Reissue, Logo Fix)
 ────────────────────────────────────────────
 Adds:
  • On-demand reissue of past invoices with expiring token link
  • Secure client-specific access (24 h validity)
  • GAS logging of 'LITE_REISSUE' views
- • Retains all Phase 12 functionality (dual delivery, view, deliver)
+ • Preserves logo aspect ratio (no stretching)
+ • Retains all Phase 12 functionality
 ────────────────────────────────────────────
 """
 
@@ -55,13 +56,11 @@ def _post_to_gas(payload: dict) -> dict:
 # ─────────────────────────────────────────────────────────────
 @bp.route("/send", methods=["POST"])
 def send_invoice_dual():
-    """Unified dual delivery – Email (mandatory) + WhatsApp."""
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name", "").strip()
         wa_number = data.get("wa_number", "").strip() or NADINE_WA
         invoice_id = data.get("invoice_id") or f"INV-{int(time.time())}"
-
         if not client_name:
             return jsonify({"ok": False, "error": "Missing client_name"}), 400
 
@@ -85,7 +84,6 @@ def send_invoice_dual():
         email_payload = {"action": "send_invoice_email", "sheet_id": SHEET_ID, "client_name": client_name}
         email_result = _post_to_gas(email_payload)
         email_status = "Sent" if email_result.get("ok") else f"Failed: {email_result.get('error')}"
-
         if not email_result.get("ok"):
             time.sleep(5)
             retry = _post_to_gas(email_payload)
@@ -128,7 +126,7 @@ def send_invoice_dual():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → PDF Viewer
+# /invoices/view/<token> → PDF Viewer (with logo fix)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -139,7 +137,6 @@ def view_invoice(token):
     client_name = check["client"]
     invoice_id = check.get("invoice") or check.get("month", "Unknown")
 
-    # Log view if part of reissue
     _post_to_gas({
         "action": "log_portal_view",
         "sheet_id": SHEET_ID,
@@ -154,7 +151,15 @@ def view_invoice(token):
 
     try:
         if os.path.exists(LOGO_PATH):
-            pdf.drawImage(LOGO_PATH, 50, 760, width=100, height=50)
+            pdf.drawImage(
+                LOGO_PATH,
+                50,
+                760,
+                width=90,                 # balanced size
+                preserveAspectRatio=True, # keeps natural ratio
+                anchor='nw',
+                mask='auto'
+            )
     except Exception as e:
         log.warning(f"Logo draw failed: {e}")
 
@@ -199,7 +204,7 @@ def view_invoice(token):
         buf,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=f"{client_name.replace(' ', '_')}_{invoice_id}.pdf"
+        download_name=f"{client_name.replace(' ','_')}_{invoice_id}.pdf"
     )
 
 
@@ -208,21 +213,14 @@ def view_invoice(token):
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reissue", methods=["POST"])
 def reissue_invoice():
-    """
-    Nadine triggers this to regenerate a past invoice.
-    Body: {"client_name":"Mary Smith","month":"September 2025"}
-    Returns an expiring link (valid 24 h).
-    """
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name", "").strip()
         month = data.get("month", "").strip()
         wa_number = data.get("wa_number", "").strip() or NADINE_WA
-
         if not client_name or not month:
             return jsonify({"ok": False, "error": "Missing client_name or month"}), 400
 
-        # Ask GAS to regenerate PDF
         payload = {"action": "generate_invoice_pdf", "client_name": client_name, "month": month}
         resp = _post_to_gas(payload)
         if not resp.get("ok"):
@@ -232,7 +230,7 @@ def reissue_invoice():
         token = generate_invoice_token(client_name, month)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        msg = f"📄 Your {month} invoice is ready – link valid for 24 hours:\n{view_url}"
+        msg = f"📄 Your {month} invoice is ready – link valid 24 h:\n{view_url}"
         send_safe_message(
             to=wa_number,
             is_template=True,
@@ -241,7 +239,6 @@ def reissue_invoice():
             label="invoice_reissue"
         )
 
-        # Log to GAS
         _post_to_gas({
             "action": "log_portal_view",
             "sheet_id": SHEET_ID,
@@ -268,18 +265,16 @@ def reissue_invoice():
 # ─────────────────────────────────────────────────────────────
 @bp.route("/deliver", methods=["POST"])
 def deliver_invoice():
-    """Generate invoice via GAS and deliver via WhatsApp."""
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name", "").strip()
         wa_number = data.get("wa_number", "").strip() or NADINE_WA
-
         if not client_name:
             return jsonify({"ok": False, "error": "Missing client_name"}), 400
         if not GAS_INVOICE_URL:
             return jsonify({"ok": False, "error": "Missing GAS_INVOICE_URL"}), 500
 
-        log.info(f"Generating invoice for {client_name} via GAS...")
+        log.info(f"Generating invoice for {client_name} via GAS…")
         r = requests.post(
             GAS_INVOICE_URL,
             json={"action": "generate_invoice_pdf", "client_name": client_name},
@@ -303,7 +298,7 @@ def deliver_invoice():
             variables=[message],
             label="invoice_deliver"
         )
-        log.info(f"Invoice successfully delivered to {client_name} via WhatsApp")
+        log.info(f"Invoice successfully delivered to {client_name}")
         return jsonify({"ok": True, "client_name": client_name, "pdf_link": pdf_link})
     except Exception as e:
         log.exception("deliver_invoice error")
