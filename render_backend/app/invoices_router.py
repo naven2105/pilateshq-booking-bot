@@ -1,20 +1,17 @@
 """
-invoices_router.py – Phase 12 (Final + Debug/Image Fix + Reissue helper)
+invoices_router.py – Phase 12 (Logo-Working Rollback + Reissue)
 ────────────────────────────────────────────
-Adds to Phase 12:
- • Temporary LOGO_PATH existence logging for deployment debug
- • ImageReader() + preserveAspectRatio to avoid invisible/stretched PNG
- • WhatsApp-safe text (no newlines/tabs in template variable)
- • Minimal /invoices/reissue to match your PowerShell test
+Based on the last version confirmed to render the logo correctly.
+Restores original ReportLab drawImage parameters (no ImageReader).
+Adds only /reissue for PowerShell tests.
 ────────────────────────────────────────────
 """
 
-import os, io, time, logging, requests, re
+import os, io, time, logging, requests
 from datetime import datetime
 from flask import Blueprint, request, jsonify, send_file
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
 from .utils import send_safe_message
 from .tokens import generate_invoice_token, verify_invoice_token
 
@@ -72,9 +69,7 @@ def send_invoice_dual():
 
         # 2️⃣ WhatsApp send (non-blocking)
         try:
-            raw = f"🧾 PilatesHQ Invoice for *{client_name}*: {view_url} (expires in 48 h)"
-            msg = re.sub(r'[\n\t]+', ' ', raw)              # no CR/LF in template vars
-            msg = re.sub(r'\s{2,}', ' ', msg)
+            msg = f"🧾 PilatesHQ Invoice for *{client_name}*: {view_url} (expires in 48 h)"
             send_safe_message(
                 to=wa_number,
                 is_template=True,
@@ -141,7 +136,7 @@ def send_invoice_dual():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → PDF Viewer  (with logo debug + ImageReader)
+# /invoices/view/<token> → PDF Viewer  (original logo logic)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -152,23 +147,13 @@ def view_invoice(token):
     client_name = check["client"]
     invoice_id = check["invoice"]
 
-    # Debug: confirm path in container
-    log.info(f"LOGO_PATH={LOGO_PATH}, exists={os.path.exists(LOGO_PATH)}")
-
     buf = io.BytesIO()
     pdf = canvas.Canvas(buf, pagesize=A4)
     pdf.setTitle(f"{client_name} Invoice {invoice_id}")
 
     try:
         if os.path.exists(LOGO_PATH):
-            img = ImageReader(LOGO_PATH)
-            pdf.drawImage(
-                img, 50, 760,
-                width=100,              # keep your Phase-12 geometry
-                preserveAspectRatio=True,
-                anchor='nw',
-                mask='auto'
-            )
+            pdf.drawImage(LOGO_PATH, 50, 760, width=100, height=50)
     except Exception as e:
         log.warning(f"Logo draw failed: {e}")
 
@@ -238,7 +223,7 @@ def deliver_invoice():
         r = requests.post(
             GAS_INVOICE_URL,
             json={"action": "generate_invoice_pdf", "client_name": client_name},
-            timeout=20
+            timeout=25
         )
 
         try:
@@ -254,10 +239,12 @@ def deliver_invoice():
         if not pdf_link:
             return jsonify({"ok": False, "error": "No pdf_link in response"}), 502
 
-        # 2️⃣ WhatsApp message (newline-safe)
-        raw = f"📄 PilatesHQ Invoice ready for {client_name}. View here: {pdf_link} (Available for 48 hours)"
-        message = re.sub(r'[\n\t]+', ' ', raw)
-        message = re.sub(r'\s{2,}', ' ', message)
+        # 2️⃣ WhatsApp message
+        message = (
+            f"📄 PilatesHQ Invoice ready for {client_name}\n"
+            f"View here: {pdf_link}\n"
+            f"(Available for 48 hours)"
+        )
         send_safe_message(
             to=wa_number,
             is_template=True,
@@ -282,40 +269,31 @@ def deliver_invoice():
 
 
 # ─────────────────────────────────────────────────────────────
-# NEW: Minimal /reissue to support your PowerShell test on Phase-12
+# /invoices/reissue  (added for PowerShell compatibility)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reissue", methods=["POST"])
 def reissue_invoice():
-    """
-    Body: {"client_name":"Mary Smith","month":"September 2025"}
-    Generates a token bound to 'month' and returns a /view/<token> link.
-    """
+    """Generate expiring token link identical to /send for PowerShell testing."""
     try:
         data = request.get_json(force=True)
-        client_name = data.get("client_name","").strip()
-        month = data.get("month","").strip()
+        client_name = data.get("client_name", "").strip()
+        month = data.get("month", "").strip()
         if not client_name or not month:
-            return jsonify({"ok":False,"error":"Missing client_name or month"}),400
+            return jsonify({"ok": False, "error": "Missing client_name or month"}), 400
 
-        # For Phase-12, our viewer expects an 'invoice' field in the token.
-        # We’ll encode month into the same slot so /view works unchanged.
-        token = generate_invoice_token(client_name, month)  # token payload handled in tokens.py
+        token = generate_invoice_token(client_name, month)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        # WhatsApp-safe info message to Nadine (optional)
-        info = re.sub(r'\s{2,}', ' ', f"📄 Reissue prepared for {client_name} – {month}: {view_url}")
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_CLIENT_ALERT,
-            variables=[info],
-            label="invoice_reissue_phase12"
-        )
+        return jsonify({
+            "ok": True,
+            "client_name": client_name,
+            "month": month,
+            "link": view_url
+        })
 
-        return jsonify({"ok":True,"client_name":client_name,"month":month,"link":view_url})
     except Exception as e:
-        log.exception("reissue_invoice error (phase12)")
-        return jsonify({"ok":False,"error":str(e)}),500
+        log.exception("reissue_invoice error")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────
