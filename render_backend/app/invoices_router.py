@@ -1,9 +1,8 @@
 """
-invoices_router.py – Phase 12 (Logo-Working Rollback + Reissue)
+invoices_router.py – Phase 13 (Logo-Working + Reissue + Resend)
 ────────────────────────────────────────────
-Based on the last version confirmed to render the logo correctly.
-Restores original ReportLab drawImage parameters (no ImageReader).
-Adds only /reissue for PowerShell tests.
+Based on the version confirmed to render the logo correctly.
+Adds new /resend endpoint for Nadine’s on-demand invoice resend.
 ────────────────────────────────────────────
 """
 
@@ -67,7 +66,7 @@ def send_invoice_dual():
         token = generate_invoice_token(client_name, invoice_id)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        # 2️⃣ WhatsApp send (non-blocking)
+        # 2️⃣ WhatsApp send
         try:
             msg = f"🧾 PilatesHQ Invoice for *{client_name}*: {view_url} (expires in 48 h)"
             send_safe_message(
@@ -83,11 +82,14 @@ def send_invoice_dual():
             log.error(f"WhatsApp send failed: {e}")
 
         # 3️⃣ Email (must succeed)
-        email_payload = {"action": "send_invoice_email", "sheet_id": SHEET_ID, "client_name": client_name}
+        email_payload = {
+            "action": "send_invoice_email",
+            "sheet_id": SHEET_ID,
+            "client_name": client_name
+        }
         email_result = _post_to_gas(email_payload)
         email_status = "Sent" if email_result.get("ok") else f"Failed: {email_result.get('error')}"
 
-        # Retry once after short delay
         if not email_result.get("ok"):
             time.sleep(5)
             retry = _post_to_gas(email_payload)
@@ -96,7 +98,6 @@ def send_invoice_dual():
             else:
                 email_status = f"Failed (Retry): {retry.get('error')}"
 
-        # 4️⃣ Log summary to Apps Script
         _post_to_gas({
             "action": "append_log_event",
             "sheet_id": SHEET_ID,
@@ -104,7 +105,6 @@ def send_invoice_dual():
             "message": f"{client_name} | Email={email_status} | WhatsApp={wa_status}"
         })
 
-        # Notify Nadine if email failed
         if "Failed" in email_status:
             send_safe_message(
                 to=NADINE_WA,
@@ -136,7 +136,7 @@ def send_invoice_dual():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → PDF Viewer  (original logo logic)
+# /invoices/view/<token> → PDF Viewer (original logo logic)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -218,8 +218,7 @@ def deliver_invoice():
         if not GAS_INVOICE_URL:
             return jsonify({"ok": False, "error": "Missing GAS_INVOICE_URL"}), 500
 
-        # 1️⃣ Generate invoice via GAS
-        log.info(f"Generating invoice for {client_name} via GAS...")
+        log.info(f"Generating invoice for {client_name} via GAS…")
         r = requests.post(
             GAS_INVOICE_URL,
             json={"action": "generate_invoice_pdf", "client_name": client_name},
@@ -239,7 +238,6 @@ def deliver_invoice():
         if not pdf_link:
             return jsonify({"ok": False, "error": "No pdf_link in response"}), 502
 
-        # 2️⃣ WhatsApp message
         message = (
             f"📄 PilatesHQ Invoice ready for {client_name}\n"
             f"View here: {pdf_link}\n"
@@ -269,11 +267,11 @@ def deliver_invoice():
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/reissue  (added for PowerShell compatibility)
+# /invoices/reissue → PowerShell token link
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reissue", methods=["POST"])
 def reissue_invoice():
-    """Generate expiring token link identical to /send for PowerShell testing."""
+    """Generate expiring token link for PowerShell testing."""
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name", "").strip()
@@ -290,9 +288,102 @@ def reissue_invoice():
             "month": month,
             "link": view_url
         })
-
     except Exception as e:
         log.exception("reissue_invoice error")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# /invoices/resend → On-demand lite invoice regeneration
+# ─────────────────────────────────────────────────────────────
+@bp.route("/resend", methods=["POST"])
+def resend_invoice():
+    """
+    Nadine’s on-demand resend from Invoices Sheet.
+    Body: {"client_name":"Mary Smith","month":"September 2025"}
+    """
+    try:
+        data = request.get_json(force=True)
+        client_name = data.get("client_name", "").strip()
+        month = data.get("month", "").strip()
+        wa_number = data.get("wa_number", "").strip() or NADINE_WA
+
+        if not client_name or not month:
+            return jsonify({"ok": False, "error": "Missing client_name or month"}), 400
+        if not GAS_INVOICE_URL:
+            return jsonify({"ok": False, "error": "Missing GAS_INVOICE_URL"}), 500
+
+        log.info(f"Resend invoice for {client_name} – {month}")
+        payload = {
+            "action": "generate_invoice_pdf",
+            "sheet_id": SHEET_ID,
+            "client_name": client_name,
+            "month": month
+        }
+        r = requests.post(GAS_INVOICE_URL, json=payload, timeout=25)
+
+        try:
+            resp = r.json()
+        except Exception:
+            log.error(f"Non-JSON GAS response: {r.text[:200]}")
+            return jsonify({"ok": False, "error": "Invalid GAS response"}), 502
+
+        if not resp.get("ok"):
+            err = resp.get("error", "GAS generation failed")
+            log.error(f"GAS generation failed: {err}")
+            send_safe_message(
+                to=NADINE_WA,
+                is_template=True,
+                template_name=TPL_ADMIN_ALERT,
+                variables=[f"⚠️ Unable to resend invoice for {client_name}: {err}"],
+                label="invoice_resend_error"
+            )
+            return jsonify({"ok": False, "error": err}), 502
+
+        pdf_link = resp.get("pdf_link")
+        if not pdf_link:
+            log.error("No pdf_link in GAS response")
+            send_safe_message(
+                to=NADINE_WA,
+                is_template=True,
+                template_name=TPL_ADMIN_ALERT,
+                variables=[f"⚠️ No pdf_link returned for {client_name} – {month}"],
+                label="invoice_resend_no_link"
+            )
+            return jsonify({"ok": False, "error": "Missing pdf_link"}), 502
+
+        message = (
+            f"📄 PilatesHQ Invoice for {month} is ready for {client_name}.\n"
+            f"View here: {pdf_link}\n"
+            f"(Available for 48 hours)"
+        )
+        send_safe_message(
+            to=wa_number,
+            is_template=True,
+            template_name=TPL_CLIENT_ALERT,
+            variables=[message],
+            label="invoice_resend"
+        )
+
+        _post_to_gas({
+            "action": "append_log_event",
+            "sheet_id": SHEET_ID,
+            "event": "INVOICE_RESEND",
+            "message": f"{client_name} | {month} | resent via WhatsApp"
+        })
+
+        log.info(f"Invoice resent successfully to {client_name}")
+        return jsonify({"ok": True, "client_name": client_name, "month": month, "pdf_link": pdf_link})
+
+    except Exception as e:
+        log.exception("resend_invoice error")
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name=TPL_ADMIN_ALERT,
+            variables=[f"❌ resend_invoice error: {e}"],
+            label="invoice_resend_exception"
+        )
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -308,6 +399,7 @@ def health():
             "/invoices/send",
             "/invoices/view/<token>",
             "/invoices/deliver",
-            "/invoices/reissue"
+            "/invoices/reissue",
+            "/invoices/resend"
         ]
     }), 200
