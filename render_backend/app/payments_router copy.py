@@ -1,11 +1,10 @@
 """
-payments_router.py – Phase 15 (Final)
+payments_router.py – Phase 14 (Final)
 ────────────────────────────────────────────
 Logs client payments from WhatsApp-style messages and
 auto-matches them to invoices via the GAS Web App.
 
-Adds WhatsApp confirmation to Nadine on success,
-and triggers "Start Invoice Review" reminder if no matching invoice is found.
+Adds WhatsApp confirmation to Nadine on success.
 ────────────────────────────────────────────
 """
 
@@ -18,7 +17,6 @@ from datetime import datetime
 from typing import Optional, Tuple
 import requests
 from flask import Blueprint, request, jsonify
-from .admin_nlp import parse_admin_command
 
 # ── Blueprint & Logger ────────────────────────────────────────
 bp = Blueprint("payments_bp", __name__)
@@ -37,7 +35,7 @@ AMOUNT_RE = re.compile(
     r"""
     (?:
         R|ZAR|\brand[s]?\b
-    )?
+    )?                           # optional currency indicator
     \s*
     (?P<amount>
         \d{1,3}(?:[ ,]\d{3})*(?:[.,]\d{2})? |
@@ -141,7 +139,6 @@ def health():
         "endpoints": ["/payments/log", "/payments/health"]
     }), 200
 
-
 @bp.route("/log", methods=["POST"])
 def payments_log():
     """Accepts free-text or structured JSON, logs to GAS, and notifies Nadine."""
@@ -192,11 +189,8 @@ def payments_log():
     if ok:
         summary = gas_resp.get("message") or f"{client_name} payment logged"
         notify_text = f"✅ {summary}"
-
         try:
             from .utils import send_safe_message
-
-            # 1️⃣ Always confirm payment logging
             send_safe_message(
                 to=NADINE_WA,
                 is_template=True,
@@ -204,21 +198,6 @@ def payments_log():
                 variables=[notify_text],
                 label="payment_confirmation"
             )
-
-            # 2️⃣ Detect “No matching invoice” and trigger review reminder
-            if "no matching invoice" in summary.lower():
-                cmd = parse_admin_command("start invoice review")
-                if cmd and cmd["intent"] == "start_invoice_review":
-                    review_msg = cmd["message"]
-                    send_safe_message(
-                        to=NADINE_WA,
-                        is_template=True,
-                        template_name=TPL_ADMIN_ALERT,
-                        variables=[review_msg],
-                        label="invoice_review_prompt"
-                    )
-                    log.info("🧾 Triggered invoice review reminder to Nadine.")
-
         except Exception as e:
             log.error(f"WhatsApp notify failed: {e}")
 

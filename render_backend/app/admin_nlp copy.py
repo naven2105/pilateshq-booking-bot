@@ -1,23 +1,17 @@
 """
 admin_nlp.py
-────────────────────────────────────────────
+────────────
 Lightweight natural-language parsing for admin commands.
-
 Supports:
  - Bookings (book, recurring, cancel, status updates)
  - Client management (add, deactivate, update fields)
  - Invoices & balances
- - Session and invoice adjustments (discounts)
- - Invoice review initiation (NEW)
-────────────────────────────────────────────
+ - Session and invoice adjustments (Phase 9)
 """
 
 import re
 
 
-# ─────────────────────────────────────────────
-# Booking & Invoice Command Parser
-# ─────────────────────────────────────────────
 def parse_admin_command(text: str) -> dict | None:
     """Parse booking and operational admin commands."""
     if not text:
@@ -52,8 +46,11 @@ def parse_admin_command(text: str) -> dict | None:
             "type": m.group(4),
         }
 
-    # ── Change session type ──
-    m = re.match(r"change\s+(.+?)\s+(\d{1,2}\s+\w+)\s+session\s+to\s+(single|duo|trio)", s)
+    # ── NEW: Change session type ──
+    m = re.match(
+        r"change\s+(.+?)\s+(\d{1,2}\s+\w+)\s+session\s+to\s+(single|duo|trio)",
+        s,
+    )
     if m:
         return {
             "intent": "update_session_type",
@@ -62,7 +59,7 @@ def parse_admin_command(text: str) -> dict | None:
             "new_type": m.group(3),
         }
 
-    # ── Apply percentage discount ──
+    # ── NEW: Apply percentage discount ──
     m = re.match(r"take\s+(\d+)%\s+off\s+(.+?)\s+invoice", s)
     if m:
         return {
@@ -71,7 +68,7 @@ def parse_admin_command(text: str) -> dict | None:
             "discount_value": int(m.group(1)),
         }
 
-    # ── Apply fixed-amount discount ──
+    # ── NEW: Apply fixed-amount discount ──
     m = re.match(r"take\s*r(\d+)\s+off\s+(.+?)\s+invoice", s)
     if m:
         return {
@@ -80,21 +77,9 @@ def parse_admin_command(text: str) -> dict | None:
             "discount_value": float(m.group(1)),
         }
 
-    # ── 🆕 NEW: Start invoice review reminder ──
-    m = re.match(r"(?i)^start\s+invoice\s+review$", s)
-    if m:
-        return {
-            "intent": "start_invoice_review",
-            "action": "remind_nadine_to_review_invoices",
-            "message": "🧾 Please begin the invoice review procedure."
-        }
-
     return None
 
 
-# ─────────────────────────────────────────────
-# Client & Admin Management Command Parser
-# ─────────────────────────────────────────────
 def parse_admin_client_command(text: str) -> dict | None:
     """Parse client and admin management commands."""
     if not text:
