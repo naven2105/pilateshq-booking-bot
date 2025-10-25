@@ -403,3 +403,55 @@ def health():
             "/invoices/resend"
         ]
     }), 200
+
+# ─────────────────────────────────────────────────────────────
+# /invoices/review-summary → Notify unreviewed invoices count
+# ─────────────────────────────────────────────────────────────
+@bp.route("/review-summary", methods=["POST"])
+def review_summary():
+    """
+    Nadine command: "review invoices"
+    Calls GAS to count unreviewed invoices and returns summary.
+    """
+    try:
+        log.info("🔎 Checking unreviewed invoices via GAS")
+        r = requests.post(GAS_INVOICE_URL, json={"action": "count_unreviewed_invoices"}, timeout=20)
+        try:
+            resp = r.json()
+        except Exception:
+            log.error(f"Non-JSON GAS response: {r.text[:200]}")
+            return jsonify({"ok": False, "error": "Invalid GAS response"}), 502
+
+        if not resp.get("ok"):
+            err = resp.get("error", "GAS call failed")
+            log.error(f"GAS returned error: {err}")
+            return jsonify({"ok": False, "error": err}), 502
+
+        count = int(resp.get("count", 0))
+        next_client = resp.get("next_client", "")
+        next_month = resp.get("next_month", "")
+        summary = (
+            f"📑 {count} invoice(s) pending review. "
+            f"Next draft: {next_client} – {next_month}."
+        )
+
+        from .utils import send_safe_message
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name="invoice_review_admin_us",
+            variables=[f'{next_client} – {next_month} ({count} pending)'],
+            label="invoice_review_summary"
+        )
+
+        log.info(f"Invoice review summary sent → {summary}")
+        return jsonify({
+            "ok": True,
+            "count": count,
+            "next_client": next_client,
+            "next_month": next_month
+        }), 200
+
+    except Exception as e:
+        log.exception("review_summary error")
+        return jsonify({"ok": False, "error": str(e)}), 500
