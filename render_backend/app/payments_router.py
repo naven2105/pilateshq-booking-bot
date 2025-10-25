@@ -4,11 +4,7 @@ payments_router.py – Phase 14 (Final)
 Logs client payments from WhatsApp-style messages and
 auto-matches them to invoices via the GAS Web App.
 
-Endpoints:
- • POST /payments/log
-    - Body (free text): {"text": "Fatima Khan paid R1,000 on 24 Oct"}
-    - Body (structured): {"client_name":"Fatima Khan","amount":1000,"handled_by":"Nadine","source":"Bank"}
- • GET  /payments/health
+Adds WhatsApp confirmation to Nadine on success.
 ────────────────────────────────────────────
 """
 
@@ -27,9 +23,10 @@ bp = Blueprint("payments_bp", __name__)
 log = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────
-# Re-use the same GAS endpoint used for invoices (now supports append_payment)
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 TZ_NAME = os.getenv("TZ_NAME", "Africa/Johannesburg")
+NADINE_WA = os.getenv("NADINE_WA", "")
+TPL_ADMIN_ALERT = "admin_generic_alert_us"
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -41,8 +38,8 @@ AMOUNT_RE = re.compile(
     )?                           # optional currency indicator
     \s*
     (?P<amount>
-        \d{1,3}(?:[ ,]\d{3})*(?:[.,]\d{2})? |  # 1,000.00 / 1 000,00 / 1000.00
-        \d+(?:[.,]\d{2})?                       # 1000 / 1000.00
+        \d{1,3}(?:[ ,]\d{3})*(?:[.,]\d{2})? |
+        \d+(?:[.,]\d{2})?
     )
     """,
     re.IGNORECASE | re.VERBOSE
@@ -62,24 +59,17 @@ PAID_RE = re.compile(
 )
 
 def _norm_amount(raw: str) -> float:
-    """Normalize South African currency strings to float."""
     if raw is None:
         return 0.0
-    s = raw.strip()
-    s = s.replace(" ", "")
+    s = raw.strip().replace(" ", "")
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
+            s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
-    else:
-        if "," in s:
-            parts = s.split(",")
-            if len(parts[-1]) in (1, 2):
-                s = ".".join(parts)
-            else:
-                s = "".join(parts)
+    elif "," in s:
+        parts = s.split(",")
+        s = ".".join(parts) if len(parts[-1]) in (1, 2) else "".join(parts)
     s = s.lstrip("Rr")
     try:
         return float(s)
@@ -87,9 +77,6 @@ def _norm_amount(raw: str) -> float:
         return 0.0
 
 def _parse_free_text(text: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
-    """
-    Parse "Name paid R1000 [on 24 Oct]" → (name, amount, date_str)
-    """
     if not text:
         return None, None, None
     m = PAID_RE.match(text.strip())
@@ -101,7 +88,6 @@ def _parse_free_text(text: str) -> Tuple[Optional[str], Optional[float], Optiona
     return name, amount, date_text
 
 def _post_to_gas(payload: dict, timeout: int = 20) -> dict:
-    """Unified POST to GAS with a single retry on transient failure."""
     if not GAS_INVOICE_URL:
         return {"ok": False, "error": "Missing GAS_INVOICE_URL"}
     try:
@@ -124,7 +110,6 @@ def _post_to_gas(payload: dict, timeout: int = 20) -> dict:
             return {"ok": False, "error": str(e2)}
 
 def _mk_date_iso(date_text: Optional[str]) -> str:
-    """Convert loose date text to ISO yyyy-mm-dd in TZ_NAME when possible; else today."""
     try:
         if not date_text:
             return datetime.now().strftime("%Y-%m-%d")
@@ -144,7 +129,7 @@ def _mk_date_iso(date_text: Optional[str]) -> str:
 # ─────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────
-@bp.route("/health", methods=["GET"])     # ✅ FIXED – no double prefix
+@bp.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
@@ -154,15 +139,9 @@ def health():
         "endpoints": ["/payments/log", "/payments/health"]
     }), 200
 
-@bp.route("/log", methods=["POST"])       # ✅ FIXED – no double prefix
+@bp.route("/log", methods=["POST"])
 def payments_log():
-    """
-    Accepts:
-      A) Free text → {"text":"Fatima Khan paid R1,000 on 24 Oct"}
-      B) Structured → {"client_name":"Fatima Khan","amount":1000,"source":"Bank","handled_by":"Nadine","date":"2025-10-24"}
-
-    Calls GAS: {"action":"append_payment", ...} and relays the JSON result.
-    """
+    """Accepts free-text or structured JSON, logs to GAS, and notifies Nadine."""
     try:
         data = request.get_json(force=True, silent=False) or {}
     except Exception:
@@ -175,7 +154,6 @@ def payments_log():
     source = (data.get("source") or "Bank").strip()
     date_str = (data.get("date") or "").strip()
 
-    # If free text present, parse it
     if text and (not client_name or not amount):
         name, amt, dtxt = _parse_free_text(text)
         if name:
@@ -195,7 +173,6 @@ def payments_log():
         return jsonify({"ok": False, "error": "Amount must be > 0"}), 400
 
     iso_date = _mk_date_iso(date_str)
-
     payload = {
         "action": "append_payment",
         "client_name": client_name,
@@ -207,6 +184,22 @@ def payments_log():
     gas_resp = _post_to_gas(payload)
     ok = bool(gas_resp.get("ok"))
     status_code = 200 if ok else 502
+
+    # ✅ WhatsApp confirmation to Nadine if payment logged successfully
+    if ok:
+        summary = gas_resp.get("message") or f"{client_name} payment logged"
+        notify_text = f"✅ {summary}"
+        try:
+            from .utils import send_safe_message
+            send_safe_message(
+                to=NADINE_WA,
+                is_template=True,
+                template_name=TPL_ADMIN_ALERT,
+                variables=[notify_text],
+                label="payment_confirmation"
+            )
+        except Exception as e:
+            log.error(f"WhatsApp notify failed: {e}")
 
     return jsonify({
         "ok": ok,
