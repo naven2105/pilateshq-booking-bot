@@ -2,12 +2,6 @@
 tasks_router.py
 ────────────────────────────────────────────
 Handles task webhook calls from Google Apps Script.
-
-Notes:
- • This module no longer uses Render CRON or APScheduler jobs.
- • All time-based triggers (morning, evening, weekly, birthdays)
-   are executed in Google Apps Script and call these endpoints
-   via HTTPS webhooks.
 ────────────────────────────────────────────
 """
 
@@ -119,7 +113,7 @@ def package_events():
 
 # ─────────────────────────────────────────────────────────────
 # ROUTE: Client behaviour analytics (weekly)
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/client-behaviour", methods=["POST"])
 def client_behaviour():
     """Handles weekly analytics of client behaviour."""
@@ -140,10 +134,9 @@ def client_behaviour():
     _send_admin_message(summary, label="client_behaviour_summary")
     return jsonify({"ok": True, "message": summary})
 
-
 # ─────────────────────────────────────────────────────────────
 # ROUTE: Sends admin alert for upcoming birthdays
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @tasks_bp.route("/birthdays", methods=["POST"])
 def birthdays():
     data = request.get_json(force=True)
@@ -158,7 +151,6 @@ def birthdays():
 
     _send_admin_message(msg, label="birthday_alert")
     return jsonify({"ok": True, "message": msg})
-
 
 @tasks_bp.route("/birthday-greetings", methods=["POST"])
 def birthday_greetings():
@@ -193,6 +185,7 @@ def birthday_greetings():
         )
         log.info(f"🎂 Sent birthday greeting to {name} ({wa})")
 
+    # Optional: Notify Nadine which birthdays were sent
     names = ", ".join([b["name"] for b in birthdays])
     admin_msg = f"🎂 PilatesHQ Birthday Greetings sent to: {names}"
     _send_admin_message(admin_msg, label="birthday_greetings_summary")

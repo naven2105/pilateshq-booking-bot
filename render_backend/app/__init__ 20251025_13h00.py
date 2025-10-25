@@ -1,33 +1,19 @@
 """
-__init__.py - Phase 14
+__init__.py
 ────────────────────────────────────────────
 Initialises all Flask blueprints for the Render backend.
 
-Notes:
- • GAS triggers (time-based jobs in Google Apps Script) remain active.
- • Render backend no longer uses CRON or APScheduler jobs — all admin
-   summaries, reminders, and payments are now triggered manually or
-   through Google Apps Script webhooks.
-
-Included Blueprints:
- • router_webhook       → Core WhatsApp event listener
- • tasks_router         → Scheduled task endpoints (triggered via GAS)
- • tasks_sheets         → Shared Google Sheets operations
- • client_reminders     → Client messaging & reminders
- • package_events       → Credit & attendance tracking
- • attendance_router    → Session reschedules & no-shows
- • invoices_router      → PDF generation & invoice delivery
- • dashboard_router     → Weekly studio insights (manual)
- • payments_router      → Payment recording & auto-match (Phase 14)
- • router_diag          → Health & diagnostics
+Now includes:
+ • dashboard_router   → Weekly studio insights
+ • payments_router    → Payment recording & auto-match (Phase 14)
 ────────────────────────────────────────────
 """
 
 import logging
-from flask import Flask
+from flask import Flask  
 
 # ── Import blueprints ─────────────────────────────
-from render_backend.app.router_webhook import router_bp
+from render_backend.app.router_webhook import router_bp  
 from render_backend.app.tasks_router import tasks_bp
 from render_backend.app.tasks_sheets import bp as tasks_sheets_bp
 from render_backend.app.client_reminders import bp as client_reminders_bp
@@ -35,7 +21,7 @@ from render_backend.app.package_events import bp as package_events_bp
 from render_backend.app.attendance_router import bp as attendance_bp
 from render_backend.app.invoices_router import bp as invoices_bp
 from render_backend.app.dashboard_router import bp as dashboard_bp
-from render_backend.app.payments_router import bp as payments_bp       # ✅ Phase 14 – Auto-Match Payments
+from render_backend.app.payments_router import bp as payments_bp      # ✅ NEW – Payments Router
 from render_backend.app.router_diag import bp as diag_bp
 
 # ── Setup logging ─────────────────────────────
@@ -58,22 +44,21 @@ def create_app() -> Flask:
     app.register_blueprint(attendance_bp)
     app.register_blueprint(invoices_bp, url_prefix="/invoices")
     app.register_blueprint(dashboard_bp, url_prefix="/dashboard")
-    app.register_blueprint(payments_bp, url_prefix="/payments")
+    app.register_blueprint(payments_bp, url_prefix="/payments")       # ✅ Phase 14 – Auto-Match Payments
     app.register_blueprint(diag_bp)
     #app.register_blueprint(test_bp, url_prefix="/test")               # Optional test router
 
     log.info("✅ All blueprints registered successfully (includes dashboard & payments routers).")
 
-    # ── Health check ─────────────────────────────────────────────
+    # ── Health check ─────────────────────────────
     @app.route("/", methods=["GET"])
     def health():
         """Simple health and route visibility endpoint."""
         return {
             "status": "ok",
             "service": "PilatesHQ Booking Bot",
-            "version": "1.5.1",  # ⬆️ Incremented – CRON removed from Render
-            "routes": list(app.blueprints.keys()),
-            "note": "All time-based triggers now handled exclusively by GAS."
+            "version": "1.5.0",  # ⬆️ incremented for Phase 14
+            "routes": list(app.blueprints.keys())
         }, 200
 
     return app
