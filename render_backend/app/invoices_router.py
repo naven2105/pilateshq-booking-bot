@@ -1,14 +1,13 @@
 """
-invoices_router.py – Phase 14 (Resend Fix + Flattened Templates + Stable GAS Integration)
+invoices_router.py – Phase 14 (Final)
 ────────────────────────────────────────────
 Enhancements:
- • Fixes WhatsApp template variable newline issue
- • Adds flatten_message() utility to clean variables
- • Keeps dual-channel delivery (Email + WhatsApp)
- • Preserves secure token links + /review-summary endpoint
+ • Adds /invoices/mark-paid endpoint for Payment Handling Automation
+ • Integrates GAS appendPayment_() + autoMatchInvoice_()
+ • Sends admin-only WhatsApp confirmations (payment_logged_admin_us)
+ • Retains Resend Fix + Flattened Templates + Secure GAS Integration
 ────────────────────────────────────────────
 """
-
 import os, io, time, logging, requests
 from datetime import datetime
 from flask import Blueprint, request, jsonify, send_file
@@ -26,18 +25,19 @@ NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
 BASE_URL = os.getenv("BASE_URL", "https://pilateshq-booking-bot.onrender.com")
+
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
 TPL_CLIENT_ALERT = "client_generic_alert_us"
+TPL_PAYMENT_LOGGED = "payment_logged_admin_us"
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
 LOGO_PATH = os.path.join(STATIC_DIR, "pilateshq_logo.png")
 
 
 # ─────────────────────────────────────────────────────────────
-# Utility: Message flattener to prevent Meta template errors
+# Utility: Message flattener
 # ─────────────────────────────────────────────────────────────
 def flatten_message(text: str) -> str:
-    """Remove newlines/tabs and collapse excessive spaces for template safety."""
     if not text:
         return ""
     clean = text.replace("\n", " ").replace("\t", " ")
@@ -47,20 +47,21 @@ def flatten_message(text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Utility: Unified Apps Script POST
+# Utility: Unified Apps Script POST with retry
 # ─────────────────────────────────────────────────────────────
-def _post_to_gas(payload: dict) -> dict:
-    try:
-        if not GAS_INVOICE_URL:
-            raise ValueError("Missing GAS_INVOICE_URL")
-        r = requests.post(GAS_INVOICE_URL, json=payload, timeout=20)
-        if not r.ok:
-            log.error(f"GAS {r.status_code}: {r.text}")
-            return {"ok": False, "error": f"GAS HTTP {r.status_code}"}
-        return r.json()
-    except Exception as e:
-        log.error(f"GAS POST failed: {e}")
-        return {"ok": False, "error": str(e)}
+def _post_to_gas(payload: dict, retries: int = 2) -> dict:
+    for attempt in range(retries + 1):
+        try:
+            if not GAS_INVOICE_URL:
+                raise ValueError("Missing GAS_INVOICE_URL")
+            r = requests.post(GAS_INVOICE_URL, json=payload, timeout=20)
+            if r.ok:
+                return r.json()
+            log.warning(f"GAS HTTP {r.status_code}: {r.text}")
+        except Exception as e:
+            log.error(f"GAS POST failed ({attempt + 1}/{retries + 1}): {e}")
+        time.sleep(2)
+    return {"ok": False, "error": "GAS communication failed"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -246,7 +247,6 @@ def resend_invoice():
             "month": month
         }
         r = requests.post(GAS_INVOICE_URL, json=payload, timeout=25)
-
         try:
             resp = r.json()
         except Exception:
@@ -275,7 +275,6 @@ def resend_invoice():
             )
             return jsonify({"ok": False, "error": "Missing pdf_link"}), 502
 
-        # Flattened message for template safety
         msg_text = flatten_message(
             f"📄 PilatesHQ Invoice for {month} is ready for {client_name}. "
             f"View here: {pdf_link}. Available for 48 hours."
@@ -316,10 +315,7 @@ def resend_invoice():
 # ─────────────────────────────────────────────────────────────
 @bp.route("/review-summary", methods=["POST"])
 def review_summary():
-    """
-    Nadine command: "review invoices"
-    Calls GAS to count unreviewed invoices and returns summary.
-    """
+    """Nadine command: 'review invoices'."""
     try:
         log.info("🔎 Checking unreviewed invoices via GAS")
         r = requests.post(GAS_INVOICE_URL, json={"action": "count_unreviewed_invoices"}, timeout=20)
@@ -332,9 +328,7 @@ def review_summary():
         next_client = resp.get("next_client", "")
         next_month = resp.get("next_month", "")
 
-        summary = flatten_message(
-            f"📑 {count} invoice(s) pending review. Next draft: {next_client} – {next_month}."
-        )
+        summary = flatten_message(f"📑 {count} invoice(s) pending review. Next draft: {next_client} – {next_month}.")
         send_safe_message(
             to=NADINE_WA,
             is_template=True,
@@ -352,6 +346,80 @@ def review_summary():
 
 
 # ─────────────────────────────────────────────────────────────
+# /invoices/mark-paid → Payment logging from Nadine
+# ─────────────────────────────────────────────────────────────
+@bp.route("/mark-paid", methods=["POST"])
+def mark_paid():
+    """
+    Logs a received payment (POP notice from Nadine).
+    Example:
+      {"client_name":"Mary Smith","amount":600,"date":"2025-10-26","note":"POP received"}
+    """
+    try:
+        data = request.get_json(force=True)
+        client = data.get("client_name", "").strip()
+        amount = data.get("amount")
+        date = data.get("date") or datetime.now().strftime("%Y-%m-%d")
+        note = data.get("note", "")
+
+        if not client or not amount:
+            return jsonify({"ok": False, "error": "Missing client_name or amount"}), 400
+
+        log.info(f"🧾 Logging payment for {client}: R{amount} on {date}")
+
+        # Step 1 – Append payment
+        append_result = _post_to_gas({
+            "action": "appendPayment_",
+            "client_name": client,
+            "amount": amount,
+            "date": date,
+            "note": note
+        })
+        if not append_result.get("ok"):
+            raise Exception(append_result.get("error", "appendPayment_ failed"))
+
+        # Step 2 – Auto-match invoice
+        match_result = _post_to_gas({
+            "action": "autoMatchInvoice_",
+            "client_name": client
+        })
+        status = match_result.get("status", "Pending")
+
+        # Step 3 – Private confirmation
+        msg = flatten_message(
+            f"✅ Payment logged for *{client}*\n"
+            f"Amount: R{amount}\nStatus: {status}\nNote: {note or '—'}"
+        )
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name=TPL_PAYMENT_LOGGED,
+            variables=[msg],
+            label="payment_mark_paid"
+        )
+
+        _post_to_gas({
+            "action": "append_log_event",
+            "sheet_id": SHEET_ID,
+            "event": "PAYMENT_LOG",
+            "message": f"{client} | R{amount} | {status}"
+        })
+
+        return jsonify({"ok": True, "client_name": client, "status": status})
+
+    except Exception as e:
+        log.exception("mark_paid error")
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name=TPL_ADMIN_ALERT,
+            variables=[flatten_message(f"⚠️ Payment logging failed: {e}")],
+            label="payment_mark_paid_error"
+        )
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────
 # Health Check
 # ─────────────────────────────────────────────────────────────
 @bp.route("", methods=["GET"])
@@ -363,6 +431,7 @@ def health():
             "/invoices/send",
             "/invoices/view/<token>",
             "/invoices/resend",
-            "/invoices/review-summary"
+            "/invoices/review-summary",
+            "/invoices/mark-paid"
         ]
     }), 200
