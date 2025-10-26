@@ -1,8 +1,11 @@
 """
-invoices_router.py – Phase 13 (Logo-Working + Reissue + Resend)
+invoices_router.py – Phase 14 (Resend Fix + Flattened Templates + Stable GAS Integration)
 ────────────────────────────────────────────
-Based on the version confirmed to render the logo correctly.
-Adds new /resend endpoint for Nadine’s on-demand invoice resend.
+Enhancements:
+ • Fixes WhatsApp template variable newline issue
+ • Adds flatten_message() utility to clean variables
+ • Keeps dual-channel delivery (Email + WhatsApp)
+ • Preserves secure token links + /review-summary endpoint
 ────────────────────────────────────────────
 """
 
@@ -28,6 +31,19 @@ TPL_CLIENT_ALERT = "client_generic_alert_us"
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
 LOGO_PATH = os.path.join(STATIC_DIR, "pilateshq_logo.png")
+
+
+# ─────────────────────────────────────────────────────────────
+# Utility: Message flattener to prevent Meta template errors
+# ─────────────────────────────────────────────────────────────
+def flatten_message(text: str) -> str:
+    """Remove newlines/tabs and collapse excessive spaces for template safety."""
+    if not text:
+        return ""
+    clean = text.replace("\n", " ").replace("\t", " ")
+    while "  " in clean:
+        clean = clean.replace("  ", " ")
+    return clean.strip()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -68,7 +84,7 @@ def send_invoice_dual():
 
         # 2️⃣ WhatsApp send
         try:
-            msg = f"🧾 PilatesHQ Invoice for *{client_name}*: {view_url} (expires in 48 h)"
+            msg = flatten_message(f"🧾 PilatesHQ Invoice for *{client_name}*: {view_url} (expires in 48h)")
             send_safe_message(
                 to=wa_number,
                 is_template=True,
@@ -110,7 +126,7 @@ def send_invoice_dual():
                 to=NADINE_WA,
                 is_template=True,
                 template_name=TPL_ADMIN_ALERT,
-                variables=[f"⚠️ Invoice email failed for {client_name}: {email_status}"],
+                variables=[flatten_message(f"⚠️ Invoice email failed for {client_name}: {email_status}")],
                 label="invoice_email_failure"
             )
 
@@ -129,14 +145,14 @@ def send_invoice_dual():
             to=NADINE_WA,
             is_template=True,
             template_name=TPL_ADMIN_ALERT,
-            variables=[f"❌ send_invoice_dual error: {e}"],
+            variables=[flatten_message(f"❌ send_invoice_dual error: {e}")],
             label="invoice_dual_error"
         )
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token> → PDF Viewer (original logo logic)
+# /invoices/view/<token> → PDF Viewer
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
@@ -203,104 +219,13 @@ def view_invoice(token):
 
 
 # ─────────────────────────────────────────────────────────────
-# /invoices/deliver → Generate + WhatsApp Delivery
-# ─────────────────────────────────────────────────────────────
-@bp.route("/deliver", methods=["POST"])
-def deliver_invoice():
-    """Generate invoice via GAS and deliver via WhatsApp."""
-    try:
-        data = request.get_json(force=True)
-        client_name = data.get("client_name", "").strip()
-        wa_number = data.get("wa_number", "").strip() or NADINE_WA
-
-        if not client_name:
-            return jsonify({"ok": False, "error": "Missing client_name"}), 400
-        if not GAS_INVOICE_URL:
-            return jsonify({"ok": False, "error": "Missing GAS_INVOICE_URL"}), 500
-
-        log.info(f"Generating invoice for {client_name} via GAS…")
-        r = requests.post(
-            GAS_INVOICE_URL,
-            json={"action": "generate_invoice_pdf", "client_name": client_name},
-            timeout=25
-        )
-
-        try:
-            resp = r.json()
-        except Exception:
-            log.error(f"Non-JSON GAS response: {r.text[:200]}")
-            return jsonify({"ok": False, "error": "Invalid GAS response"}), 502
-
-        if not resp.get("ok"):
-            return jsonify({"ok": False, "error": resp.get("error", "GAS generation failed")}), 502
-
-        pdf_link = resp.get("pdf_link")
-        if not pdf_link:
-            return jsonify({"ok": False, "error": "No pdf_link in response"}), 502
-
-        message = (
-            f"📄 PilatesHQ Invoice ready for {client_name}\n"
-            f"View here: {pdf_link}\n"
-            f"(Available for 48 hours)"
-        )
-        send_safe_message(
-            to=wa_number,
-            is_template=True,
-            template_name=TPL_CLIENT_ALERT,
-            variables=[message],
-            label="invoice_deliver"
-        )
-        log.info(f"Invoice successfully delivered to {client_name} via WhatsApp")
-
-        return jsonify({"ok": True, "client_name": client_name, "pdf_link": pdf_link})
-
-    except Exception as e:
-        log.exception("deliver_invoice error")
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_ADMIN_ALERT,
-            variables=[f"❌ deliver_invoice error: {e}"],
-            label="invoice_deliver_error"
-        )
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/reissue → PowerShell token link
-# ─────────────────────────────────────────────────────────────
-@bp.route("/reissue", methods=["POST"])
-def reissue_invoice():
-    """Generate expiring token link for PowerShell testing."""
-    try:
-        data = request.get_json(force=True)
-        client_name = data.get("client_name", "").strip()
-        month = data.get("month", "").strip()
-        if not client_name or not month:
-            return jsonify({"ok": False, "error": "Missing client_name or month"}), 400
-
-        token = generate_invoice_token(client_name, month)
-        view_url = f"{BASE_URL}/invoices/view/{token}"
-
-        return jsonify({
-            "ok": True,
-            "client_name": client_name,
-            "month": month,
-            "link": view_url
-        })
-    except Exception as e:
-        log.exception("reissue_invoice error")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ─────────────────────────────────────────────────────────────
 # /invoices/resend → On-demand lite invoice regeneration
 # ─────────────────────────────────────────────────────────────
 @bp.route("/resend", methods=["POST"])
 def resend_invoice():
     """
     Nadine’s on-demand resend from Invoices Sheet.
-    Body: {"client_name":"Mary Smith","month":"September 2025"}
+    Body: {"client_name":"Mary Smith","month":"October 2025"}
     """
     try:
         data = request.get_json(force=True)
@@ -330,38 +255,37 @@ def resend_invoice():
 
         if not resp.get("ok"):
             err = resp.get("error", "GAS generation failed")
-            log.error(f"GAS generation failed: {err}")
             send_safe_message(
                 to=NADINE_WA,
                 is_template=True,
                 template_name=TPL_ADMIN_ALERT,
-                variables=[f"⚠️ Unable to resend invoice for {client_name}: {err}"],
+                variables=[flatten_message(f"⚠️ Unable to resend invoice for {client_name}: {err}")],
                 label="invoice_resend_error"
             )
             return jsonify({"ok": False, "error": err}), 502
 
         pdf_link = resp.get("pdf_link")
         if not pdf_link:
-            log.error("No pdf_link in GAS response")
             send_safe_message(
                 to=NADINE_WA,
                 is_template=True,
                 template_name=TPL_ADMIN_ALERT,
-                variables=[f"⚠️ No pdf_link returned for {client_name} – {month}"],
+                variables=[flatten_message(f"⚠️ No pdf_link returned for {client_name} – {month}")],
                 label="invoice_resend_no_link"
             )
             return jsonify({"ok": False, "error": "Missing pdf_link"}), 502
 
-        message = (
-            f"📄 PilatesHQ Invoice for {month} is ready for {client_name}.\n"
-            f"View here: {pdf_link}\n"
-            f"(Available for 48 hours)"
+        # Flattened message for template safety
+        msg_text = flatten_message(
+            f"📄 PilatesHQ Invoice for {month} is ready for {client_name}. "
+            f"View here: {pdf_link}. Available for 48 hours."
         )
+
         send_safe_message(
             to=wa_number,
             is_template=True,
             template_name=TPL_CLIENT_ALERT,
-            variables=[message],
+            variables=[msg_text],
             label="invoice_resend"
         )
 
@@ -381,9 +305,49 @@ def resend_invoice():
             to=NADINE_WA,
             is_template=True,
             template_name=TPL_ADMIN_ALERT,
-            variables=[f"❌ resend_invoice error: {e}"],
+            variables=[flatten_message(f"❌ resend_invoice error: {e}")],
             label="invoice_resend_exception"
         )
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# /invoices/review-summary → Notify unreviewed invoices count
+# ─────────────────────────────────────────────────────────────
+@bp.route("/review-summary", methods=["POST"])
+def review_summary():
+    """
+    Nadine command: "review invoices"
+    Calls GAS to count unreviewed invoices and returns summary.
+    """
+    try:
+        log.info("🔎 Checking unreviewed invoices via GAS")
+        r = requests.post(GAS_INVOICE_URL, json={"action": "count_unreviewed_invoices"}, timeout=20)
+        resp = r.json() if r.ok else {}
+        if not resp.get("ok"):
+            err = resp.get("error", "GAS call failed")
+            return jsonify({"ok": False, "error": err}), 502
+
+        count = int(resp.get("count", 0))
+        next_client = resp.get("next_client", "")
+        next_month = resp.get("next_month", "")
+
+        summary = flatten_message(
+            f"📑 {count} invoice(s) pending review. Next draft: {next_client} – {next_month}."
+        )
+        send_safe_message(
+            to=NADINE_WA,
+            is_template=True,
+            template_name=TPL_ADMIN_ALERT,
+            variables=[summary],
+            label="invoice_review_summary"
+        )
+
+        log.info(f"Invoice review summary sent → {summary}")
+        return jsonify({"ok": True, "count": count, "next_client": next_client, "next_month": next_month})
+
+    except Exception as e:
+        log.exception("review_summary error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -398,60 +362,7 @@ def health():
         "endpoints": [
             "/invoices/send",
             "/invoices/view/<token>",
-            "/invoices/deliver",
-            "/invoices/reissue",
-            "/invoices/resend"
+            "/invoices/resend",
+            "/invoices/review-summary"
         ]
     }), 200
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/review-summary → Notify unreviewed invoices count
-# ─────────────────────────────────────────────────────────────
-@bp.route("/review-summary", methods=["POST"])
-def review_summary():
-    """
-    Nadine command: "review invoices"
-    Calls GAS to count unreviewed invoices and returns summary.
-    """
-    try:
-        log.info("🔎 Checking unreviewed invoices via GAS")
-        r = requests.post(GAS_INVOICE_URL, json={"action": "count_unreviewed_invoices"}, timeout=20)
-        try:
-            resp = r.json()
-        except Exception:
-            log.error(f"Non-JSON GAS response: {r.text[:200]}")
-            return jsonify({"ok": False, "error": "Invalid GAS response"}), 502
-
-        if not resp.get("ok"):
-            err = resp.get("error", "GAS call failed")
-            log.error(f"GAS returned error: {err}")
-            return jsonify({"ok": False, "error": err}), 502
-
-        count = int(resp.get("count", 0))
-        next_client = resp.get("next_client", "")
-        next_month = resp.get("next_month", "")
-        summary = (
-            f"📑 {count} invoice(s) pending review. "
-            f"Next draft: {next_client} – {next_month}."
-        )
-
-        from .utils import send_safe_message
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name="invoice_review_admin_us",
-            variables=[f'{next_client} – {next_month} ({count} pending)'],
-            label="invoice_review_summary"
-        )
-
-        log.info(f"Invoice review summary sent → {summary}")
-        return jsonify({
-            "ok": True,
-            "count": count,
-            "next_client": next_client,
-            "next_month": next_month
-        }), 200
-
-    except Exception as e:
-        log.exception("review_summary error")
-        return jsonify({"ok": False, "error": str(e)}), 500
