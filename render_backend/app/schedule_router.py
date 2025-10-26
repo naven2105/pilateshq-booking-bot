@@ -166,7 +166,7 @@ def admin_evening():
 # ─────────────────────────────────────────────────────────────
 # 0️⃣ Unified Dispatcher (for external POST calls)
 # ─────────────────────────────────────────────────────────────
-@bp.route("/schedule", methods=["POST"])
+@bp.route("/", methods=["POST"])
 def schedule_dispatch():
     """Generic schedule entrypoint for external callers (e.g. Render test)."""
     try:
