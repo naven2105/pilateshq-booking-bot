@@ -92,6 +92,78 @@ def add_session():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # ─────────────────────────────────────────────────────────────
+#  /schedule/mark-reschedule
+#  Triggered when Nadine (or NLP) requests "reschedule {client_name}"
+#  Sends action to Google Apps Script → marks session as rescheduled
+#  Designed to handle both human (Nadine) and NLP requests uniformly
+# ─────────────────────────────────────────────────────────────
+@bp.route("/schedule/mark-reschedule", methods=["POST"])
+def mark_reschedule():
+    try:
+        # ── 1️⃣ Validate Input ───────────────────────────────────────
+        data = request.get_json(force=True)
+        client_name = (data.get("client_name") or "").strip()
+
+        if not client_name:
+            log.warning("mark_reschedule() called with missing client_name")
+            return jsonify({"ok": False, "error": "Missing client_name"}), 400
+
+        log.info(f"Reschedule request received for client: {client_name}")
+
+        # ── 2️⃣ Prepare GAS Payload ─────────────────────────────────
+        payload = {"action": "mark_reschedule", "client_name": client_name}
+        gas_url = os.getenv("GAS_ATTENDANCE_URL", "")
+
+        if not gas_url:
+            err_msg = "Missing GAS_ATTENDANCE_URL in environment"
+            log.error(err_msg)
+            send_safe_message(NADINE_WA, f"⚠ System setup issue: {err_msg}")
+            return jsonify({"ok": False, "error": err_msg}), 500
+
+        # ── 3️⃣ Call GAS Endpoint ───────────────────────────────────
+        log.debug(f"Calling GAS URL: {gas_url} → {payload}")
+        resp = requests.post(gas_url, json=payload, timeout=20)
+        gas_text = resp.text.strip()
+        gas_result = resp.json() if gas_text else {}
+
+        log.debug(f"GAS response: {gas_result}")
+
+        # ── 4️⃣ Interpret GAS Response ───────────────────────────────
+        if gas_result.get("ok"):
+            msg = f"✅ Session updated: {client_name} marked as rescheduled."
+            log.info(msg)
+            send_safe_message(NADINE_WA, msg)
+            return jsonify({
+                "ok": True,
+                "message": "Session rescheduled",
+                "gas_result": gas_result,
+            })
+
+        # Handle failure response from GAS
+        error_msg = gas_result.get("error") or gas_result.get("message") or "Unknown error"
+        log.warning(f"Reschedule failed for {client_name}: {error_msg}")
+        send_safe_message(
+            NADINE_WA,
+            f"⚠ Unable to mark session for {client_name}: {error_msg}"
+        )
+        return jsonify({"ok": False, "error": error_msg}), 502
+
+    # ── 5️⃣ Handle Exceptions ───────────────────────────────────────
+    except requests.exceptions.Timeout:
+        log.error("GAS request timed out")
+        send_safe_message(NADINE_WA, f"⚠ GAS request timeout for {client_name}")
+        return jsonify({"ok": False, "error": "GAS request timeout"}), 504
+
+    except Exception as e:
+        log.exception(f"mark_reschedule() failed: {e}")
+        send_safe_message(
+            NADINE_WA,
+            f"⚠ System error while rescheduling {client_name}: {str(e)}"
+        )
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────
 # 2️⃣ Reschedule Session
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reschedule", methods=["POST"])
