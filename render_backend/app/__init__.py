@@ -1,5 +1,5 @@
 """
-__init__.py – Phase 17 (Unified Invoices + Payments)
+__init__.py – Phase 18 (Client Engagement Automation)
 ────────────────────────────────────────────────────────────
 Initialises all Flask blueprints for the Render backend.
 
@@ -12,18 +12,18 @@ Key Notes:
 
 Included Blueprints:
  • router_webhook        → Core WhatsApp event listener
- • tasks_router          → Scheduled task endpoints (triggered via GAS)
+ • tasks_router          → Unified GAS task endpoints (reminders, analytics)
  • tasks_sheets          → Shared Google Sheets operations
- • client_reminders      → Client messaging & reminders
  • package_events        → Credit & attendance tracking
- • invoices_router       → Unified invoices + payments (Phase 17)
+ • invoices_router       → Unified invoices + payments
  • schedule_router       → Weekly bookings, reschedule, admin digests
  • dashboard_router      → Weekly/monthly summaries
  • router_diag           → Health & diagnostics
 
 Retired Blueprints:
- • attendance_router     → Replaced by /schedule/mark-reschedule
- • payments_router       → Merged into invoices_router
+ • client_reminders      → merged into tasks_router (Phase 18)
+ • attendance_router     → replaced by /schedule/mark-reschedule
+ • payments_router       → merged into invoices_router
 ────────────────────────────────────────────────────────────
 """
 
@@ -34,10 +34,9 @@ from flask import Flask
 from render_backend.app.router_webhook import router_bp
 from render_backend.app.tasks_router import tasks_bp
 from render_backend.app.tasks_sheets import bp as tasks_sheets_bp
-from render_backend.app.client_reminders import bp as client_reminders_bp
 from render_backend.app.package_events import bp as package_events_bp
-from render_backend.app.invoices_router import bp as invoices_bp             # ✅ Unified Invoices + Payments
-from render_backend.app.schedule_router import bp as schedule_bp             # ✅ Bookings + Reschedules
+from render_backend.app.invoices_router import bp as invoices_bp           # ✅ Unified Invoices + Payments
+from render_backend.app.schedule_router import bp as schedule_bp           # ✅ Bookings + Reschedules
 from render_backend.app.dashboard_router import bp as dashboard_bp
 from render_backend.app.router_diag import bp as diag_bp
 
@@ -54,16 +53,15 @@ def create_app() -> Flask:
 
     # ── Register all blueprints ─────────────────────────────────────────
     app.register_blueprint(router_bp)                                  # /webhook
-    app.register_blueprint(tasks_bp)                                   # /tasks
+    app.register_blueprint(tasks_bp)                                   # /tasks (now includes client reminders)
     app.register_blueprint(tasks_sheets_bp)                            # /tasks/sheets
-    app.register_blueprint(client_reminders_bp)                        # /client-reminders
     app.register_blueprint(package_events_bp)                          # /package-events
     app.register_blueprint(invoices_bp, url_prefix="/invoices")        # ✅ Unified router
     app.register_blueprint(schedule_bp, url_prefix="/schedule")
     app.register_blueprint(dashboard_bp, url_prefix="/dashboard")
     app.register_blueprint(diag_bp)
 
-    log.info("✅ All blueprints registered successfully (Unified Invoices + Payments active).")
+    log.info("✅ All blueprints registered successfully (Phase 18 – Client Engagement active).")
 
     # ── Health Check ───────────────────────────────────────────────────
     @app.route("/", methods=["GET"])
@@ -72,11 +70,11 @@ def create_app() -> Flask:
         return {
             "status": "ok",
             "service": "PilatesHQ Booking Bot",
-            "version": "1.7.0",  # ⬆️ Updated for Unified Invoices + Payments
+            "version": "1.8.0",  # ⬆️ Updated for Phase 18 – Client Engagement Automation
             "routes": list(app.blueprints.keys()),
             "note": (
                 "All time-based triggers are handled exclusively by Google Apps Script. "
-                "Payments router retired – invoices_router now handles all payment events."
+                "client_reminders merged into tasks_router; payments handled in invoices_router."
             )
         }, 200
 
