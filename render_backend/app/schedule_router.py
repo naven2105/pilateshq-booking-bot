@@ -6,6 +6,7 @@ Handles studio schedule functions for PilatesHQ.
 Key Features
  • /schedule/add-session     → Add booked session to Google Sheet
  • /schedule/reschedule      → Mark session as rescheduled
+ • /schedule/mark-reschedule → Alternate trigger (Nadine/NLP)
  • /schedule/admin-morning   → Morning summary (06h00)
  • /schedule/admin-evening   → Next-day preview (20h00)
  • /schedule/health          → Service check
@@ -25,6 +26,7 @@ log = logging.getLogger(__name__)
 
 # ── Environment ─────────────────────────────────────────────
 GAS_SCHEDULE_URL = os.getenv("GAS_SCHEDULE_URL", "")
+GAS_ATTENDANCE_URL = os.getenv("GAS_ATTENDANCE_URL", "")
 NADINE_WA = os.getenv("NADINE_WA", "")
 TPL_ADMIN = "admin_generic_alert_us"
 
@@ -32,10 +34,11 @@ TPL_ADMIN = "admin_generic_alert_us"
 # Internal helper for posting to GAS
 # ─────────────────────────────────────────────────────────────
 def _post_to_gas(payload: dict):
-    if not GAS_SCHEDULE_URL:
-        return {"ok": False, "error": "Missing GAS_SCHEDULE_URL"}
+    url = GAS_SCHEDULE_URL or GAS_ATTENDANCE_URL
+    if not url:
+        return {"ok": False, "error": "Missing GAS_SCHEDULE_URL or GAS_ATTENDANCE_URL"}
     try:
-        r = requests.post(GAS_SCHEDULE_URL, json=payload, timeout=20)
+        r = requests.post(url, json=payload, timeout=20)
         return r.json() if r.ok else {"ok": False, "error": f"GAS HTTP {r.status_code}"}
     except Exception as e:
         log.error(f"GAS POST failed: {e}")
@@ -52,7 +55,7 @@ def add_session():
         client_name = data.get("client_name", "").strip()
         session_day = data.get("day", "").strip()
         session_time = data.get("time", "").strip()
-        session_type = data.get("session_type", "").strip()
+        session_type = data.get("session_type", "").strip() or "Group"
         week = data.get("week", "").strip() or "Current"
 
         if not client_name or not session_day or not session_time:
@@ -95,12 +98,11 @@ def add_session():
 #  /schedule/mark-reschedule
 #  Triggered when Nadine (or NLP) requests "reschedule {client_name}"
 #  Sends action to Google Apps Script → marks session as rescheduled
-#  Designed to handle both human (Nadine) and NLP requests uniformly
+#  Fixed endpoint name to avoid duplication
 # ─────────────────────────────────────────────────────────────
-@bp.route("/schedule/mark-reschedule", methods=["POST"])
-def mark_reschedule():
+@bp.route("/schedule/mark-reschedule", methods=["POST"], endpoint="mark_reschedule_api")
+def mark_reschedule_api():
     try:
-        # ── 1️⃣ Validate Input ───────────────────────────────────────
         data = request.get_json(force=True)
         client_name = (data.get("client_name") or "").strip()
 
@@ -109,18 +111,15 @@ def mark_reschedule():
             return jsonify({"ok": False, "error": "Missing client_name"}), 400
 
         log.info(f"Reschedule request received for client: {client_name}")
-
-        # ── 2️⃣ Prepare GAS Payload ─────────────────────────────────
         payload = {"action": "mark_reschedule", "client_name": client_name}
-        gas_url = os.getenv("GAS_ATTENDANCE_URL", "")
+        gas_url = GAS_ATTENDANCE_URL or GAS_SCHEDULE_URL
 
         if not gas_url:
-            err_msg = "Missing GAS_ATTENDANCE_URL in environment"
+            err_msg = "Missing GAS_ATTENDANCE_URL or GAS_SCHEDULE_URL"
             log.error(err_msg)
             send_safe_message(NADINE_WA, f"⚠ System setup issue: {err_msg}")
             return jsonify({"ok": False, "error": err_msg}), 500
 
-        # ── 3️⃣ Call GAS Endpoint ───────────────────────────────────
         log.debug(f"Calling GAS URL: {gas_url} → {payload}")
         resp = requests.post(gas_url, json=payload, timeout=20)
         gas_text = resp.text.strip()
@@ -128,27 +127,21 @@ def mark_reschedule():
 
         log.debug(f"GAS response: {gas_result}")
 
-        # ── 4️⃣ Interpret GAS Response ───────────────────────────────
         if gas_result.get("ok"):
-            msg = f"✅ Session updated: {client_name} marked as rescheduled."
+            msg = f"✅ Session updated: {client_name} marked as rescheduled. Enjoy your day 😄"
             log.info(msg)
             send_safe_message(NADINE_WA, msg)
             return jsonify({
                 "ok": True,
                 "message": "Session rescheduled",
-                "gas_result": gas_result,
+                "gas_result": gas_result
             })
 
-        # Handle failure response from GAS
         error_msg = gas_result.get("error") or gas_result.get("message") or "Unknown error"
         log.warning(f"Reschedule failed for {client_name}: {error_msg}")
-        send_safe_message(
-            NADINE_WA,
-            f"⚠ Unable to mark session for {client_name}: {error_msg}"
-        )
+        send_safe_message(NADINE_WA, f"⚠ Unable to mark session for {client_name}: {error_msg}")
         return jsonify({"ok": False, "error": error_msg}), 502
 
-    # ── 5️⃣ Handle Exceptions ───────────────────────────────────────
     except requests.exceptions.Timeout:
         log.error("GAS request timed out")
         send_safe_message(NADINE_WA, f"⚠ GAS request timeout for {client_name}")
@@ -164,11 +157,11 @@ def mark_reschedule():
 
 
 # ─────────────────────────────────────────────────────────────
-# 2️⃣ Reschedule Session
+# 2️⃣ Reschedule Session (legacy)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/reschedule", methods=["POST"])
-def mark_reschedule():
-    """Mark client session as rescheduled."""
+def mark_reschedule_legacy():
+    """Legacy endpoint kept for backward compatibility."""
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name", "").strip()
@@ -245,11 +238,10 @@ def schedule_dispatch():
         data = request.get_json(force=True)
         action = (data.get("action") or "").strip()
 
-        # Match supported actions
         if action == "add_session":
             return add_session()
         elif action == "mark_reschedule":
-            return mark_reschedule()
+            return mark_reschedule_api()
         elif action == "get_sessions_today":
             return admin_morning()
         elif action == "get_sessions_tomorrow":
@@ -260,7 +252,6 @@ def schedule_dispatch():
     except Exception as e:
         log.exception("schedule_dispatch error")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -274,6 +265,7 @@ def health():
         "endpoints": [
             "/schedule/add-session",
             "/schedule/reschedule",
+            "/schedule/mark-reschedule",
             "/schedule/admin-morning",
             "/schedule/admin-evening",
             "/schedule/health"
