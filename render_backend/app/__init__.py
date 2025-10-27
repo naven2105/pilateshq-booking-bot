@@ -53,9 +53,9 @@ def create_app() -> Flask:
 
     # ── Register all blueprints ─────────────────────────────────────────
     app.register_blueprint(router_bp)                                  # /webhook
-    app.register_blueprint(tasks_bp)                                   # /tasks (now includes client reminders)
-    app.register_blueprint(tasks_sheets_bp)                            # /tasks/sheets
-    app.register_blueprint(package_events_bp)                          # /package-events
+    app.register_blueprint(tasks_bp, url_prefix="/tasks")              # ✅ all /tasks/... endpoints (reminders, birthdays, analytics)
+    app.register_blueprint(tasks_sheets_bp, url_prefix="/tasks/sheets")
+    app.register_blueprint(package_events_bp, url_prefix="/package-events")
     app.register_blueprint(invoices_bp, url_prefix="/invoices")        # ✅ Unified router
     app.register_blueprint(schedule_bp, url_prefix="/schedule")
     app.register_blueprint(dashboard_bp, url_prefix="/dashboard")
@@ -70,7 +70,7 @@ def create_app() -> Flask:
         return {
             "status": "ok",
             "service": "PilatesHQ Booking Bot",
-            "version": "1.8.0",  # ⬆️ Updated for Phase 18 – Client Engagement Automation
+            "version": "1.8.1",  # ⬆️ Updated after /tasks prefix fix
             "routes": list(app.blueprints.keys()),
             "note": (
                 "All time-based triggers are handled exclusively by Google Apps Script. "
