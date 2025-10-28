@@ -1,3 +1,4 @@
+# render_backend/app/tasks_router.py
 """
 tasks_router.py – Phase 18 (Unified Version)
 ────────────────────────────────────────────
@@ -8,7 +9,7 @@ Purpose:
 
 Includes:
  • /tasks/run-reminders → Admin morning/evening/week summary
- • /tasks/client-reminders → Client session templates
+ • /tasks/client-reminders → Client session templates (+ admin invoice review)
  • /tasks/package-events → Admin package alerts
  • /tasks/client-behaviour → Behaviour analytics
  • /tasks/birthdays + /tasks/birthday-greetings → Birthday automation
@@ -43,20 +44,21 @@ TPL_CLIENT_WEEKLY = "client_weekly_schedule_us"
 # ─────────────────────────────────────────────
 # Helper: Send admin template safely
 # ─────────────────────────────────────────────
-def _send_admin_message(msg: str, label="admin_alert"):
-    """Send WhatsApp alert to Nadine safely using admin template."""
-    if not NADINE_WA:
+def _send_admin_message(msg: str, label: str = "admin_alert", to_wa: str | None = None):
+    """Send WhatsApp alert to admin using template; defaults to NADINE_WA."""
+    dest = (to_wa or NADINE_WA or "").strip()
+    if not dest:
         log.warning("⚠️ NADINE_WA not configured.")
         return
     safe_execute(
         label,
         send_whatsapp_template,
-        NADINE_WA,
+        dest,
         TPL_ADMIN_ALERT,
         TEMPLATE_LANG,
         [msg],
     )
-    log.info(f"📲 Admin alert sent: {msg}")
+    log.info(f"📲 Admin alert sent ({label}) → {dest}: {msg}")
 
 
 # ─────────────────────────────────────────────
@@ -68,12 +70,12 @@ def run_reminders():
     Triggered by GAS (06h00, 20h00, Sunday night).
     Sends admin summary based on schedule data.
     """
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     log.info(f"[Tasks] /run-reminders payload: {data}")
 
-    msg_type = data.get("type", "")
-    total = data.get("total", 0)
-    schedule = data.get("schedule", "No sessions")
+    msg_type = (data.get("type") or "").strip()
+    total = int(data.get("total") or 0)
+    schedule = data.get("schedule") or "No sessions"
 
     if msg_type == "morning":
         msg = f"🌅 PilatesHQ Morning Summary: {total} sessions today. Schedule: {schedule}"
@@ -98,11 +100,12 @@ def handle_client_reminders():
       - client-night-before   (20h00 daily)
       - client-week-ahead     (Sunday 20h00)
       - client-next-hour      (hourly)
+      - admin_invoice_review  (daily 19h00 pre/month-end nudges)
     """
-    payload = request.get_json(force=True)
+    payload = request.get_json(force=True) or {}
     job_type = (payload.get("type") or "").strip()
-    sessions = payload.get("sessions", [])
-    admin_number = payload.get("admin_number", NADINE_WA)
+    sessions = payload.get("sessions") or []
+    admin_number = (payload.get("admin_number") or NADINE_WA or "").strip()
     log.info(f"[client-reminders] Received job={job_type}, count={len(sessions)}")
 
     sent_clients = 0
@@ -110,7 +113,7 @@ def handle_client_reminders():
     # Night-before (20h00)
     if job_type == "client-night-before":
         for s in sessions:
-            wa = s.get("wa_number")
+            wa = (s.get("wa_number") or "").strip()
             if not wa:
                 continue
             ok = safe_execute(
@@ -119,7 +122,7 @@ def handle_client_reminders():
                 wa,
                 TPL_CLIENT_TOMORROW,
                 TEMPLATE_LANG,
-                [s.get("session_time", "08:00")],
+                [s.get("session_time") or "08:00"],
             )
             if ok:
                 sent_clients += 1
@@ -128,17 +131,17 @@ def handle_client_reminders():
     # Week-ahead (Sunday 20h00)
     elif job_type == "client-week-ahead":
         for s in sessions:
-            wa = s.get("wa_number")
+            wa = (s.get("wa_number") or "").strip()
             if not wa:
                 continue
-            summary = f"{s.get('session_date')} – {s.get('session_time')} ({s.get('session_type')})"
+            summary = f"{s.get('session_date') or ''} – {s.get('session_time') or ''} ({s.get('session_type') or 'single'})"
             ok = safe_execute(
                 "week_ahead",
                 send_whatsapp_template,
                 wa,
                 TPL_CLIENT_WEEKLY,
                 TEMPLATE_LANG,
-                [s.get("client_name", "there"), summary],
+                [s.get("client_name") or "there", summary],
             )
             if ok:
                 sent_clients += 1
@@ -147,7 +150,7 @@ def handle_client_reminders():
     # Next-hour reminders (hourly)
     elif job_type == "client-next-hour":
         for s in sessions:
-            wa = s.get("wa_number")
+            wa = (s.get("wa_number") or "").strip()
             if not wa:
                 continue
             ok = safe_execute(
@@ -156,11 +159,17 @@ def handle_client_reminders():
                 wa,
                 TPL_CLIENT_NEXT_HOUR,
                 TEMPLATE_LANG,
-                [s.get("session_time", "soon")],
+                [s.get("session_time") or "soon"],
             )
             if ok:
                 sent_clients += 1
         _send_admin_message(f"⏰ Sent next-hour reminders ({sent_clients}).")
+
+    # Admin invoice review nudge (pre & month-end)
+    elif job_type == "admin_invoice_review":
+        note = payload.get("message") or "📅 Invoice Review: Please review and finalise invoices."
+        _send_admin_message(note, label="admin_invoice_review", to_wa=admin_number)
+        return jsonify({"ok": True, "message": "admin_invoice_review"})
 
     # Fallback for unknown type
     else:
@@ -187,9 +196,9 @@ def test_client_reminders():
 @tasks_bp.route("/package-events", methods=["POST"])
 def package_events():
     """Sends admin alerts for package or credit events."""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     log.info(f"[Tasks] /package-events payload: {data}")
-    message = data.get("message", "No message")
+    message = data.get("message") or "No message"
     _send_admin_message(message, label="package_event")
     return jsonify({"ok": True, "message": "Sent to Nadine"})
 
@@ -200,12 +209,12 @@ def package_events():
 @tasks_bp.route("/client-behaviour", methods=["POST"])
 def client_behaviour():
     """Handles weekly analytics of client behaviour."""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     log.info(f"[Tasks] /client-behaviour payload: {data}")
 
-    no_shows = data.get("no_shows", [])
-    cancels = data.get("cancellations", [])
-    inactive = data.get("inactive", [])
+    no_shows = data.get("no_shows") or []
+    cancels = data.get("cancellations") or []
+    inactive = data.get("inactive") or []
 
     summary = (
         f"📊 Client Behaviour Summary\n"
@@ -223,14 +232,14 @@ def client_behaviour():
 @tasks_bp.route("/birthdays", methods=["POST"])
 def birthdays():
     """Sends admin alert for upcoming birthdays."""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     log.info(f"[Tasks] /birthdays payload: {data}")
 
-    birthdays = data.get("birthdays", [])
+    birthdays = data.get("birthdays") or []
     if not birthdays:
         return jsonify({"ok": True, "message": "No upcoming birthdays"})
 
-    names = ", ".join([f"{b['name']} ({b['date']})" for b in birthdays])
+    names = ", ".join([f"{(b.get('name') or '').strip()} ({(b.get('date') or '').strip()})" for b in birthdays])
     msg = f"🎉 PilatesHQ Birthday Planner: {names}"
     _send_admin_message(msg, label="birthday_alert")
     return jsonify({"ok": True, "message": msg})
@@ -239,16 +248,17 @@ def birthdays():
 @tasks_bp.route("/birthday-greetings", methods=["POST"])
 def birthday_greetings():
     """Sends personalised birthday greetings to clients."""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     log.info(f"[Tasks] /birthday-greetings payload: {data}")
 
-    birthdays = data.get("birthdays", [])
+    birthdays = data.get("birthdays") or []
     if not birthdays:
         return jsonify({"ok": True, "message": "No client birthdays today"})
 
+    sent = 0
     for b in birthdays:
-        name = b.get("name")
-        wa = b.get("wa_number")
+        name = (b.get("name") or "there").strip()
+        wa = (b.get("wa_number") or "").strip()
         if not wa:
             continue
 
@@ -259,10 +269,8 @@ def birthday_greetings():
             variables=[f"🎉 Happy Birthday {name}! Wishing you strength and balance for the year ahead."],
             label="client_birthday_greeting",
         )
+        sent += 1
         log.info(f"🎂 Sent birthday greeting to {name} ({wa})")
 
-    names = ", ".join([b["name"] for b in birthdays])
-    admin_msg = f"🎂 PilatesHQ Birthday Greetings sent to: {names}"
-    _send_admin_message(admin_msg, label="birthday_greetings_summary")
-
-    return jsonify({"ok": True, "sent": len(birthdays), "message": admin_msg})
+    _send_admin_message(f"🎂 PilatesHQ Birthday Greetings sent: {sent}", label="birthday_greetings_summary")
+    return jsonify({"ok": True, "sent": sent, "message": "birthday_greetings"})
