@@ -77,12 +77,14 @@ def run_reminders():
     total = int(data.get("total") or 0)
     schedule = data.get("schedule") or "No sessions"
 
+    log.info(f"[Tasks/run-reminders] type={msg_type}, total={total}, sent to {NADINE_WA}")
+
     if msg_type == "morning":
-        msg = f"🌅 PilatesHQ Morning Summary: {total} sessions today. Schedule: {schedule}"
+        msg = f"🌅 PilatesHQ Morning Summary: {total} sessions today.\n{schedule}"
     elif msg_type == "evening":
-        msg = f"🌙 PilatesHQ Evening Preview: {total} sessions tomorrow. Schedule: {schedule}."
+        msg = f"🌙 PilatesHQ Evening Preview: {total} sessions tomorrow.\n{schedule}"
     elif msg_type == "week_ahead_admin":
-        msg = f"📆 PilatesHQ Week-Ahead Preview: {total} sessions scheduled. Schedule: {schedule}"
+        msg = f"📆 PilatesHQ Week-Ahead Preview: {total} sessions scheduled.\n{schedule}"
     else:
         msg = f"🕐 Unknown reminder type received ({msg_type})."
 
@@ -107,6 +109,9 @@ def handle_client_reminders():
     sessions = payload.get("sessions") or []
     admin_number = (payload.get("admin_number") or NADINE_WA or "").strip()
     log.info(f"[client-reminders] Received job={job_type}, count={len(sessions)}")
+    
+    # 👇 Additional context log 
+    log.info(f"[client-reminders] type={job_type}, sessions={len(sessions)}, admin={admin_number}")
 
     sent_clients = 0
 
