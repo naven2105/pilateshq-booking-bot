@@ -1,56 +1,34 @@
 # render_backend/app/admin_nudge.py
 """
-admin_nudge.py
-────────────────────────────────────────────
-Simplified version (no database).
-Sends admin notifications to Nadine via WhatsApp template messages.
+admin_nudge.py – Phase 20 (Guest Logic Revision)
+────────────────────────────────────────────────────────────
+Removed legacy lead alerts and WhatsApp template usage.
+Guests contacting the bot are now redirected automatically
+to Nadine (handled in router_client.py).
+────────────────────────────────────────────────────────────
 """
 
 import os
 import logging
-from render_backend.app.utils import send_whatsapp_template
 
 log = logging.getLogger(__name__)
 
 # ── Environment Configuration ─────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
-ADMIN_NEW_LEAD_TEMPLATE = "admin_new_lead_alert"
-
 
 # ── Helper: Validate phone number ─────────────────────────────
 def _validate_wa_number(num: str) -> bool:
     """Ensure WhatsApp number looks valid (digits only, 10+ chars)."""
     return num and num.isdigit() and len(num) >= 10
 
-
-# ── Notify Nadine of a new lead ───────────────────────────────
+# ── Guest lead handling (now passive) ─────────────────────────
 def notify_new_lead(name: str, wa_number: str):
     """
-    Send a WhatsApp template notification to Nadine
-    whenever a new lead or enquiry is received.
+    Previously: sent admin_new_lead_alert to Nadine.
+    Now: purely logs the event (no WhatsApp message sent).
     """
-    if not NADINE_WA:
-        log.warning("⚠️ NADINE_WA not set — cannot send admin alerts.")
-        return
-
-    if not _validate_wa_number(NADINE_WA):
-        log.error(f"Invalid NADINE_WA: {NADINE_WA}")
-        return
-
     clean_name = (name or "Unknown").strip()
     clean_number = (wa_number or "Unknown").strip()
-
-    log.info(f"📢 Sending admin new lead alert → {clean_name} ({clean_number})")
-
-    result = send_whatsapp_template(
-        to=NADINE_WA,
-        name=ADMIN_NEW_LEAD_TEMPLATE,
-        lang=TEMPLATE_LANG,
-        variables=[clean_name, clean_number],
-    )
-
-    if result.get("ok"):
-        log.info("✅ Admin notification sent successfully.")
-    else:
-        log.error(f"❌ Failed to send admin alert: {result}")
+    log.info(f"👋 Guest reached bot: {clean_name} ({clean_number}) — redirected to Nadine.")
+    # No WhatsApp template messages are sent here anymore.
