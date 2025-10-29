@@ -1,5 +1,5 @@
 """
-router_webhook.py
+router_webhook.py – Phase 21
 ────────────────────────────────────────────
 Handles incoming Meta Webhook events (GET verify + POST messages).
 
@@ -11,15 +11,14 @@ Handles incoming Meta Webhook events (GET verify + POST messages).
      - unpaid invoices          → full unpaid invoice summary
      - credits                  → unused credits summary
  • Client reschedule detection
- • Default new lead capture
+ • Guest / unknown number welcome flow 🆕
 ────────────────────────────────────────────
 """
 
 import os
 import requests
 from flask import Blueprint, request, jsonify
-from .admin_nudge import notify_new_lead
-from .utils import send_safe_message, send_whatsapp_template
+from .utils import send_safe_message, send_whatsapp_text
 
 router_bp = Blueprint("router_bp", __name__)
 
@@ -161,10 +160,23 @@ def webhook():
                 return jsonify({"status": "credits summary requested"}), 200
 
             # ────────────────────────────────────────────────────────────
-            # Default → treat as new lead
+            # 🌐 Guest / Unknown Number Handling (no admin alert)
             # ────────────────────────────────────────────────────────────
-            notify_new_lead(name=profile_name, wa_number=wa_number)
-            return jsonify({"status": "new lead handled"}), 200
+            print(f"🙋 Guest detected → {profile_name} ({wa_number})")
+            try:
+                welcome = (
+                    "👋 Welcome to *PilatesHQ Studio!*\n\n"
+                    "This WhatsApp number is reserved for *registered clients* "
+                    "to manage bookings, reminders, and invoices.\n\n"
+                    "For enquiries or new sign-ups, please contact *Nadine* on *084 313 1635* "
+                    "or visit 🌐 *pilateshq.co.za* 💜"
+                )
+                send_whatsapp_text(wa_number, welcome)
+                print(f"📤 Guest welcome sent to {wa_number}")
+            except Exception as e:
+                print(f"⚠️ Guest welcome failed → {e}")
+
+            return jsonify({"status": "guest_redirect"}), 200
 
         print("⚠️ Unknown event type:", value)
         return jsonify({"status": "ignored"}), 200
