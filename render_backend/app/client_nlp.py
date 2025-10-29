@@ -1,6 +1,5 @@
-#app/client_nlp.py
 """
-client_nlp.py
+client_nlp.py – Phase 20
 ───────────────────────────────
 Lightweight natural-language parsing for client shortcuts.
 
@@ -11,9 +10,8 @@ Recognises:
   • Reschedule requests
   • FAQs and general help
   • Contact Nadine (admin)
+  • Group availability lookup 🆕
   • Greetings
-
-Each intent returns a small dict → consumed by router_client or client_commands.
 """
 
 import re
@@ -80,6 +78,10 @@ def parse_client_command(text: str) -> dict | None:
     # ── Invoices ──
     if re.search(r"\b(invoice|statement|payment|bill)\b", s):
         return {"intent": "get_invoice"}
+
+    # ── Group availability lookup 🆕 ──
+    if re.search(r"\b(groups?|availability|group spaces?|open slots?|reformer slots?)\b", s):
+        return {"intent": "group_availability"}
 
     # ── FAQs ──
     if re.search(r"\b(faq|question|info|information|offer|help)\b", s):

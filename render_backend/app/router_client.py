@@ -1,9 +1,11 @@
 """
-router_client.py – Phase 5
+router_client.py – Phase 20
 ────────────────────────────
 Adds:
  • Admin command: “unpaid invoices”
    → Returns list of clients with no or partial payments
+ • Client command: “groups” / “group availability” 🆕
+   → Returns latest group openings from GAS
 ────────────────────────────
 """
 
@@ -95,6 +97,21 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
             client_commands.send_invoice(wa)
             return jsonify({"status": "ok", "role": "client_invoice"}), 200
 
+        # 🆕 Group Availability
+        if intent == "group_availability":
+            try:
+                resp = requests.post(f"{RENDER_BASE}/tasks/groups", json={"action": "get_group_availability"}, timeout=15)
+                if resp.ok:
+                    data = resp.json()
+                    msg = data.get("message", {}).get("message", "⚠️ No group data found.")
+                    safe_execute(send_whatsapp_text, wa, msg, label="client_group_availability")
+                else:
+                    safe_execute(send_whatsapp_text, wa, "⚠️ Could not fetch group availability right now.", label="client_group_availability_fail")
+            except Exception as e:
+                log.error(f"[router_client] group_availability failed: {e}")
+                safe_execute(send_whatsapp_text, wa, f"⚠️ System error fetching availability: {e}", label="client_group_availability_err")
+            return jsonify({"status": "ok", "role": "client_group_availability"}), 200
+
         # FAQs
         if intent == "faq":
             handle_faq_message(wa, txt)
@@ -109,7 +126,7 @@ def handle_client(msg, wa: str, text_in: str, client: dict):
         # Greeting
         if intent == "greeting":
             name_short = client.get("name", "there").split()[0]
-            safe_execute(send_whatsapp_text, wa, f"Hi {name_short} 👋\nHow can I assist today?\nYou can type *bookings*, *faq*, or *message Nadine*.", label="client_greeting")
+            safe_execute(send_whatsapp_text, wa, f"Hi {name_short} 👋\nHow can I assist today?\nYou can type *bookings*, *faq*, or *groups* to view class availability.", label="client_greeting")
             return jsonify({"status": "ok", "role": "client_greeting"}), 200
 
     # Default fallback → FAQ menu
