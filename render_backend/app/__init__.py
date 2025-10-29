@@ -25,11 +25,6 @@ Active Blueprints:
  • dashboard_router  → Weekly/monthly summaries
  • router_diag       → Health & diagnostics
  • tasks_groups      → 🆕 Phase 19 Group Availability Query
-
-Retired Blueprints:
- • client_reminders  → merged into tasks_router (Phase 18)
- • attendance_router → replaced by /schedule/mark-reschedule
- • payments_router   → merged into invoices_router
 ────────────────────────────────────────────────────────────
 """
 
@@ -69,7 +64,7 @@ def create_app() -> Flask:
     app.register_blueprint(invoices_bp, url_prefix="/invoices")
     app.register_blueprint(schedule_bp, url_prefix="/schedule")
     app.register_blueprint(dashboard_bp, url_prefix="/dashboard")
-    app.register_blueprint(groups_bp, url_prefix="/tasks/groups")       # 🆕 Phase 19
+    app.register_blueprint(groups_bp)                                   # ✅ FIXED — no prefix duplication
     app.register_blueprint(diag_bp)
 
     log.info("✅ All blueprints registered successfully (Phase 19 active).")
