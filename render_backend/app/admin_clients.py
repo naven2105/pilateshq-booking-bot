@@ -1,138 +1,193 @@
-#app/admin_clients.py
 """
-admin_clients.py
-────────────────
-Handles client management:
- - Add clients
- - Convert leads
- - Attendance updates (sick, no-show, cancel next session)
- - Deactivate clients
+admin_clients.py – Phase 22e
+────────────────────────────────────────────
+Adds Quick Update Reply Mode for Nadine.
+Features:
+ • Remembers last referenced client.
+ • Recognises short replies:
+     - "DOB 21-May"
+     - "Email tom@..."
+     - "Notes prefers mornings"
+ • Prompts Nadine after each add/find
+   with suggestion to update details.
+────────────────────────────────────────────
 """
 
+import re
 import logging
-from .utils import send_whatsapp_text, normalize_wa, safe_execute, post_to_webhook
+from .utils import send_whatsapp_text, safe_execute, post_to_webhook
 from .config import WEBHOOK_BASE
-from . import admin_nudge
 
 log = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────
+# In-memory tracker for last referenced client
+# ─────────────────────────────────────────────
+_last_client_by_admin = {}   # { wa_number: "Client Name" }
 
-# ─────────────────────────────────────────────────────────────
-# Sheets-based client lookup & creation
-# ─────────────────────────────────────────────────────────────
-def _find_or_create_client(name: str, wa_number: str | None = None):
-    """
-    Look up a client by name from Google Sheets.
-    If not found and wa_number provided, create a new one via webhook.
-    Returns (client_id, wa_number, existed)
-    """
+# ─────────────────────────────────────────────
+# Helper: GAS call wrapper
+# ─────────────────────────────────────────────
+def _call_gas(action: str, payload: dict):
     try:
-        wa_number = normalize_wa(wa_number) if wa_number else None
-        res = post_to_webhook(f"{WEBHOOK_BASE}/sheets", {"action": "get_clients"})
-        clients = res.get("clients", []) if isinstance(res, dict) else []
-
-        # Try to find existing by name or number
-        for c in clients:
-            cname = (c.get("name") or "").strip().lower()
-            cnum = normalize_wa(c.get("phone") or "")
-            if cname == name.lower() or (wa_number and cnum == wa_number):
-                log.info(f"[CLIENT EXISTS] name={name}, wa={wa_number}")
-                return c.get("client_id"), cnum, True
-
-        # Create if not found
-        if wa_number:
-            post_to_webhook(f"{WEBHOOK_BASE}/sheets", {
-                "action": "add_client",
-                "name": name,
-                "phone": wa_number,
-                "status": "active",
-                "notes": "Auto-added via admin command"
-            })
-            log.info(f"[CLIENT CREATED] name={name}, wa={wa_number}")
-            return None, wa_number, False
-
-        log.warning(f"[CLIENT NOT FOUND] {name}")
-        return None, None, False
-
+        res = post_to_webhook(f"{WEBHOOK_BASE}/sheets",
+                              {**payload, "action": action})
+        return res or {"ok": False, "error": "No response"}
     except Exception as e:
-        log.error(f"❌ Error in _find_or_create_client: {e}")
-        return None, None, False
+        log.error(f"[GAS ERROR] {action} :: {e}")
+        return {"ok": False, "error": str(e)}
 
+# ─────────────────────────────────────────────
+# Helper: Format client summary
+# ─────────────────────────────────────────────
+def _format_summary(client: dict) -> str:
+    if not client:
+        return "⚠ Client details unavailable."
+    name = client.get("name", "Unknown")
+    phone = client.get("phone", "–")
+    dob = f"{client.get('dob_day','')} {client.get('dob_month','')}".strip() or "Not recorded"
+    email = client.get("email_address", "–") or "–"
+    notes = client.get("notes", "–") or "–"
+    status = client.get("status", "Active").title()
+    return (
+        f"👤 *{name}* ({phone})\n"
+        f"🎂 DOB: {dob}\n"
+        f"📧 Email: {email}\n"
+        f"🗒 Notes: {notes}\n"
+        f"🟢 Status: {status}"
+    )
 
-# ─────────────────────────────────────────────────────────────
-# Main handler for admin client actions
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Helper: Store memory + send update prompt
+# ─────────────────────────────────────────────
+def _remember_and_prompt(wa: str, name: str, summary: str):
+    _last_client_by_admin[wa] = name
+    prompt = (
+        summary
+        + "\n\n💬 Would you like to add DOB, notes, or email?"
+        + "\n→ e.g. 'DOB 21-May' or 'Email mary@…'"
+    )
+    safe_execute(send_whatsapp_text, wa, prompt)
+
+# ─────────────────────────────────────────────
+# Main handler (includes Quick-Update Mode)
+# ─────────────────────────────────────────────
 def handle_client_command(parsed: dict, wa: str):
-    """Route parsed client/admin commands (Sheets integration)."""
-
     intent = parsed.get("intent")
-    log.info(f"[ADMIN CLIENT] parsed={parsed}")
+    name = (parsed.get("name") or "").strip()
+    log.info(f"[ADMIN CLIENT] intent={intent}, name={name}")
 
-    # ── Add Client ───────────────────────────────────────────
+    # ── 0️⃣ Check for short replies first ──
+    short = _detect_quick_update(parsed.get("raw") or "", wa)
+    if short:
+        _handle_quick_update(short, wa)
+        return
+
+    # 1️⃣ Add Client
     if intent == "add_client":
-        name = parsed.get("name", "").strip()
-        number = parsed.get("number", "").replace("+", "").strip()
-
+        number = (parsed.get("number") or "").strip()
         if not name or not number:
             safe_execute(send_whatsapp_text, wa,
-                "⚠ Missing name or number. Usage: 'Add client Alice 0821234567'",
-                label="add_client_missing"
-            )
+                         "⚠ Use: 'Add Mary Smith 0821234567'")
             return
-
-        # Normalise SA number format
-        if number.startswith("0"):
-            number = "27" + number[1:]
-
-        cid, wnum, existed = _find_or_create_client(name, number)
-        if existed:
-            safe_execute(send_whatsapp_text, wa,
-                f"ℹ Client '{name}' already exists with number {wnum}.",
-                label="add_client_exists"
-            )
+        res = _call_gas("add_client", {"name": name, "wa_number": number})
+        if res.get("ok"):
+            c = _call_gas("find_client", {"name": name}).get("client", {})
+            summary = f"✅ *{name}* ({number}) added successfully.\n" + _format_summary(c)
+            _remember_and_prompt(wa, name, summary)
         else:
             safe_execute(send_whatsapp_text, wa,
-                f"✅ Client '{name}' added with number {wnum}.",
-                label="add_client_ok"
-            )
-            # Send welcome message
-            safe_execute(send_whatsapp_text, wnum,
-                f"💜 Hi {name}, you’ve been added as a PilatesHQ client. "
-                f"Nadine will confirm your bookings with you soon!",
-                label="client_welcome"
-            )
+                         f"⚠ Could not add {name}: {res.get('error','unknown error')}")
         return
 
-    # ── Cancel Next ───────────────────────────────────────────
-    if intent == "cancel_next":
-        from .admin_bookings import cancel_next_booking
-        cancel_next_booking(parsed.get("name"), wa)
+    # 2️⃣ Update DOB
+    if intent == "update_dob":
+        dob = parsed.get("dob", "")
+        res = _call_gas("update_dob", {"name": name, "dob": dob})
+        if res.get("ok"):
+            c = _call_gas("find_client", {"name": name}).get("client", {})
+            msg = f"✅ DOB updated for *{name}* → {dob}\n" + _format_summary(c)
+        elif "invalid" in res.get("error", "").lower():
+            msg = "⚠ Invalid DOB format — use 21-May or 5-Aug."
+        elif "not found" in res.get("error", "").lower():
+            msg = f"⚠ I couldn’t find {name} in your client list."
+        else:
+            msg = f"⚠ Could not update DOB for {name}."
+        safe_execute(send_whatsapp_text, wa, msg)
+        _last_client_by_admin[wa] = name
         return
 
-    # ── Sick Today ────────────────────────────────────────────
-    if intent == "off_sick_today":
-        from .admin_bookings import mark_today_status
-        mark_today_status(parsed.get("name"), "sick", wa)
+    # 3️⃣ Update Notes
+    if intent == "update_notes":
+        notes = parsed.get("notes", "")
+        res = _call_gas("update_notes", {"name": name, "notes": notes})
+        if res.get("ok"):
+            c = _call_gas("find_client", {"name": name}).get("client", {})
+            msg = f"✅ Notes updated for *{name}*.\n" + _format_summary(c)
+        elif "not found" in res.get("error", "").lower():
+            msg = f"⚠ I couldn’t find {name} in your client list."
+        else:
+            msg = f"⚠ Could not update notes for {name}."
+        safe_execute(send_whatsapp_text, wa, msg)
+        _last_client_by_admin[wa] = name
         return
 
-    # ── No-show ───────────────────────────────────────────────
-    if intent == "no_show_today":
-        from .admin_bookings import mark_today_status
-        mark_today_status(parsed.get("name"), "no_show", wa)
+    # 4️⃣ Update Email
+    if intent == "update_email":
+        email = parsed.get("email", "")
+        res = _call_gas("update_email", {"name": name, "email": email})
+        if res.get("ok"):
+            c = _call_gas("find_client", {"name": name}).get("client", {})
+            msg = f"✅ Email updated for *{name}*.\n" + _format_summary(c)
+        elif "not found" in res.get("error", "").lower():
+            msg = f"⚠ I couldn’t find {name} in your client list."
+        else:
+            msg = f"⚠ Could not update email for {name}."
+        safe_execute(send_whatsapp_text, wa, msg)
+        _last_client_by_admin[wa] = name
         return
 
-    # ── Deactivation ──────────────────────────────────────────
-    if intent == "deactivate":
-        admin_nudge.request_deactivate(parsed.get("name"), wa)
+    # 5️⃣ Find Client
+    if intent == "find_client":
+        res = _call_gas("find_client", {"name": name})
+        if res.get("ok") and res.get("client"):
+            summary = _format_summary(res["client"])
+            _remember_and_prompt(wa, name, summary)
+        else:
+            safe_execute(send_whatsapp_text, wa,
+                         f"⚠ I couldn’t find {name} in your client list.")
         return
 
-    if intent == "confirm_deactivate":
-        admin_nudge.confirm_deactivate(parsed.get("name"), wa)
-        return
+    # 6️⃣ Fallback
+    safe_execute(
+        send_whatsapp_text,
+        wa,
+        "⚠ I didn’t recognise that command. Try 'Find Mary Smith' or 'DOB 21-May'.",
+    )
 
-    if intent == "cancel":
-        safe_execute(send_whatsapp_text, wa,
-            "❌ Deactivation cancelled. No changes made.",
-            label="deactivate_cancel"
-        )
-        return
+# ─────────────────────────────────────────────
+# Quick Update Mode helpers
+# ─────────────────────────────────────────────
+def _detect_quick_update(text: str, wa: str) -> dict | None:
+    """Detects 'DOB …', 'Email …', or 'Notes …' short replies."""
+    t = text.strip()
+    name = _last_client_by_admin.get(wa)
+    if not name:
+        return None
+    # DOB pattern
+    if m := re.match(r"(?i)^dob\s+(\d{1,2}[-/ ]?[A-Za-z]{3,9})$", t):
+        return {"intent": "update_dob", "name": name, "dob": m.group(1)}
+    # Email pattern
+    if m := re.match(r"(?i)^email\s+([^\s@]+@[^\s@]+\.[^\s@]+)$", t):
+        return {"intent": "update_email", "name": name, "email": m.group(1)}
+    # Notes pattern
+    if m := re.match(r"(?i)^notes?\s+(.+)$", t):
+        return {"intent": "update_notes", "name": name, "notes": m.group(1)}
+    return None
+
+
+def _handle_quick_update(parsed: dict, wa: str):
+    """Executes the quick update immediately."""
+    intent = parsed["intent"]
+    log.info(f"[QUICK UPDATE] {intent} for {parsed['name']}")
+    handle_client_command(parsed, wa)
