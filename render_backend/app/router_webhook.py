@@ -1,6 +1,6 @@
 """
-router_webhook.py – Phase 24D (Final Unified Integration)
-────────────────────────────────────────────
+router_webhook.py – Phase 25A (Unified Reschedule Integration)
+────────────────────────────────────────────────────────────
 Handles incoming Meta Webhook events (GET verify + POST messages).
 
 ✅ Includes:
@@ -13,9 +13,9 @@ Handles incoming Meta Webhook events (GET verify + POST messages).
      - export clients / today / week  → GAS PDF export trigger
      - deactivate {client}            → mark client inactive
      - birthdays / birthdays test     → run weekly birthdays digest now
- • Client reschedule detection → now routed via /schedule/mark-reschedule
+ • 🔁 Client & Admin reschedule handling via client_reschedule_handler.py
  • Guest / unknown number welcome flow (no escalation)
-────────────────────────────────────────────
+────────────────────────────────────────────────────────────
 """
 
 import os
@@ -24,6 +24,7 @@ import time
 import requests
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, send_whatsapp_text
+from .client_reschedule_handler import handle_reschedule_event   # ✅ NEW import
 
 router_bp = Blueprint("router_bp", __name__)
 
@@ -36,7 +37,6 @@ TEMPLATE_LANG  = os.getenv("TEMPLATE_LANG", "en_US")
 # GAS + internal endpoints
 GAS_WEBHOOK_URL   = os.getenv("GAS_WEBHOOK_URL", "")
 APPS_SCRIPT_URL   = os.getenv("APPS_SCRIPT_URL", "")
-SCHEDULE_ENDPOINT = f"{WEBHOOK_BASE}/schedule/mark-reschedule"   # ← updated
 STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
 UNPAID_ENDPOINT   = f"{WEBHOOK_BASE}/invoices/unpaid"
@@ -202,19 +202,11 @@ def webhook():
                 return jsonify({"status": "birthdays handled"}), 200
 
             # ───────────────────────────────
-            # 🔁 CLIENT RESCHEDULE
+            # 🔁 CLIENT / ADMIN RESCHEDULE HANDLER (NEW)
             # ───────────────────────────────
-            if "reschedule" in lower_text:
-                try:
-                    requests.post(
-                        SCHEDULE_ENDPOINT,
-                        json={"client_name": profile_name},
-                        timeout=6
-                    )
-                    notify_admin(f"🔁 Reschedule noted for {profile_name}")
-                except Exception as e:
-                    print(f"⚠️ Reschedule forward failed: {e}")
-                return jsonify({"status": "reschedule handled"}), 200
+            if any(x in lower_text for x in ["reschedule", "cancel", "can't make", "cannot make", "noshow", "no show", "skip"]):
+                print(f"🔁 Routed to reschedule handler: {profile_name} → {msg_text}")
+                return handle_reschedule_event(profile_name, wa_number, msg_text, is_admin=(wa_number == NADINE_WA))
 
             # ───────────────────────────────
             # 📊 CREDITS SUMMARY
