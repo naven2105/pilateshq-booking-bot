@@ -89,7 +89,7 @@ def add_session():
 # ─────────────────────────────────────────────────────────────
 # 2️⃣ Mark Reschedule / No-Show
 # ─────────────────────────────────────────────────────────────
-@bp.route("/schedule/mark-reschedule", methods=["POST"], endpoint="mark_reschedule_api")
+@bp.route("/mark-reschedule", methods=["POST"], endpoint="mark_reschedule_api")
 def mark_reschedule_api():
     """Handles both reschedule + no-show updates coming from the webhook."""
     try:
