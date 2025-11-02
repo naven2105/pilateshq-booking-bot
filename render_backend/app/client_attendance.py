@@ -1,4 +1,3 @@
-# app/client_attendance.py
 """
 client_attendance.py
 ────────────────────
@@ -14,13 +13,13 @@ import logging
 import os
 import requests
 from datetime import datetime
-from .utils import send_whatsapp_text, safe_execute
-from . import admin_nudge
+from .utils import send_whatsapp_text, send_safe_message, safe_execute
 
 log = logging.getLogger(__name__)
 
 # Your deployed Google Apps Script Web App URL
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
+NADINE_WA = os.getenv("NADINE_WA", "")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -55,19 +54,21 @@ def mark_sick_today(wa_number: str):
     """Mark today's session as 'sick' and notify admin."""
     log.info(f"[client_attendance] mark_sick_today → {wa_number}")
 
-    # Update Google Sheet
     _post_to_apps_script("update_status_today", wa_number, "sick")
 
-    # Notify client
     safe_execute(
+        "client_sick_ok",
         send_whatsapp_text,
         wa_number,
         "🤒 Got it — your session today is marked as *sick*. Rest well 💜",
-        label="client_sick_ok",
     )
 
     # Notify Nadine
-    admin_nudge.attendance_update(wa_number, "sick", datetime.now().date(), "session")
+    send_safe_message(
+        NADINE_WA,
+        f"📋 Client ({wa_number}) marked today as *sick*.",
+        label="admin_sick_notice",
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -80,13 +81,17 @@ def cancel_today(wa_number: str):
     _post_to_apps_script("update_status_today", wa_number, "cancelled")
 
     safe_execute(
+        "client_cancel_today_ok",
         send_whatsapp_text,
         wa_number,
         "❌ Your session today has been *cancelled*. Thanks for letting us know.",
-        label="client_cancel_today_ok",
     )
 
-    admin_nudge.attendance_update(wa_number, "cancelled", datetime.now().date(), "session")
+    send_safe_message(
+        NADINE_WA,
+        f"📋 Client ({wa_number}) *cancelled* today’s session.",
+        label="admin_cancel_notice",
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -97,10 +102,14 @@ def running_late(wa_number: str):
     log.info(f"[client_attendance] running_late → {wa_number}")
 
     safe_execute(
+        "client_late_ok",
         send_whatsapp_text,
         wa_number,
         "⌛ Thanks for letting us know. Drive safe — Nadine has been notified.",
-        label="client_late_ok",
     )
 
-    admin_nudge.attendance_update(wa_number, "late", datetime.now().date(), "session")
+    send_safe_message(
+        NADINE_WA,
+        f"🚗 Client ({wa_number}) reported they’re *running late*.",
+        label="admin_late_notice",
+    )
