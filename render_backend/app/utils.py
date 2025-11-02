@@ -1,14 +1,7 @@
 """
-utils.py – PilatesHQ WhatsApp Bot Utilities (Phase 18.3)
+utils.py – PilatesHQ WhatsApp Bot Utilities (Phase 26)
 ────────────────────────────────────────────────────────────
-Full file version – all outgoing WhatsApp messages (template + text)
-are now single-line and sanitised (no newlines, tabs, or >4 spaces).
-
-Includes:
- • clean_text() sanitiser
- • send_whatsapp_template() & send_whatsapp_text() with auto-clean
- • send_safe_message() router with automatic template fallback
- • safe_execute(), retry logic, DOB helpers, number normalisation
+Enhanced with trigger_client_menu() for the Client Self-Service Menu.
 ────────────────────────────────────────────────────────────
 """
 
@@ -106,7 +99,6 @@ def send_whatsapp_template(to: str, name: str, lang: str = DEFAULT_LANG, variabl
     }
 
     safe_vars = [clean_text(v) for v in (variables or [])]
-
     data = {
         "messaging_product": "whatsapp",
         "to": normalize_wa(to),
@@ -124,16 +116,14 @@ def send_whatsapp_template(to: str, name: str, lang: str = DEFAULT_LANG, variabl
     }
 
     log.info(f"📤 Sending WhatsApp template → {to} ({name}) vars={safe_vars}")
-
     try:
         resp = requests.post(url, json=data, headers=headers, timeout=10)
         result = resp.json() if resp.text else {}
         if resp.status_code >= 400:
             log.error(f"❌ WhatsApp API error {resp.status_code}: {resp.text}")
             return {"ok": False, "status_code": resp.status_code, "error": resp.text}
-        else:
-            log.info(f"✅ WhatsApp message sent to {to} ({name}) → {resp.status_code}")
-            return {"ok": True, "status_code": resp.status_code, "response": result}
+        log.info(f"✅ WhatsApp message sent to {to} ({name})")
+        return {"ok": True, "status_code": resp.status_code, "response": result}
     except Exception as e:
         log.error(f"❌ WhatsApp template send failed: {e}")
         return {"ok": False, "error": str(e)}
@@ -148,7 +138,6 @@ def send_whatsapp_text(to: str, text: str):
         return {"ok": False, "error": "missing credentials"}
 
     text = clean_text(text)
-
     url = f"{META_BASE_URL}/{META_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {META_ACCESS_TOKEN}",
@@ -164,16 +153,14 @@ def send_whatsapp_text(to: str, text: str):
     }
 
     log.info(f"💬 Sending WhatsApp text → {to}: {text}")
-
     try:
         resp = requests.post(url, json=data, headers=headers, timeout=10)
         result = resp.json() if resp.text else {}
         if resp.status_code >= 400:
             log.error(f"❌ WhatsApp text error {resp.status_code}: {resp.text}")
             return {"ok": False, "status_code": resp.status_code, "error": resp.text}
-        else:
-            log.info(f"✅ WhatsApp text sent to {to}")
-            return {"ok": True, "status_code": resp.status_code, "response": result}
+        log.info(f"✅ WhatsApp text sent to {to}")
+        return {"ok": True, "status_code": resp.status_code, "response": result}
     except Exception as e:
         log.error(f"❌ WhatsApp text send failed: {e}")
         return {"ok": False, "error": str(e)}
@@ -213,7 +200,7 @@ def post_with_retry(url: str, payload: dict, retries: int = 3, delay: float = 2.
     return None
 
 # ─────────────────────────────────────────────────────────────
-# HYBRID MESSAGE ROUTER (Production) – Sanitised
+# Hybrid Safe Sender
 # ─────────────────────────────────────────────────────────────
 def send_safe_message(
     to: str,
@@ -227,41 +214,39 @@ def send_safe_message(
     """
     Smart WhatsApp message router.
     Handles Meta 24-hour re-engagement rules automatically.
-    All messages are cleaned of newlines, tabs, and excessive spaces.
     """
     try:
         message = clean_text(message)
         variables = [clean_text(v) for v in (variables or [])]
 
-        # Use template immediately for system messages
         if is_template and template_name:
             log.info(f"[SAFE MSG] Template {template_name} → {to}")
             return send_whatsapp_template(to, template_name, DEFAULT_LANG, variables)
 
-        # Otherwise, free text path
-        log.info(f"[SAFE MSG] Free text → {to}")
         resp = send_whatsapp_text(to, message)
-
         try:
             resp_json = resp if isinstance(resp, dict) else (resp.json() if hasattr(resp, "json") else {})
         except Exception:
             resp_json = {}
 
-        # Detect expired 24h window
         if "131047" in json.dumps(resp_json) or "Re-engagement" in json.dumps(resp_json):
-            log.warning(f"[SAFE MSG] 24h window closed for {to}. Re-sending via template.")
+            log.warning(f"[SAFE MSG] 24h window closed for {to}. Using template fallback.")
             tmpl = template_name or "admin_generic_alert_us"
             vars_ = variables or [message]
             return send_whatsapp_template(to, tmpl, DEFAULT_LANG, vars_)
 
-        if isinstance(resp_json, dict) and resp_json.get("messages"):
-            msg_id = resp_json["messages"][0].get("id")
-            log.info(f"[SAFE MSG] Delivered {label} → {to} | {msg_id}")
-        else:
-            log.debug(f"[SAFE MSG] {to} response: {resp_json}")
-
         return resp_json
-
     except Exception as e:
         log.error(f"[send_safe_message] {label} :: {e}")
+        return {"ok": False, "error": str(e)}
+
+# ─────────────────────────────────────────────────────────────
+# NEW: Trigger Client Menu Template
+# ─────────────────────────────────────────────────────────────
+def trigger_client_menu(wa_number: str, name: str = "there"):
+    """Send the PilatesHQ Main Menu template to a client."""
+    try:
+        return send_whatsapp_template(wa_number, "PilatesHQ_Menu_Main", DEFAULT_LANG, [name])
+    except Exception as e:
+        log.error(f"❌ trigger_client_menu failed: {e}")
         return {"ok": False, "error": str(e)}

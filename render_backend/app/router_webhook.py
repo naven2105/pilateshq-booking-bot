@@ -1,20 +1,19 @@
 """
-router_webhook.py – Phase 25A (Unified Reschedule Integration)
+router_webhook.py – Phase 26 (Client Self-Service Menu Integration)
 ────────────────────────────────────────────────────────────
-Handles incoming Meta Webhook events (GET verify + POST messages).
+Handles all incoming Meta Webhook events (GET verify + POST messages).
 
-✅ Includes:
- • Extracts contact name from 'contacts'
- • Admin commands:
-     - book / suspend / resume        → standing slot management
-     - invoice {client}               → single client invoice review
-     - unpaid invoices                → full unpaid invoice summary
-     - credits                        → unused credits summary
-     - export clients / today / week  → GAS PDF export trigger
-     - deactivate {client}            → mark client inactive
-     - birthdays / birthdays test     → run weekly birthdays digest now
- • 🔁 Client & Admin reschedule handling via client_reschedule_handler.py
- • Guest / unknown number welcome flow (no escalation)
+✅  Includes:
+ •  Extracts contact name from ‘contacts’
+ •  Admin commands:
+      – book / suspend / resume / deactivate
+      – invoice {client}
+      – unpaid invoices / credits
+      – export clients / today / week
+      – birthdays digest
+ •  🔁 Client & Admin reschedule handling (via client_reschedule_handler)
+ •  🧭 Client Self-Service Menu trigger (“menu”, “help”)
+ •  Guest / unknown number welcome flow
 ────────────────────────────────────────────────────────────
 """
 
@@ -24,7 +23,9 @@ import time
 import requests
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, send_whatsapp_text
-from .client_reschedule_handler import handle_reschedule_event   # ✅ NEW import
+from .client_reschedule_handler import handle_reschedule_event
+from .client_menu_router import send_client_menu, handle_client_action   # ✅ NEW
+# ─────────────────────────────────────────────────────────────
 
 router_bp = Blueprint("router_bp", __name__)
 
@@ -41,7 +42,6 @@ STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
 UNPAID_ENDPOINT   = f"{WEBHOOK_BASE}/invoices/unpaid"
 
-
 # ───────────────────────────────
 # Utility helper
 # ───────────────────────────────
@@ -51,7 +51,6 @@ def notify_admin(message: str):
         send_safe_message(NADINE_WA, message)
     except Exception as e:
         print(f"⚠️ notify_admin failed: {e}")
-
 
 # ───────────────────────────────
 # META VERIFICATION HANDSHAKE
@@ -67,7 +66,6 @@ def verify():
     print("❌ Meta webhook verification failed.")
     return "Forbidden", 403
 
-
 # ───────────────────────────────
 # META MESSAGE HANDLER
 # ───────────────────────────────
@@ -81,19 +79,19 @@ def webhook():
         change = (entry.get("changes") or [{}])[0]
         value  = change.get("value", {})
 
-        # ── 1️⃣ Status updates ─────────────────────────────
+        # ── 1️⃣ Status updates ─────────────────────────
         if "statuses" in value:
             status = value["statuses"][0]
             print(f"📬 Status update: {status.get('id')} → {status.get('status')}")
             return jsonify({"status": "logged"}), 200
 
-        # ── 2️⃣ Incoming messages ─────────────────────────
+        # ── 2️⃣ Incoming messages ──────────────────────
         if "messages" in value:
-            msg        = value["messages"][0]
-            wa_number  = msg.get("from", "")
-            msg_text   = msg.get("text", {}).get("body", "").strip()
+            msg = value["messages"][0]
+            wa_number = msg.get("from", "")
+            msg_text = msg.get("text", {}).get("body", "").strip()
             lower_text = msg_text.lower()
-            contacts   = value.get("contacts", [])
+            contacts = value.get("contacts", [])
             profile_name = contacts[0]["profile"]["name"] if contacts else "Unknown"
 
             print(f"💬 Message from {profile_name} ({wa_number}): {msg_text}")
@@ -115,7 +113,7 @@ def webhook():
             if wa_number == NADINE_WA and lower_text.startswith("invoice "):
                 client_name = msg_text.split(" ", 1)[1].strip()
                 try:
-                    r = requests.post(INVOICE_ENDPOINT, json={"client_name": client_name}, timeout=10)
+                    requests.post(INVOICE_ENDPOINT, json={"client_name": client_name}, timeout=10)
                     notify_admin(f"✅ Invoice sent for {client_name}")
                 except Exception as e:
                     notify_admin(f"⚠️ Invoice error: {e}")
@@ -139,7 +137,6 @@ def webhook():
                 if not GAS_WEBHOOK_URL:
                     notify_admin("⚠️ GAS webhook not configured.")
                     return jsonify({"status": "missing GAS"}), 200
-
                 action_map = {
                     "clients": ("export_clients", "Clients Register"),
                     "today": ("export_sessions_today", "Today's Sessions"),
@@ -149,13 +146,11 @@ def webhook():
                 if not matched:
                     notify_admin("⚠️ Unknown export command.")
                     return jsonify({"status": "unknown export"}), 200
-
                 action, label = matched
-                success, pdf_link, response_text = False, None, ""
+                success, pdf_link = False, None
                 for attempt in range(2):
                     try:
                         r = requests.post(GAS_WEBHOOK_URL, json={"action": action}, timeout=25)
-                        response_text = r.text
                         if r.ok:
                             data = json.loads(r.text)
                             if data.get("ok") and data.get("pdf_link"):
@@ -165,7 +160,6 @@ def webhook():
                     except Exception as e:
                         print(f"⚠️ Export attempt {attempt+1} failed: {e}")
                     time.sleep(1.2)
-
                 msg = f"✅ {label} ready: {pdf_link}" if success else f"❌ {label} export failed"
                 notify_admin(msg)
                 return jsonify({"status": "export handled", "ok": success}), 200
@@ -202,7 +196,15 @@ def webhook():
                 return jsonify({"status": "birthdays handled"}), 200
 
             # ───────────────────────────────
-            # 🔁 CLIENT / ADMIN RESCHEDULE HANDLER (NEW)
+            # 🧭 CLIENT SELF-SERVICE MENU (NEW)
+            # ───────────────────────────────
+            if lower_text in ["menu", "help"]:
+                print(f"🧭 Menu triggered by {profile_name} ({wa_number})")
+                send_client_menu(wa_number, profile_name)
+                return jsonify({"status": "menu sent"}), 200
+
+            # ───────────────────────────────
+            # 🔁 CLIENT / ADMIN RESCHEDULE
             # ───────────────────────────────
             if any(x in lower_text for x in ["reschedule", "cancel", "can't make", "cannot make", "noshow", "no show", "skip"]):
                 print(f"🔁 Routed to reschedule handler: {profile_name} → {msg_text}")
@@ -229,7 +231,7 @@ def webhook():
                 "This WhatsApp number is reserved for *registered clients* "
                 "to manage bookings, reminders, and invoices.\n\n"
                 "If you’d like to start Pilates or learn more, please contact *Nadine* via "
-                "email at 📧 *lu@pilateshq.co.za* or visit our website 🌐 *www.pilateshq.co.za* 💜"
+                "email 📧 *lu@pilateshq.co.za* or visit 🌐 *www.pilateshq.co.za* 💜"
             )
             try:
                 send_whatsapp_text(wa_number, welcome)
@@ -243,7 +245,6 @@ def webhook():
     except Exception as e:
         print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
-
 
 # ───────────────────────────────
 # HEALTH CHECK
