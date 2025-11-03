@@ -246,6 +246,24 @@ def webhook():
         print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
 
+
+# ───────────────────────────────
+# 🔧 TEST MESSAGE ROUTE
+# ───────────────────────────────
+@router_bp.route("/test_send", methods=["POST"])
+def test_send():
+    """Simple route to test Meta WhatsApp send"""
+    try:
+        data = request.get_json(force=True)
+        to = data.get("to")
+        text = data.get("text")
+        send_whatsapp_text(to, text)
+        return jsonify({"ok": True, "message": f"Sent to {to}"}), 200
+    except Exception as e:
+        print(f"❌ test_send error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ───────────────────────────────
 # HEALTH CHECK
 # ───────────────────────────────
