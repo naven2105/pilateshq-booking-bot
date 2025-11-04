@@ -13,7 +13,7 @@ Handles all incoming Meta Webhook events (GET verify + POST messages).
       – birthdays digest
  •  🔁 Client & Admin reschedule handling (via client_reschedule_handler)
  •  🧭 Client Self-Service Menu trigger (“menu”, “help”)
- •  Guest / unknown number welcome flow
+ •  Context-aware fallback: shows menu for clients/admins, welcome for guests
 ────────────────────────────────────────────────────────────
 """
 
@@ -24,9 +24,9 @@ import requests
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, send_whatsapp_text
 from .client_reschedule_handler import handle_reschedule_event
-from .client_menu_router import send_client_menu, handle_client_action   # ✅ NEW
-# ─────────────────────────────────────────────────────────────
+from .client_menu_router import send_client_menu, handle_client_action
 
+# ─────────────────────────────────────────────────────────────
 router_bp = Blueprint("router_bp", __name__)
 
 # ── Environment variables ────────────────────────────────────────────────
@@ -196,7 +196,7 @@ def webhook():
                 return jsonify({"status": "birthdays handled"}), 200
 
             # ───────────────────────────────
-            # 🧭 CLIENT SELF-SERVICE MENU (NEW)
+            # 🧭 CLIENT SELF-SERVICE MENU
             # ───────────────────────────────
             if lower_text in ["menu", "help"]:
                 print(f"🧭 Menu triggered by {profile_name} ({wa_number})")
@@ -223,21 +223,41 @@ def webhook():
                 return jsonify({"status": "credits handled"}), 200
 
             # ───────────────────────────────
-            # 🌐 GUEST HANDLING
+            # 🧭 OUT-OF-RANGE MESSAGE HANDLING
             # ───────────────────────────────
-            print(f"🙋 Guest contacted bot: {profile_name} ({wa_number})")
-            welcome = (
-                "🤖 Hello! This is the *PilatesHQ Chatbot.*\n\n"
-                "This WhatsApp number is reserved for *registered clients* "
-                "to manage bookings, reminders, and invoices.\n\n"
-                "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 *084 313 1635*, "
-                "email 📧 *lu@pilateshq.co.za*, or visit 🌐 *www.pilateshq.co.za* 💜"
-            )
             try:
-                send_whatsapp_text(wa_number, welcome)
+                if not GAS_WEBHOOK_URL:
+                    print("⚠️ GAS_WEBHOOK_URL not configured, skipping lookup.")
+                    lookup = {}
+                else:
+                    r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=10)
+                    lookup = r.json() if r.ok else {}
+
+                if wa_number == NADINE_WA:
+                    print(f"🧩 Admin sent unrecognised msg: {msg_text}")
+                    send_client_menu(wa_number, "Nadine")
+                    return jsonify({"status": "admin fallback"}), 200
+
+                elif lookup.get("ok"):
+                    print(f"🧩 Known client fallback → showing menu for {lookup.get('client_name')}")
+                    send_client_menu(wa_number, lookup.get("client_name"))
+                    return jsonify({"status": "client fallback"}), 200
+
+                else:
+                    print(f"🙋 Guest fallback (not found in lookup): {profile_name} ({wa_number})")
+                    welcome = (
+                        "🤖 Hello! This is the *PilatesHQ Chatbot.*\n\n"
+                        "This WhatsApp number is reserved for *registered clients* "
+                        "to manage bookings, reminders, and invoices.\n\n"
+                        "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 *084 313 1635*, "
+                        "email 📧 *lu@pilateshq.co.za*, or visit 🌐 *www.pilateshq.co.za* 💜"
+                    )
+                    send_whatsapp_text(wa_number, welcome)
+                    return jsonify({"status": "guest fallback"}), 200
+
             except Exception as e:
-                print(f"⚠️ Guest welcome failed → {e}")
-            return jsonify({"status": "guest redirect"}), 200
+                print(f"⚠️ Out-of-range handler failed → {e}")
+                return jsonify({"status": "fallback error"}), 200
 
         print("⚠️ Unknown event type:", value)
         return jsonify({"status": "ignored"}), 200
@@ -245,7 +265,6 @@ def webhook():
     except Exception as e:
         print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
-
 
 # ───────────────────────────────
 # 🔧 TEST MESSAGE ROUTE
@@ -262,7 +281,6 @@ def test_send():
     except Exception as e:
         print(f"❌ test_send error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 # ───────────────────────────────
 # HEALTH CHECK
