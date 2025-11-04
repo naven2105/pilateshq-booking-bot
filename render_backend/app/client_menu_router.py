@@ -44,6 +44,32 @@ def send_client_menu(wa_number: str, name: str = "there"):
         return {"ok": False, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────
+# Helper: Send admin menu
+# ─────────────────────────────────────────────────────────────    
+def send_admin_menu(wa_number: str):
+    """
+    Sends a simplified admin command reference instead of the client menu.
+    """
+    try:
+        text = (
+            "🛠️ *PilatesHQ Admin Commands*\n\n"
+            "Here are your quick commands:\n"
+            "• book [client] – Add standing slot\n"
+            "• suspend [client] – Suspend standing slot\n"
+            "• resume [client] – Resume slot\n"
+            "• deactivate [client] – Deactivate client\n"
+            "• export clients / today / week – Export PDF\n"
+            "• invoice [client] – Generate invoice\n"
+            "• unpaid invoices – List overdue\n"
+            "• birthdays – Weekly digest\n\n"
+            "💡 Tip: Send 'menu' to view this list again."
+        )
+        send_whatsapp_text(wa_number, text)
+    except Exception as e:
+        print(f"⚠️ send_admin_menu failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 # API Route: Send menu manually (optional testing endpoint)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/client-menu/send", methods=["POST"])

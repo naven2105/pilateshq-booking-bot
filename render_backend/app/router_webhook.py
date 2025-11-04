@@ -11,9 +11,9 @@ Handles all incoming Meta Webhook events (GET verify + POST messages).
       – unpaid invoices / credits
       – export clients / today / week
       – birthdays digest
- •  🔁 Client & Admin reschedule handling (via client_reschedule_handler)
+ •  🔁 Client & Admin reschedule handling
  •  🧭 Client Self-Service Menu trigger (“menu”, “help”)
- •  Context-aware fallback: shows menu for clients/admins, welcome for guests
+ •  Smart fallback: Admin → admin menu, Client → client menu, Guest → intro msg
 ────────────────────────────────────────────────────────────
 """
 
@@ -24,12 +24,13 @@ import requests
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, send_whatsapp_text
 from .client_reschedule_handler import handle_reschedule_event
-from .client_menu_router import send_client_menu, handle_client_action
+from .client_menu_router import send_client_menu, send_admin_menu   # ✅ includes new admin menu
 
-# ─────────────────────────────────────────────────────────────
 router_bp = Blueprint("router_bp", __name__)
 
-# ── Environment variables ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Environment variables
+# ─────────────────────────────────────────────────────────────
 VERIFY_TOKEN   = os.getenv("META_VERIFY_TOKEN", "")
 WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
 NADINE_WA      = os.getenv("NADINE_WA", "")
@@ -43,7 +44,7 @@ INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
 UNPAID_ENDPOINT   = f"{WEBHOOK_BASE}/invoices/unpaid"
 
 # ───────────────────────────────
-# Utility helper
+# Helper: Admin notify
 # ───────────────────────────────
 def notify_admin(message: str):
     """Send a safe WhatsApp message to Nadine (admin)."""
@@ -226,16 +227,13 @@ def webhook():
             # 🧭 OUT-OF-RANGE MESSAGE HANDLING
             # ───────────────────────────────
             try:
-                if not GAS_WEBHOOK_URL:
-                    print("⚠️ GAS_WEBHOOK_URL not configured, skipping lookup.")
-                    lookup = {}
-                else:
-                    r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=10)
-                    lookup = r.json() if r.ok else {}
+                # Lookup in Google Sheets
+                r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=10)
+                lookup = r.json() if r.ok else {}
 
                 if wa_number == NADINE_WA:
                     print(f"🧩 Admin sent unrecognised msg: {msg_text}")
-                    send_client_menu(wa_number, "Nadine")
+                    send_admin_menu(wa_number)
                     return jsonify({"status": "admin fallback"}), 200
 
                 elif lookup.get("ok"):
@@ -266,6 +264,7 @@ def webhook():
         print("❌ Webhook error:", e)
         return jsonify({"error": str(e)}), 500
 
+
 # ───────────────────────────────
 # 🔧 TEST MESSAGE ROUTE
 # ───────────────────────────────
@@ -281,6 +280,7 @@ def test_send():
     except Exception as e:
         print(f"❌ test_send error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # ───────────────────────────────
 # HEALTH CHECK
