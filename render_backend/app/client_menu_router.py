@@ -1,24 +1,27 @@
 """
-client_menu_router.py – Phase 26 (Client Self-Service Menu)
+client_menu_router.py – Phase 26 (Client Self-Service Menu + Admin Template)
 ────────────────────────────────────────────────────────────
 Purpose:
- • Send the PilatesHQ main menu (WhatsApp template)
+ • Send the PilatesHQ client self-service menu (template)
  • Handle button payloads from Meta interactive replies
- • Route actions to existing modules (bookings, attendance, reschedule)
-
-Integration:
- • router_webhook.py → import and call handle_client_action()
- • Depends on utils.send_whatsapp_template(), send_safe_message()
+ • Route actions to bookings / attendance / reschedule modules
+ • Send all admin communications via WhatsApp template (admin_generic_alert_us)
 ────────────────────────────────────────────────────────────
 """
 
 import os
 import logging
 from flask import Blueprint, request, jsonify
-from .utils import send_whatsapp_template, send_safe_message, normalize_wa
+from .utils import (
+    send_whatsapp_template,
+    send_safe_message,
+    send_whatsapp_text,
+    normalize_wa
+)
 from . import client_bookings, client_attendance
 from .client_reschedule_handler import handle_reschedule_event
 
+# ─────────────────────────────────────────────────────────────
 bp = Blueprint("client_menu", __name__)
 log = logging.getLogger(__name__)
 
@@ -28,11 +31,12 @@ log = logging.getLogger(__name__)
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
-# Approved WhatsApp Template
+# Approved WhatsApp Templates
 MENU_TEMPLATE = "pilateshq_menu_main"
+ADMIN_TEMPLATE = "admin_generic_alert_us"
 
 # ─────────────────────────────────────────────────────────────
-# Helper: Send main menu
+# Helper: Send main client menu
 # ─────────────────────────────────────────────────────────────
 def send_client_menu(wa_number: str, name: str = "there"):
     """Send the PilatesHQ client self-service menu via WhatsApp template."""
@@ -40,22 +44,19 @@ def send_client_menu(wa_number: str, name: str = "there"):
         log.info(f"[client_menu] Sending main menu to {wa_number}")
         return send_whatsapp_template(wa_number, MENU_TEMPLATE, TEMPLATE_LANG, [name])
     except Exception as e:
-        log.error(f"❌ Failed to send menu: {e}")
+        log.error(f"❌ Failed to send client menu: {e}")
         return {"ok": False, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────
-# Helper: Send admin menu
-# ─────────────────────────────────────────────────────────────    
+# Helper: Send admin menu using approved template
+# ─────────────────────────────────────────────────────────────
 def send_admin_menu(wa_number: str):
-    """
-    Sends a simplified admin command reference instead of the client menu.
-    """
+    """Send a simplified admin command reference via Meta-approved template."""
     try:
-        text = (
-            "🛠️ *PilatesHQ Admin Commands*\n\n"
-            "Here are your quick commands:\n"
+        help_text = (
+            "🛠️ PilatesHQ Admin Commands:\n"
             "• book [client] – Add standing slot\n"
-            "• suspend [client] – Suspend standing slot\n"
+            "• suspend [client] – Suspend slot\n"
             "• resume [client] – Resume slot\n"
             "• deactivate [client] – Deactivate client\n"
             "• export clients / today / week – Export PDF\n"
@@ -64,13 +65,23 @@ def send_admin_menu(wa_number: str):
             "• birthdays – Weekly digest\n\n"
             "💡 Tip: Send 'menu' to view this list again."
         )
-        send_whatsapp_text(wa_number, text)
+        send_whatsapp_template(
+            wa_number,
+            ADMIN_TEMPLATE,
+            TEMPLATE_LANG,
+            [help_text]
+        )
+        log.info(f"✅ Admin menu sent via template to {wa_number}")
     except Exception as e:
-        print(f"⚠️ send_admin_menu failed: {e}")
-
+        log.error(f"⚠️ send_admin_menu failed: {e}")
+        # fallback in case of template failure (only within 24h session)
+        try:
+            send_whatsapp_text(wa_number, help_text)
+        except Exception as inner:
+            log.error(f"❌ Admin menu text fallback failed: {inner}")
 
 # ─────────────────────────────────────────────────────────────
-# API Route: Send menu manually (optional testing endpoint)
+# API Route: Trigger menu manually (for testing)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/client-menu/send", methods=["POST"])
 def send_menu_api():
@@ -91,7 +102,7 @@ def send_menu_api():
 def handle_client_action():
     """
     Receive interactive button payloads from WhatsApp.
-    Example payload:
+    Example:
     {
         "wa_number": "2784313635",
         "payload": "MY_SCHEDULE",
