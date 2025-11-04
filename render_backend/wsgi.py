@@ -1,20 +1,28 @@
 #render_backend/wsgi.py
 """
-wsgi.py
+wsgi.py – PilatesHQ Render Backend Entry Point
 ────────────────────────────────────────────
-Main entry point for Gunicorn on Render.
-Loads Flask app via create_app() from render_backend.app.
+This file is used by Gunicorn to launch the Flask app on Render.
 
-✅ Simplified structure:
- - Single import from render_backend.app
- - All routes registered automatically in app/__init__.py
- - Clean and Render-ready for deployment
+Expected project structure:
+render_backend/
+ ├── wsgi.py
+ └── app/
+     ├── __init__.py  ← contains create_app()
+     ├── router_webhook.py
+     ├── invoices_router.py
+     ├── client_menu_router.py
+     └── ...
+────────────────────────────────────────────
 """
 
+import os
 from render_backend.app import create_app
 
-# ── Gunicorn entrypoint ─────────────────────────────
+# Flask application factory
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Starting PilatesHQ Render Backend on port {port}")
+    app.run(host="0.0.0.0", port=port)

@@ -1,5 +1,4 @@
-
-##render_backend/app/__init__.py
+#render_backend/__init__.py
 """
 __init__.py – PilatesHQ Render Backend (Phase 26)
 ────────────────────────────────────────────────────────────
