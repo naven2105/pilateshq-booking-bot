@@ -29,7 +29,7 @@ NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 
 # Approved WhatsApp Template
-MENU_TEMPLATE = "PilatesHQ_Menu_Main"
+MENU_TEMPLATE = "pilateshq_menu_main"
 
 # ─────────────────────────────────────────────────────────────
 # Helper: Send main menu

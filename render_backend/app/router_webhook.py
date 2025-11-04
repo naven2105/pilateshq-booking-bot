@@ -230,8 +230,8 @@ def webhook():
                 "🤖 Hello! This is the *PilatesHQ Chatbot.*\n\n"
                 "This WhatsApp number is reserved for *registered clients* "
                 "to manage bookings, reminders, and invoices.\n\n"
-                "If you’d like to start Pilates or learn more, please contact *Nadine* via "
-                "email 📧 *lu@pilateshq.co.za* or visit 🌐 *www.pilateshq.co.za* 💜"
+                "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 *084 313 1635*, "
+                "email 📧 *lu@pilateshq.co.za*, or visit 🌐 *www.pilateshq.co.za* 💜"
             )
             try:
                 send_whatsapp_text(wa_number, welcome)
