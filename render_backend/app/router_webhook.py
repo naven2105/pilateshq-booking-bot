@@ -16,7 +16,7 @@ Handles all incoming Meta Webhook events (GET verify + POST messages).
  •  Context-aware fallback:
       – Admin → WhatsApp template (admin_generic_alert_us)
       – Client → shows menu
-      – Guest → polite message (no lead creation)
+      – Guest → Meta template (guest_welcome_us) or fallback text
 ────────────────────────────────────────────────────────────
 """
 
@@ -33,12 +33,13 @@ from .client_menu_router import send_client_menu, handle_client_action
 router_bp = Blueprint("router_bp", __name__)
 
 # ── Environment variables ─────────────────────────────────────
-VERIFY_TOKEN   = os.getenv("META_VERIFY_TOKEN", "")
-WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
-NADINE_WA      = os.getenv("NADINE_WA", "")
-TEMPLATE_LANG  = os.getenv("TEMPLATE_LANG", "en_US")
-GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
-APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL", "")
+VERIFY_TOKEN      = os.getenv("META_VERIFY_TOKEN", "")
+WEBHOOK_BASE      = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
+NADINE_WA         = os.getenv("NADINE_WA", "")
+TEMPLATE_LANG     = os.getenv("TEMPLATE_LANG", "en_US")
+TEMPLATE_GUEST_WELCOME = os.getenv("TEMPLATE_GUEST_WELCOME", "guest_welcome_us")
+GAS_WEBHOOK_URL   = os.getenv("GAS_WEBHOOK_URL", "")
+APPS_SCRIPT_URL   = os.getenv("APPS_SCRIPT_URL", "")
 
 STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
@@ -245,14 +246,24 @@ def webhook():
             # Guest flow (unregistered user)
             # ─────────────────────────────
             print(f"🙋 Guest detected: {profile_name} ({wa_number})")
-            guest_msg = (
-                "🤖 Hello! This is the PilatesHQ Chatbot.\n\n"
-                "This WhatsApp number is reserved for *registered clients* "
-                "to manage bookings, reminders, and invoices.\n\n"
-                "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 084 313 1635, "
-                "email 📧 lu@pilateshq.co.za, or visit 🌐 www.pilateshq.co.za 💜"
-            )
-            send_whatsapp_text(wa_number, guest_msg)
+            try:
+                send_whatsapp_template(
+                    wa_number,
+                    TEMPLATE_GUEST_WELCOME,
+                    TEMPLATE_LANG,
+                    [profile_name or "there"]
+                )
+                print(f"✅ Guest template sent via {TEMPLATE_GUEST_WELCOME} to {wa_number}")
+            except Exception as e:
+                print(f"⚠️ Template send failed ({e}), using text fallback.")
+                guest_msg = (
+                    "🤖 Hello! This is the PilatesHQ Chatbot.\n\n"
+                    "This WhatsApp number is reserved for *registered clients* "
+                    "to manage bookings, reminders, and invoices.\n\n"
+                    "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 084 313 1635, "
+                    "email 📧 lu@pilateshq.co.za, or visit 🌐 www.pilateshq.co.za 💜"
+                )
+                send_whatsapp_text(wa_number, guest_msg)
             print("✅ Guest politely redirected (no lead created)")
             return jsonify({"status": "guest message"}), 200
 
