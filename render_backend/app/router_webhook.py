@@ -1,11 +1,11 @@
 """
-router_webhook.py – Phase 26D (Interactive Buttons + Lean Logging)
+router_webhook.py – Phase 26D (Interactive Button Fix + Lean Logging + GAS Integration)
 ────────────────────────────────────────────────────────────
 Handles all incoming Meta Webhook events (GET verify + POST messages).
 
 ✅ Includes:
  • Extracts contact name from ‘contacts’
- • Detects text & interactive button replies (MY_SCHEDULE, etc.)
+ • Detects interactive button payloads (MY_SCHEDULE, etc.)
  • Admin commands:
       – book / suspend / resume / deactivate
       – invoice {client}
@@ -28,8 +28,7 @@ import requests
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, send_whatsapp_text, send_whatsapp_template
 from .client_reschedule_handler import handle_reschedule_event
-from .client_menu_router import send_client_menu, handle_client_action
-from .client_menu_router import handle_client_action as handle_client_action_inner
+from .client_menu_router import send_client_menu, handle_client_action as handle_client_action_inner
 
 # ─────────────────────────────────────────────────────────────
 router_bp = Blueprint("router_bp", __name__)
@@ -46,6 +45,35 @@ DEBUG_MODE        = os.getenv("DEBUG_MODE", "false").lower() == "true"
 STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
 UNPAID_ENDPOINT   = f"{WEBHOOK_BASE}/invoices/unpaid"
+
+
+# ─────────────────────────────────────────────────────────────
+# Helper: Extract text or button payload from a message
+# ─────────────────────────────────────────────────────────────
+def extract_message_text(msg: dict) -> str:
+    """
+    Safely extract the user's intent text from WhatsApp webhook message.
+
+    Supports both:
+      • Standard text messages  → msg["text"]["body"]
+      • Interactive button replies → msg["interactive"]["button_reply"]["id"]
+      • List replies → msg["interactive"]["list_reply"]["id"]
+
+    Returns a clean uppercase payload string (e.g., "MY_SCHEDULE").
+    """
+    try:
+        mtype = msg.get("type", "")
+        if mtype == "text":
+            return msg.get("text", {}).get("body", "").strip()
+        if mtype == "interactive":
+            interactive = msg.get("interactive", {})
+            if "button_reply" in interactive:
+                return interactive["button_reply"].get("id", "").strip()
+            if "list_reply" in interactive:
+                return interactive["list_reply"].get("id", "").strip()
+        return ""
+    except Exception:
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -88,7 +116,7 @@ def verify():
 def webhook():
     data = request.get_json(force=True)
 
-    # ── Condensed Logging ─────────────────────────────────────
+    # ── Lean Logging ───────────────────────────────────────────
     if DEBUG_MODE:
         print("📩 Full webhook (DEBUG):", json.dumps(data, indent=2))
     else:
@@ -99,19 +127,10 @@ def webhook():
             if "messages" in value:
                 msg = value["messages"][0]
                 wa_number = msg.get("from", "")
-                mtype = msg.get("type", "")
-                if mtype == "interactive":
-                    interactive = msg.get("interactive", {})
-                    if "button_reply" in interactive:
-                        msg_text = interactive["button_reply"]["id"]
-                    elif "list_reply" in interactive:
-                        msg_text = interactive["list_reply"]["id"]
-                    else:
-                        msg_text = "(unknown interactive)"
-                else:
-                    msg_text = msg.get("text", {}).get("body", "")
-                profile = value.get("contacts", [{}])[0].get("profile", {}).get("name", "Unknown")
-                print(f"💬 {profile} ({wa_number}) → {msg_text}")
+                summary = extract_message_text(msg)
+                contacts = value.get("contacts", [])
+                profile = contacts[0]["profile"]["name"] if contacts else "Unknown"
+                print(f"💬 {profile} ({wa_number}) → {summary}")
             elif "statuses" in value:
                 status = value["statuses"][0]
                 print(f"📬 {status.get('recipient_id')} → {status.get('status')}")
@@ -133,20 +152,8 @@ def webhook():
 
         msg = value["messages"][0]
         wa_number = msg.get("from", "")
-        msg_type = msg.get("type", "")
-        msg_text = ""
-
-        # ✅ Support both text and interactive button replies
-        if msg_type == "text":
-            msg_text = msg.get("text", {}).get("body", "").strip()
-        elif msg_type == "interactive":
-            interactive = msg.get("interactive", {})
-            if "button_reply" in interactive:
-                msg_text = interactive["button_reply"]["id"]
-            elif "list_reply" in interactive:
-                msg_text = interactive["list_reply"]["id"]
-
-        lower_text = msg_text.strip().lower()
+        msg_text = extract_message_text(msg)
+        lower_text = msg_text.lower()
         contacts = value.get("contacts", [])
         profile_name = contacts[0]["profile"]["name"] if contacts else "Unknown"
 
@@ -154,28 +161,97 @@ def webhook():
         # ADMIN COMMANDS (Nadine only)
         # ─────────────────────────────
         if wa_number == NADINE_WA:
-            # ... (no change to admin section)
-            # keep your existing admin logic exactly as before
-            pass
+            if any(lower_text.startswith(c) for c in ["book ", "suspend ", "resume "]):
+                try:
+                    r = requests.post(STANDING_ENDPOINT, json={"from": wa_number, "text": msg_text}, timeout=10)
+                    notify_admin(f"Standing command processed ({r.status_code})")
+                except Exception as e:
+                    notify_admin(f"Standing command error: {e}")
+                return jsonify({"status": "standing handled"}), 200
+
+            if lower_text.startswith("invoice "):
+                client_name = msg_text.split(" ", 1)[1].strip()
+                try:
+                    requests.post(INVOICE_ENDPOINT, json={"client_name": client_name}, timeout=10)
+                    notify_admin(f"Invoice sent for {client_name}")
+                except Exception as e:
+                    notify_admin(f"Invoice error: {e}")
+                return jsonify({"status": "invoice handled"}), 200
+
+            if lower_text in ["unpaid invoices", "check invoices"]:
+                try:
+                    requests.post(UNPAID_ENDPOINT, json={"action": "list_overdue_invoices"}, timeout=15)
+                    notify_admin("Unpaid invoices summary requested")
+                except Exception as e:
+                    notify_admin(f"Unpaid request failed: {e}")
+                return jsonify({"status": "unpaid handled"}), 200
+
+            if lower_text.startswith("export"):
+                if not GAS_WEBHOOK_URL:
+                    notify_admin("GAS webhook not configured.")
+                    return jsonify({"status": "missing GAS"}), 200
+                mapping = {
+                    "clients": ("export_clients", "Clients Register"),
+                    "today": ("export_sessions_today", "Today's Sessions"),
+                    "week": ("export_sessions_week", "Weekly Sessions"),
+                }
+                matched = next(((a, l) for k, (a, l) in mapping.items() if k in lower_text), None)
+                if not matched:
+                    notify_admin("Unknown export command.")
+                    return jsonify({"status": "unknown export"}), 200
+                action, label = matched
+                try:
+                    r = requests.post(GAS_WEBHOOK_URL, json={"action": action}, timeout=25)
+                    if r.ok and r.json().get("ok"):
+                        notify_admin(f"{label} export completed successfully.")
+                    else:
+                        notify_admin(f"{label} export failed.")
+                except Exception as e:
+                    notify_admin(f"Export error: {e}")
+                return jsonify({"status": "export handled"}), 200
+
+            if lower_text.startswith("deactivate "):
+                client_name = msg_text.split(" ", 1)[1].strip()
+                try:
+                    r = requests.post(GAS_WEBHOOK_URL, json={"action": "deactivate_client", "client_name": client_name}, timeout=20)
+                    if r.ok and r.json().get("ok"):
+                        notify_admin(f"Deactivated {client_name}")
+                    else:
+                        notify_admin(f"Could not deactivate {client_name}")
+                except Exception as e:
+                    notify_admin(f"Deactivate error: {e}")
+                return jsonify({"status": "deactivate handled"}), 200
+
+            if lower_text in ["birthdays", "birthdays test"]:
+                try:
+                    r = requests.post(GAS_WEBHOOK_URL, json={"action": "weekly_birthdays_digest"}, timeout=30)
+                    notify_admin("🎂 Birthdays digest completed." if r.ok else "Birthdays digest failed.")
+                except Exception as e:
+                    notify_admin(f"Digest error: {e}")
+                return jsonify({"status": "birthdays handled"}), 200
+
+            send_whatsapp_template(
+                wa_number,
+                "admin_generic_alert_us",
+                TEMPLATE_LANG,
+                [f"You sent '{msg_text}'. Here's your admin quick menu reminder."]
+            )
+            return jsonify({"status": "admin fallback"}), 200
+
 
         # ─────────────────────────────
         # CLIENT MENU / ACTIONS
         # ─────────────────────────────
-        # ✅ Handle interactive payloads (buttons)
-        if msg_type == "interactive" and msg_text:
-            handle_client_action()
-            return jsonify({"status": "interactive handled"}), 200
-
-        if msg_type == "interactive" and msg_text:
-            action_payload = {
-                "wa_number": wa_number,
-                "name": profile_name,
-                "payload": msg_text.upper().strip(),
-            }
+        if msg_text.upper() in ["MY_SCHEDULE", "CHECK_AVAILABILITY", "VIEW_LATEST_INVOICE"]:
             try:
-                handle_client_action_inner(action_payload)
-                return jsonify({"status": "interactive handled", "payload": msg_text}), 200
-            except Exception as e:      
+                payload = {
+                    "wa_number": wa_number,
+                    "name": profile_name,
+                    "payload": msg_text.upper().strip(),
+                }
+                handle_client_action_inner(payload)
+                return jsonify({"status": "client action handled", "payload": msg_text}), 200
+            except Exception as e:
                 print(f"⚠️ handle_client_action failed: {e}")
                 send_whatsapp_text(wa_number, "⚠️ Sorry, something went wrong processing your selection.")
                 return jsonify({"status": "interactive error"}), 500
@@ -190,44 +266,42 @@ def webhook():
         # ─────────────────────────────
         # LOOKUP CLIENT STATUS IN GAS
         # ─────────────────────────────
-        try:
-            lookup = {}
-            if GAS_WEBHOOK_URL:
+        lookup = {}
+        if GAS_WEBHOOK_URL:
+            try:
                 r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=10)
                 lookup = r.json() if r.ok else {}
-
-            if lookup.get("ok"):
-                send_client_menu(wa_number, lookup.get("client_name"))
-                return jsonify({"status": "client fallback"}), 200
-
-            # ─────────────────────────────
-            # Guest flow (unregistered)
-            # ─────────────────────────────
-            print(f"🙋 Guest detected: {profile_name} ({wa_number})")
-            try:
-                send_whatsapp_template(
-                    wa_number,
-                    TEMPLATE_GUEST_WELCOME,
-                    TEMPLATE_LANG,
-                    [profile_name or "there"]
-                )
-                print(f"✅ Guest template sent via {TEMPLATE_GUEST_WELCOME} to {wa_number}")
             except Exception as e:
-                print(f"⚠️ Template send failed ({e}), using text fallback.")
-                guest_msg = (
-                    "🤖 Hello! This is the PilatesHQ Chatbot.\n\n"
-                    "This WhatsApp number is reserved for *registered clients* "
-                    "to manage bookings, reminders, and invoices.\n\n"
-                    "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 084 313 1635, "
-                    "email 📧 lu@pilateshq.co.za, or visit 🌐 www.pilateshq.co.za 💜"
-                )
-                send_whatsapp_text(wa_number, guest_msg)
-            print("✅ Guest politely redirected (no lead created)")
-            return jsonify({"status": "guest message"}), 200
+                print(f"⚠️ GAS lookup failed: {e}")
 
+        if lookup.get("ok"):
+            send_client_menu(wa_number, lookup.get("client_name"))
+            return jsonify({"status": "client fallback"}), 200
+
+        # ─────────────────────────────
+        # Guest flow (unregistered)
+        # ─────────────────────────────
+        print(f"🙋 Guest detected: {profile_name} ({wa_number})")
+        try:
+            send_whatsapp_template(
+                wa_number,
+                TEMPLATE_GUEST_WELCOME,
+                TEMPLATE_LANG,
+                [profile_name or "there"],
+            )
+            print(f"✅ Guest template sent via {TEMPLATE_GUEST_WELCOME} to {wa_number}")
         except Exception as e:
-            print(f"⚠️ Lookup or guest handling failed: {e}")
-            return jsonify({"status": "lookup error"}), 200
+            print(f"⚠️ Template send failed ({e}), using text fallback.")
+            guest_msg = (
+                "🤖 Hello! This is the PilatesHQ Chatbot.\n\n"
+                "This WhatsApp number is reserved for *registered clients* "
+                "to manage bookings, reminders, and invoices.\n\n"
+                "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 084 313 1635, "
+                "email 📧 lu@pilateshq.co.za, or visit 🌐 www.pilateshq.co.za 💜"
+            )
+            send_whatsapp_text(wa_number, guest_msg)
+        print("✅ Guest politely redirected (no lead created)")
+        return jsonify({"status": "guest message"}), 200
 
     except Exception as e:
         print(f"❌ Webhook processing error: {e}")
