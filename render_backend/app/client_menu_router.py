@@ -1,10 +1,10 @@
 """
-client_menu_router.py – Phase 26C (Interactive Menu v2)
+client_menu_router.py – Phase 27 (Template-Only Weekly Schedule)
 ────────────────────────────────────────────────────────────
-Adds active button handling for new 3-option WhatsApp menu:
-  1️⃣ My Schedule → GAS export_sessions_today
-  2️⃣ Check Availability → GAS get_group_availability
-  3️⃣ View Latest Invoice → Flask /invoices/review-one
+Enhancement:
+ • Replaces daily PDF with one-line 7-day schedule summary.
+ • Uses Meta template: client_generic_alert_us.
+ • No attachments or newlines.
 ────────────────────────────────────────────────────────────
 """
 
@@ -18,7 +18,6 @@ from .utils import (
     send_whatsapp_text,
     normalize_wa
 )
-from .client_reschedule_handler import handle_reschedule_event
 
 bp = Blueprint("client_menu", __name__)
 log = logging.getLogger(__name__)
@@ -27,6 +26,7 @@ log = logging.getLogger(__name__)
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 MENU_TEMPLATE = "pilateshq_menu_main"
+CLIENT_ALERT_TEMPLATE = "client_generic_alert_us"
 ADMIN_TEMPLATE = "admin_generic_alert_us"
 GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
@@ -50,7 +50,7 @@ def send_client_menu(wa_number: str, name: str = "there"):
 
 
 # ─────────────────────────────────────────────────────────────
-# Button payload handler
+# Button payload handler (7-day schedule)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/action", methods=["POST"])
 def handle_client_action():
@@ -63,14 +63,21 @@ def handle_client_action():
     log.info(f"[client_menu] Action received: {action} from {wa_number}")
 
     try:
-        # 1️⃣ My Schedule
+        # 1️⃣ My Schedule – now sends 7-day summary via template only
         if "schedule" in action:
             if GAS_WEBHOOK_URL:
-                r = requests.post(GAS_WEBHOOK_URL, json={"action": "export_sessions_today"}, timeout=20)
+                r = requests.post(GAS_WEBHOOK_URL, json={"action": "export_sessions_week", "wa_number": wa_number}, timeout=20)
                 if r.ok:
-                    send_safe_message(wa_number, "📅 Here's your PilatesHQ schedule for today (check your WhatsApp Media tab).")
-                    return jsonify({"ok": True, "routed": "schedule"}), 200
-            send_whatsapp_text(wa_number, "⚠️ Unable to fetch schedule right now.")
+                    result = r.json()
+                    summary = result.get("summary", "")
+                    if summary:
+                        send_whatsapp_template(wa_number, CLIENT_ALERT_TEMPLATE, TEMPLATE_LANG, [summary])
+                        log.info(f"📆 Sent 7-day schedule template to {wa_number}")
+                        return jsonify({"ok": True, "summary": summary}), 200
+                    else:
+                        send_whatsapp_text(wa_number, "📭 No booked sessions found in the next 7 days.")
+                        return jsonify({"ok": True, "summary": "none"}), 200
+            send_whatsapp_text(wa_number, "⚠️ Unable to fetch your schedule right now.")
             return jsonify({"ok": False}), 200
 
         # 2️⃣ Check Availability
