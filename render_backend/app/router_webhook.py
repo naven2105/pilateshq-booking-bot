@@ -1,19 +1,19 @@
 """
-router_webhook.py – Phase 26B (Final Guest Handling + GAS Integration)
+router_webhook.py – Phase 26C (Lean Logging + Guest Template + GAS Integration)
 ────────────────────────────────────────────────────────────
 Handles all incoming Meta Webhook events (GET verify + POST messages).
 
-✅  Includes:
- •  Extracts contact name from ‘contacts’
- •  Admin commands:
+✅ Includes:
+ • Extracts contact name from ‘contacts’
+ • Admin commands:
       – book / suspend / resume / deactivate
       – invoice {client}
       – unpaid invoices / credits
       – export clients / today / week
       – birthdays digest
- •  🔁 Client & Admin reschedule handling
- •  🧭 Client Self-Service Menu trigger (“menu”, “help”)
- •  Context-aware fallback:
+ • 🔁 Client & Admin reschedule handling
+ • 🧭 Client Self-Service Menu trigger (“menu”, “help”)
+ • Context-aware fallback:
       – Admin → WhatsApp template (admin_generic_alert_us)
       – Client → shows menu
       – Guest → Meta template (guest_welcome_us) or fallback text
@@ -39,7 +39,7 @@ NADINE_WA         = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG     = os.getenv("TEMPLATE_LANG", "en_US")
 TEMPLATE_GUEST_WELCOME = os.getenv("TEMPLATE_GUEST_WELCOME", "guest_welcome_us")
 GAS_WEBHOOK_URL   = os.getenv("GAS_WEBHOOK_URL", "")
-APPS_SCRIPT_URL   = os.getenv("APPS_SCRIPT_URL", "")
+DEBUG_MODE        = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
@@ -85,7 +85,27 @@ def verify():
 @router_bp.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
-    print("📩 Incoming webhook:", json.dumps(data, indent=2))
+
+    # ── Condensed Logging ─────────────────────────────────────
+    if DEBUG_MODE:
+        print("📩 Full webhook (DEBUG):", json.dumps(data, indent=2))
+    else:
+        try:
+            entry = (data.get("entry") or [{}])[0]
+            change = (entry.get("changes") or [{}])[0]
+            value = change.get("value", {})
+            if "messages" in value:
+                msg = value["messages"][0]
+                wa_number = msg.get("from", "")
+                msg_text = msg.get("text", {}).get("body", "")
+                contacts = value.get("contacts", [])
+                profile = contacts[0]["profile"]["name"] if contacts else "Unknown"
+                print(f"💬 {profile} ({wa_number}) → {msg_text}")
+            elif "statuses" in value:
+                status = value["statuses"][0]
+                print(f"📬 {status.get('recipient_id')} → {status.get('status')}")
+        except Exception as e:
+            print(f"⚠️ Log parse failed: {e}")
 
     try:
         entry  = (data.get("entry") or [{}])[0]
@@ -94,13 +114,10 @@ def webhook():
 
         # ── STATUS EVENTS ────────────────────────────────────────
         if "statuses" in value:
-            status = value["statuses"][0]
-            print(f"📬 Delivery status → {status.get('id')} = {status.get('status')}")
             return jsonify({"ok": True, "type": "status"}), 200
 
         # ── MESSAGE EVENTS ───────────────────────────────────────
         if "messages" not in value:
-            print("⚠️ Unhandled webhook event:", value)
             return jsonify({"ok": True, "type": "ignored"}), 200
 
         msg = value["messages"][0]
@@ -109,8 +126,6 @@ def webhook():
         lower_text = msg_text.lower()
         contacts = value.get("contacts", [])
         profile_name = contacts[0]["profile"]["name"] if contacts else "Unknown"
-
-        print(f"💬 {profile_name} ({wa_number}) → {msg_text}")
 
         # ─────────────────────────────
         # ADMIN COMMANDS (Nadine only)
@@ -145,7 +160,7 @@ def webhook():
                     notify_admin(f"Unpaid request failed: {e}")
                 return jsonify({"status": "unpaid handled"}), 200
 
-            # Export commands (clients/today/week)
+            # Export commands
             if lower_text.startswith("export"):
                 if not GAS_WEBHOOK_URL:
                     notify_admin("GAS webhook not configured.")
@@ -163,25 +178,15 @@ def webhook():
                     return jsonify({"status": "unknown export"}), 200
 
                 action, label = matched
-                success = False
-                pdf_link = None
-
-                for attempt in range(2):
-                    try:
-                        r = requests.post(GAS_WEBHOOK_URL, json={"action": action}, timeout=25)
-                        if r.ok:
-                            data = r.json()
-                            if data.get("ok") and data.get("pdf_link"):
-                                pdf_link = data["pdf_link"]
-                                success = True
-                                break
-                    except Exception as e:
-                        print(f"⚠️ Export attempt {attempt+1} failed: {e}")
-                    time.sleep(1.2)
-
-                msg = f"{label} ready: {pdf_link}" if success else f"{label} export failed"
-                notify_admin(msg)
-                return jsonify({"status": "export handled", "ok": success}), 200
+                try:
+                    r = requests.post(GAS_WEBHOOK_URL, json={"action": action}, timeout=25)
+                    if r.ok and r.json().get("ok"):
+                        notify_admin(f"{label} export completed successfully.")
+                    else:
+                        notify_admin(f"{label} export failed.")
+                except Exception as e:
+                    notify_admin(f"Export error: {e}")
+                return jsonify({"status": "export handled"}), 200
 
             # Deactivate client
             if lower_text.startswith("deactivate "):
@@ -201,15 +206,14 @@ def webhook():
                 try:
                     r = requests.post(GAS_WEBHOOK_URL, json={"action": "weekly_birthdays_digest"}, timeout=30)
                     if r.ok:
-                        data = r.json()
-                        notify_admin(f"🎂 Birthdays digest: {data.get('summary', 'No birthdays this week.')}")
+                        notify_admin("🎂 Birthdays digest completed.")
                     else:
-                        notify_admin("Birthdays digest failed")
+                        notify_admin("Birthdays digest failed.")
                 except Exception as e:
                     notify_admin(f"Digest error: {e}")
                 return jsonify({"status": "birthdays handled"}), 200
 
-            # Admin fallback (unrecognised)
+            # Admin fallback
             send_whatsapp_template(
                 wa_number,
                 "admin_generic_alert_us",
@@ -233,17 +237,18 @@ def webhook():
         # LOOKUP CLIENT STATUS IN GAS
         # ─────────────────────────────
         try:
-            lookup = {}
             if GAS_WEBHOOK_URL:
                 r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=10)
                 lookup = r.json() if r.ok else {}
+            else:
+                lookup = {}
 
             if lookup.get("ok"):
                 send_client_menu(wa_number, lookup.get("client_name"))
                 return jsonify({"status": "client fallback"}), 200
 
             # ─────────────────────────────
-            # Guest flow (unregistered user)
+            # Guest flow (unregistered)
             # ─────────────────────────────
             print(f"🙋 Guest detected: {profile_name} ({wa_number})")
             try:
