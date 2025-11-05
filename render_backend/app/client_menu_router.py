@@ -1,10 +1,11 @@
 """
-client_menu_router.py – Phase 27 (Template-Only Weekly Schedule)
+client_menu_router.py – Phase 27E (Unified REQUEST_TIMEOUT Config)
 ────────────────────────────────────────────────────────────
 Enhancement:
- • Replaces daily PDF with one-line 7-day schedule summary.
- • Uses Meta template: client_generic_alert_us.
- • No attachments or newlines.
+ • Centralises all network request timeouts under REQUEST_TIMEOUT
+ • Default = 35 seconds, override via environment variable
+ • Fully consistent with router_webhook.py
+ • Still sends weekly summary using WhatsApp template client_generic_alert_us
 ────────────────────────────────────────────────────────────
 """
 
@@ -30,6 +31,9 @@ CLIENT_ALERT_TEMPLATE = "client_generic_alert_us"
 ADMIN_TEMPLATE = "admin_generic_alert_us"
 GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
+
+# Global timeout (default 35s, override via environment)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 
 # GAS & local endpoints
 INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
@@ -63,19 +67,30 @@ def handle_client_action():
     log.info(f"[client_menu] Action received: {action} from {wa_number}")
 
     try:
-        # 1️⃣ My Schedule – now sends 7-day summary via template only
+        # 1️⃣ My Schedule – sends 7-day summary via template
         if "schedule" in action:
             if GAS_WEBHOOK_URL:
-                r = requests.post(GAS_WEBHOOK_URL, json={"action": "export_sessions_week", "wa_number": wa_number}, timeout=20)
+                r = requests.post(
+                    GAS_WEBHOOK_URL,
+                    json={"action": "export_sessions_week", "wa_number": wa_number},
+                    timeout=REQUEST_TIMEOUT
+                )
                 if r.ok:
                     result = r.json()
                     summary = result.get("summary", "")
                     if summary:
-                        send_whatsapp_template(wa_number, CLIENT_ALERT_TEMPLATE, TEMPLATE_LANG, [summary])
+                        send_whatsapp_template(
+                            wa_number,
+                            CLIENT_ALERT_TEMPLATE,
+                            TEMPLATE_LANG,
+                            [summary]
+                        )
                         log.info(f"📆 Sent 7-day schedule template to {wa_number}")
                         return jsonify({"ok": True, "summary": summary}), 200
                     else:
-                        send_whatsapp_text(wa_number, "📭 No booked sessions found in the next 7 days.")
+                        send_whatsapp_text(
+                            wa_number, "📭 No booked sessions found in the next 7 days."
+                        )
                         return jsonify({"ok": True, "summary": "none"}), 200
             send_whatsapp_text(wa_number, "⚠️ Unable to fetch your schedule right now.")
             return jsonify({"ok": False}), 200
@@ -83,10 +98,19 @@ def handle_client_action():
         # 2️⃣ Check Availability
         if "availability" in action:
             if GAS_WEBHOOK_URL:
-                r = requests.post(GAS_WEBHOOK_URL, json={"action": "get_group_availability"}, timeout=20)
+                r = requests.post(
+                    GAS_WEBHOOK_URL,
+                    json={"action": "get_group_availability"},
+                    timeout=REQUEST_TIMEOUT
+                )
                 if r.ok:
-                    send_safe_message(wa_number, "✅ Nadine will confirm your slot shortly. Thank you for checking availability!")
-                    send_safe_message(NADINE_WA, f"📩 Client *{name}* ({wa_number}) checked availability.")
+                    send_safe_message(
+                        wa_number,
+                        "✅ Nadine will confirm your slot shortly. Thank you for checking availability!"
+                    )
+                    send_safe_message(
+                        NADINE_WA, f"📩 Client *{name}* ({wa_number}) checked availability."
+                    )
                     return jsonify({"ok": True, "routed": "availability"}), 200
             send_whatsapp_text(wa_number, "⚠️ Unable to check availability right now.")
             return jsonify({"ok": False}), 200
@@ -94,9 +118,16 @@ def handle_client_action():
         # 3️⃣ View Latest Invoice
         if "invoice" in action:
             try:
-                r = requests.post(INVOICE_ENDPOINT, json={"client_name": name}, timeout=15)
+                r = requests.post(
+                    INVOICE_ENDPOINT,
+                    json={"client_name": name},
+                    timeout=REQUEST_TIMEOUT
+                )
                 if r.ok:
-                    send_safe_message(wa_number, "🧾 Your latest invoice has been sent via WhatsApp and email.")
+                    send_safe_message(
+                        wa_number,
+                        "🧾 Your latest invoice has been sent via WhatsApp and email."
+                    )
                     return jsonify({"ok": True, "routed": "invoice"}), 200
             except Exception as e:
                 log.warning(f"Invoice error: {e}")
@@ -104,7 +135,10 @@ def handle_client_action():
             return jsonify({"ok": False}), 200
 
         # Unrecognised payload
-        send_whatsapp_text(wa_number, "❓Sorry, I didn’t understand that option. Please type *menu* to try again.")
+        send_whatsapp_text(
+            wa_number,
+            "❓Sorry, I didn’t understand that option. Please type *menu* to try again."
+        )
         return jsonify({"ok": False, "error": "unknown payload"}), 400
 
     except Exception as e:
@@ -131,4 +165,8 @@ def send_menu_api():
 @bp.route("", methods=["GET"])
 @bp.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "client_menu_router"}), 200
+    return jsonify({
+        "status": "ok",
+        "service": "client_menu_router",
+        "timeout": REQUEST_TIMEOUT
+    }), 200
