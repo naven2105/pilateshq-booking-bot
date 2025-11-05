@@ -1,11 +1,12 @@
 """
-router_webhook.py – Phase 26D (Interactive Buttons + Lean Logging + GAS Integration)
+router_webhook.py – Phase 26E (Unified Timeout + Interactive Buttons + Lean Logging)
 ────────────────────────────────────────────────────────────
 Handles all incoming Meta Webhook events (GET verify + POST messages).
 
 ✅ Includes:
  • Extracts contact name from ‘contacts’
  • Detects interactive replies (buttons / lists) → forwards to /client-menu/action
+ • Centralised timeout constant for all network requests (REQUEST_TIMEOUT = 20)
  • Admin commands:
       – book / suspend / resume / deactivate
       – invoice {client}
@@ -42,10 +43,14 @@ TEMPLATE_GUEST_WELCOME = os.getenv("TEMPLATE_GUEST_WELCOME", "guest_welcome_us")
 GAS_WEBHOOK_URL        = os.getenv("GAS_WEBHOOK_URL", "")
 DEBUG_MODE             = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
+# ── Endpoint constants ────────────────────────────────────────
 STANDING_ENDPOINT = f"{WEBHOOK_BASE}/tasks/standing/command"
 INVOICE_ENDPOINT  = f"{WEBHOOK_BASE}/invoices/review-one"
 UNPAID_ENDPOINT   = f"{WEBHOOK_BASE}/invoices/unpaid"
 CLIENT_MENU_ACTION_ENDPOINT = f"{WEBHOOK_BASE}/client-menu/action"
+
+# ── Global timeout constant (seconds) ─────────────────────────
+REQUEST_TIMEOUT = 20   # ⏱️ All outbound request.post() calls use this timeout
 
 # ─────────────────────────────────────────────────────────────
 # Helper: Admin template notification
@@ -85,24 +90,19 @@ def extract_message_text(msg: dict) -> str:
     """
     mtype = (msg.get("type") or "").lower()
 
-    # Plain text message
     if mtype == "text":
         body = (msg.get("text") or {}).get("body", "") or ""
         return body.strip().upper()
 
-    # Interactive replies (buttons / lists)
     if mtype == "interactive":
         i = msg.get("interactive") or {}
         btn = i.get("button_reply")
         if btn:
-            # Prefer developer-stable IDs; fallback to visible title
             return (btn.get("id") or btn.get("title") or "").strip().upper()
-
         lst = i.get("list_reply")
         if lst:
             return (lst.get("id") or lst.get("title") or "").strip().upper()
 
-    # Other types: return empty string
     return ""
 
 # ─────────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ def forward_client_action(payload: str, wa_number: str, name: str):
         requests.post(
             CLIENT_MENU_ACTION_ENDPOINT,
             json={"wa_number": wa_number, "name": name, "payload": payload},
-            timeout=10
+            timeout=REQUEST_TIMEOUT
         )
         print(f"➡️ Forwarded action '{payload}' to client_menu_router for {wa_number}")
     except Exception as e:
@@ -141,7 +141,6 @@ def verify():
 def webhook():
     data = request.get_json(force=True)
 
-    # Lean logging
     if DEBUG_MODE:
         print("📩 Full webhook (DEBUG):", json.dumps(data, indent=2))
     else:
@@ -167,11 +166,8 @@ def webhook():
         change = (entry.get("changes") or [{}])[0]
         value  = change.get("value", {})
 
-        # Status events
         if "statuses" in value:
             return jsonify({"ok": True, "type": "status"}), 200
-
-        # Message events only
         if "messages" not in value:
             return jsonify({"ok": True, "type": "ignored"}), 200
 
@@ -179,45 +175,33 @@ def webhook():
         wa_number = msg.get("from", "")
         contacts = value.get("contacts", [])
         profile_name = contacts[0]["profile"]["name"] if contacts else "Unknown"
-
-        # Normalized message text / interactive payload
-        cmd = extract_message_text(msg)  # <-- critical fix
+        cmd = extract_message_text(msg)
         lower_text = cmd.lower()
 
         # ─────────────────────────────
-        # ADMIN COMMANDS (Nadine only)
+        # ADMIN COMMANDS
         # ─────────────────────────────
         if wa_number == NADINE_WA:
             if any(lower_text.startswith(c) for c in ["book ", "suspend ", "resume "]):
-                try:
-                    r = requests.post(STANDING_ENDPOINT, json={"from": wa_number, "text": cmd}, timeout=10)
-                    notify_admin(f"Standing command processed ({r.status_code})")
-                except Exception as e:
-                    notify_admin(f"Standing command error: {e}")
+                r = requests.post(STANDING_ENDPOINT, json={"from": wa_number, "text": cmd}, timeout=REQUEST_TIMEOUT)
+                notify_admin(f"Standing command processed ({r.status_code})")
                 return jsonify({"status": "standing handled"}), 200
 
             if lower_text.startswith("invoice "):
                 client_name = cmd.split(" ", 1)[1].strip()
-                try:
-                    requests.post(INVOICE_ENDPOINT, json={"client_name": client_name}, timeout=10)
-                    notify_admin(f"Invoice sent for {client_name}")
-                except Exception as e:
-                    notify_admin(f"Invoice error: {e}")
+                requests.post(INVOICE_ENDPOINT, json={"client_name": client_name}, timeout=REQUEST_TIMEOUT)
+                notify_admin(f"Invoice sent for {client_name}")
                 return jsonify({"status": "invoice handled"}), 200
 
             if lower_text in ["unpaid invoices", "check invoices"]:
-                try:
-                    requests.post(UNPAID_ENDPOINT, json={"action": "list_overdue_invoices"}, timeout=15)
-                    notify_admin("Unpaid invoices summary requested")
-                except Exception as e:
-                    notify_admin(f"Unpaid request failed: {e}")
+                requests.post(UNPAID_ENDPOINT, json={"action": "list_overdue_invoices"}, timeout=REQUEST_TIMEOUT)
+                notify_admin("Unpaid invoices summary requested")
                 return jsonify({"status": "unpaid handled"}), 200
 
             if lower_text.startswith("export"):
                 if not GAS_WEBHOOK_URL:
                     notify_admin("GAS webhook not configured.")
                     return jsonify({"status": "missing GAS"}), 200
-
                 mapping = {
                     "clients": ("export_clients", "Clients Register"),
                     "today": ("export_sessions_today", "Today's Sessions"),
@@ -228,37 +212,21 @@ def webhook():
                     notify_admin("Unknown export command.")
                     return jsonify({"status": "unknown export"}), 200
                 action, label = matched
-                try:
-                    r = requests.post(GAS_WEBHOOK_URL, json={"action": action}, timeout=25)
-                    if r.ok and r.json().get("ok"):
-                        notify_admin(f"{label} export completed.")
-                    else:
-                        notify_admin(f"{label} export failed.")
-                except Exception as e:
-                    notify_admin(f"Export error: {e}")
+                r = requests.post(GAS_WEBHOOK_URL, json={"action": action}, timeout=REQUEST_TIMEOUT)
+                notify_admin(f"{label} export {'completed' if r.ok else 'failed'}.")
                 return jsonify({"status": "export handled"}), 200
 
             if lower_text.startswith("deactivate "):
                 client_name = cmd.split(" ", 1)[1].strip()
-                try:
-                    r = requests.post(GAS_WEBHOOK_URL, json={"action": "deactivate_client", "client_name": client_name}, timeout=20)
-                    if r.ok and r.json().get("ok"):
-                        notify_admin(f"Deactivated {client_name}")
-                    else:
-                        notify_admin(f"Could not deactivate {client_name}")
-                except Exception as e:
-                    notify_admin(f"Deactivate error: {e}")
+                r = requests.post(GAS_WEBHOOK_URL, json={"action": "deactivate_client", "client_name": client_name}, timeout=REQUEST_TIMEOUT)
+                notify_admin(f"Deactivated {client_name}" if r.ok else f"Could not deactivate {client_name}")
                 return jsonify({"status": "deactivate handled"}), 200
 
             if lower_text in ["birthdays", "birthdays test"]:
-                try:
-                    r = requests.post(GAS_WEBHOOK_URL, json={"action": "weekly_birthdays_digest"}, timeout=30)
-                    notify_admin("🎂 Birthdays digest completed." if r.ok else "Birthdays digest failed.")
-                except Exception as e:
-                    notify_admin(f"Digest error: {e}")
+                r = requests.post(GAS_WEBHOOK_URL, json={"action": "weekly_birthdays_digest"}, timeout=REQUEST_TIMEOUT)
+                notify_admin("🎂 Birthdays digest completed." if r.ok else "Birthdays digest failed.")
                 return jsonify({"status": "birthdays handled"}), 200
 
-            # Admin fallback
             send_whatsapp_template(
                 wa_number,
                 "admin_generic_alert_us",
@@ -270,59 +238,51 @@ def webhook():
         # ─────────────────────────────
         # CLIENT MENU / ACTIONS
         # ─────────────────────────────
-        # Explicit menu keywords
-        if lower_text in ["MENU", "HELP", "HI", "HELLO", "START"]:
+        if lower_text in ["menu", "help", "hi", "hello", "start"]:
             send_client_menu(wa_number, profile_name)
             return jsonify({"status": "menu sent"}), 200
 
-        # Interactive button payloads from the 3-option template
         if cmd in ("MY_SCHEDULE", "CHECK_AVAILABILITY", "VIEW_INVOICE"):
             forward_client_action(cmd, wa_number, profile_name)
             return jsonify({"status": "client action forwarded", "payload": cmd}), 200
 
-        # Reschedule keywords (free text)
-        if any(x in lower_text for x in ["RESCHEDULE", "CANCEL", "CAN'T MAKE", "CANT MAKE", "NO SHOW", "NOSHOW", "SKIP"]):
+        if any(x in lower_text for x in ["reschedule", "cancel", "can't make", "cant make", "no show", "noshow", "skip"]):
             return handle_reschedule_event(profile_name, wa_number, cmd, is_admin=False)
 
         # ─────────────────────────────
-        # LOOKUP CLIENT STATUS IN GAS
+        # LOOKUP CLIENT STATUS
         # ─────────────────────────────
+        lookup = {}
+        if GAS_WEBHOOK_URL:
+            r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=REQUEST_TIMEOUT)
+            lookup = r.json() if r.ok else {}
+
+        if lookup.get("ok"):
+            send_client_menu(wa_number, lookup.get("client_name"))
+            return jsonify({"status": "client fallback"}), 200
+
+        # Guest flow
+        print(f"🙋 Guest detected: {profile_name} ({wa_number})")
         try:
-            lookup = {}
-            if GAS_WEBHOOK_URL:
-                r = requests.post(GAS_WEBHOOK_URL, json={"action": "lookup_client_name", "wa_number": wa_number}, timeout=10)
-                lookup = r.json() if r.ok else {}
-
-            if lookup.get("ok"):
-                send_client_menu(wa_number, lookup.get("client_name"))
-                return jsonify({"status": "client fallback"}), 200
-
-            # Guest flow
-            print(f"🙋 Guest detected: {profile_name} ({wa_number})")
-            try:
-                send_whatsapp_template(
-                    wa_number,
-                    TEMPLATE_GUEST_WELCOME,
-                    TEMPLATE_LANG,
-                    [profile_name or "there"]
-                )
-                print(f"✅ Guest template sent via {TEMPLATE_GUEST_WELCOME} to {wa_number}")
-            except Exception as e:
-                print(f"⚠️ Template send failed ({e}), using text fallback.")
-                guest_msg = (
-                    "🤖 Hello! This is the PilatesHQ Chatbot.\n\n"
-                    "This WhatsApp number is reserved for *registered clients* "
-                    "to manage bookings, reminders, and invoices.\n\n"
-                    "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 084 313 1635, "
-                    "email 📧 lu@pilateshq.co.za, or visit 🌐 www.pilateshq.co.za 💜"
-                )
-                send_whatsapp_text(wa_number, guest_msg)
-            print("✅ Guest politely redirected (no lead created)")
-            return jsonify({"status": "guest message"}), 200
-
+            send_whatsapp_template(
+                wa_number,
+                TEMPLATE_GUEST_WELCOME,
+                TEMPLATE_LANG,
+                [profile_name or "there"]
+            )
+            print(f"✅ Guest template sent via {TEMPLATE_GUEST_WELCOME}")
         except Exception as e:
-            print(f"⚠️ Lookup or guest handling failed: {e}")
-            return jsonify({"status": "lookup error"}), 200
+            print(f"⚠️ Template send failed ({e}), using text fallback.")
+            guest_msg = (
+                "🤖 Hello! This is the PilatesHQ Chatbot.\n\n"
+                "This WhatsApp number is reserved for *registered clients* "
+                "to manage bookings, reminders, and invoices.\n\n"
+                "If you’d like to start Pilates or learn more, please contact *Nadine* directly 📱 084 313 1635, "
+                "email 📧 lu@pilateshq.co.za, or visit 🌐 www.pilateshq.co.za 💜"
+            )
+            send_whatsapp_text(wa_number, guest_msg)
+        print("✅ Guest politely redirected (no lead created)")
+        return jsonify({"status": "guest message"}), 200
 
     except Exception as e:
         print(f"❌ Webhook processing error: {e}")
@@ -333,7 +293,6 @@ def webhook():
 # ─────────────────────────────────────────────────────────────
 @router_bp.route("/test_send", methods=["POST"])
 def test_send():
-    """Manual send for testing."""
     try:
         data = request.get_json(force=True)
         to = data.get("to")
