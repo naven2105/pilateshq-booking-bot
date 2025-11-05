@@ -29,6 +29,7 @@ from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, send_whatsapp_text, send_whatsapp_template
 from .client_reschedule_handler import handle_reschedule_event
 from .client_menu_router import send_client_menu, handle_client_action
+from .client_menu_router import handle_client_action as handle_client_action_inner
 
 # ─────────────────────────────────────────────────────────────
 router_bp = Blueprint("router_bp", __name__)
@@ -164,6 +165,20 @@ def webhook():
         if msg_type == "interactive" and msg_text:
             handle_client_action()
             return jsonify({"status": "interactive handled"}), 200
+
+        if msg_type == "interactive" and msg_text:
+            action_payload = {
+                "wa_number": wa_number,
+                "name": profile_name,
+                "payload": msg_text.upper().strip(),
+            }
+            try:
+                handle_client_action_inner(action_payload)
+                return jsonify({"status": "interactive handled", "payload": msg_text}), 200
+            except Exception as e:      
+                print(f"⚠️ handle_client_action failed: {e}")
+                send_whatsapp_text(wa_number, "⚠️ Sorry, something went wrong processing your selection.")
+                return jsonify({"status": "interactive error"}), 500
 
         if lower_text in ["menu", "help"]:
             send_client_menu(wa_number, profile_name)
