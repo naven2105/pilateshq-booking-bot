@@ -38,7 +38,7 @@ WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 
 # GAS & local endpoints
-INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
+INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoice/review-one"
 
 
 # ─────────────────────────────────────────────────────────────
