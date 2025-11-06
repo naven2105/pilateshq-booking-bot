@@ -1,13 +1,11 @@
 """
-client_menu_router.py – Phase 27J (NLP Stable + Diagnostics)
+client_menu_router.py – Phase 27K (Invoice Delivery Fix + NLP Stable)
 ────────────────────────────────────────────────────────────
 Enhancement:
- • Adds NLP normaliser for flexible text (e.g. “invoices”, “share invoice”)
- • Simplifies action checks (exact match vs substring)
- • Logs both raw and normalised input for easier debugging
- • Keeps only:
-      1️⃣ My Schedule → 7-day summary via GAS
-      2️⃣ View Latest Invoice → latest invoice delivery
+ • Fix: Invoice delivery now includes client wa_number in payload
+   → prevents fallback to NADINE_WA.
+ • Keeps NLP normalisation (invoice / invoices / share invoice / etc.)
+ • Logs raw + normalised inputs for diagnosis
  • Unified REQUEST_TIMEOUT from environment (default 35 s)
 ────────────────────────────────────────────────────────────
 """
@@ -143,11 +141,9 @@ def handle_client_action():
         if action == "view_invoice" and not handled:
             handled = True
             try:
-                r = requests.post(
-                    INVOICE_ENDPOINT,
-                    json={"client_name": name},
-                    timeout=REQUEST_TIMEOUT,
-                )
+                # Include wa_number in payload to prevent fallback to admin
+                payload = {"client_name": name, "wa_number": wa_number}
+                r = requests.post(INVOICE_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT)
                 log.info(
                     f"🧾 Invoice request → HTTP {r.status_code} | body={r.text[:200]}"
                 )
