@@ -320,6 +320,31 @@ def log_payment():
         log.exception("log_payment error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+# ─────────────────────────────────────────────────────────────
+# /invoices/review-one
+# ─────────────────────────────────────────────────────────────
+@bp.route("/review-one", methods=["POST"])
+def review_one_invoice():
+    """
+    Client self-service: latest invoice delivery (WhatsApp + Email).
+    Triggered via /client-menu/action when client taps 'View Latest Invoice'.
+    """
+    try:
+        data = request.get_json(force=True)
+        client_name = (data.get("client_name") or "").strip()
+        if not client_name:
+            return jsonify({"ok": False, "error": "Missing client_name"}), 400
+
+        # Reuse the dual-delivery function
+        from .invoices_router import send_invoice_dual
+        return send_invoice_dual()
+
+    except Exception as e:
+        log.exception("review_one_invoice error")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ─────────────────────────────────────────────────────────────
 # Health routes
 # ─────────────────────────────────────────────────────────────
