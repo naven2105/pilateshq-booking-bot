@@ -9,16 +9,16 @@ Now delegates menu display to utils.trigger_client_menu().
 from __future__ import annotations
 import logging
 from typing import Optional
-from .utils import (
+from .render_backend.app.utils import (
     send_whatsapp_text,
     normalize_wa,
     safe_execute,
     trigger_client_menu,
 )
-from . import client_bookings, client_attendance
-from .invoices import send_invoice
-from .client_reschedule_handler import handle_reschedule_event
-from .config import NADINE_WA
+from .render_backend.app import client_bookings, client_attendance
+from .render_backend.app.invoices import send_invoice
+from .render_backend.app.client_reschedule_handler import handle_reschedule_event
+from .render_backend.app.config import NADINE_WA
 
 log = logging.getLogger(__name__)
 

@@ -22,21 +22,22 @@ The Render server remains online to process instant WhatsApp events and bridge t
 
 ---
 
-## 🗂️ Folder Structure (Phase 17)
+## 🗂️ Folder Structure (Phase 30)
 
 | File | Purpose |
 |------|----------|
-| `app/__init__.py` | Registers all Flask blueprints — unified architecture (v1.7.0) |
+| `app/__init__.py` | Registers all Flask blueprints — unified architecture (v1.10.0) |
 | `app/router_webhook.py` | Core WhatsApp Cloud API event listener |
-| `app/tasks_router.py` | GAS-triggered reminders (morning / evening / week-ahead / birthdays) |
+| `app/tasks_router.py` | **Phase 30** reminders (`/tasks/reminder/morning`, `/tasks/reminder/evening`) + client reminders |
 | `app/tasks_sheets.py` | Shared Google Sheets read/write utilities |
 | `app/client_reminders.py` | Sends Meta-approved templates to clients |
 | `app/package_events.py` | Handles credit usage and low-balance alerts |
-| `app/invoices_router.py` | ✅ Unified Invoices + Payments — PDF generation, delivery, and logging |
+| `app/invoices_router.py` | ✅ Unified Invoices + Payments — PDF generation, delivery, logging, **/invoices/confirm** |
 | `app/schedule_router.py` | ✅ Bookings + Reschedules + Admin Digests |
 | `app/dashboard_router.py` | Weekly & monthly studio insight reports |
 | `app/admin_actions_router.py` | NLP admin commands (discounts, session type changes) |
 | `app/standing_router.py` | Recurring slot (“standing booking”) management |
+| `app/admin_exports_router.py` | Phase 29: Client / Session Exports + UAT logging |
 | `app/utils.py` | Shared helpers for WhatsApp messaging + GAS POST requests |
 | `app/tokens.py` | Secure token encoding / decoding for invoice links |
 | `app/static/pilateshq_logo.png` | Logo used in invoice PDF headers |
@@ -53,43 +54,40 @@ The Render server remains online to process instant WhatsApp events and bridge t
 |-----------|-------------|
 | META_ACCESS_TOKEN | WhatsApp Cloud API access token |
 | PHONE_NUMBER_ID | PilatesHQ Business WhatsApp ID |
+| GAS_WEBHOOK_URL | ✅ Unified GAS endpoint (v107) for exports/logging |
 | GAS_INVOICE_URL | Google Apps Script endpoint for invoices & payments |
-| GAS_SCHEDULE_URL | Google Apps Script endpoint for schedule automation |
 | CLIENT_SHEET_ID | Google Sheet ID for client / invoice data |
 | NADINE_WA | Nadine’s WhatsApp number (for admin alerts) |
 | BASE_URL | Public Render URL for secure invoice token links |
 | TEMPLATE_LANG | Default Meta template locale (e.g. en_US) |
+| SECRET_KEY | Token signing key for secure invoice links |
+| REQUEST_TIMEOUT | Global request timeout (default 35s) |
 
 *(Optional)* Gmail API credentials may still be used if direct email sending is re-enabled.
 
 ---
 
-## 💼 Phase 17 — Unified Invoices + Payments
+## 💼 Phase 30 — Automated Reminders & Invoice Flow UAT
 
-**Objective:** simplify billing automation by merging invoice delivery + payment logging into a single secure workflow.
+**Objectives**
+- GAS triggers 06h00 and 20h00 → call Flask:
+  - `POST /tasks/reminder/morning`  
+  - `POST /tasks/reminder/evening`
+- GAS posts invoice confirmations to:
+  - `POST /invoices/confirm` (records status and notifies Nadine)
 
-### Key Features
-- Auto-generate PDF invoices with studio branding and bank details.  
-- Deliver each invoice via both WhatsApp and Email.  
-- Tokenised link security (expiry within 48 hours).  
-- Payments logged directly by Nadine through bot commands or NLP input.  
-- Automatic matching of payments to open invoices (via GAS).  
-- Private WhatsApp confirmation to Nadine only — no client payment messages.  
-- Centralised GAS logging for auditing and dashboard analytics.
-
-### WhatsApp Templates Used
-- `client_generic_alert_us` – Client invoice delivery  
-- `admin_generic_alert_us` – Admin alerts and summaries  
-- `payment_logged_admin_us` – Payment confirmations (Nadine only)
+**Behaviour**
+- All reminder and invoice events send WhatsApp template alerts to Nadine.  
+- Each event appends a compact line to the GAS `Logs` tab via `append_log_event`.  
+- No CRON or APScheduler on Render — GAS orchestrates schedules.
 
 ---
 
 ## 🧩 System Integration Flow
-Client Message → Meta Webhook → Flask (router_webhook)
-└→ NLP / schedule_router / invoices_router
-└→ Google Apps Script (write to Sheets, trigger logic)
-└→ Sends summaries & dashboards back via /dashboard
-
+Client Message → Meta Webhook → Flask (router_webhook)  
+└→ NLP / schedule_router / invoices_router / tasks_router  
+└→ Google Apps Script (write to Sheets, trigger logic)  
+└→ Sends summaries & dashboards back via `/dashboard/*` and admin templates
 
 All daily / weekly triggers (e.g. reminders, dashboards, auto-invoices) originate in Google Apps Script and POST to the corresponding Flask endpoint.
 
@@ -105,41 +103,14 @@ All daily / weekly triggers (e.g. reminders, dashboards, auto-invoices) originat
 
 ---
 
-## 🔮 Future Simplification
-Once all event logic (bookings, invoices, reschedules, payments) is fully migrated to Google Apps Script or Meta Workflows,  
-this Render backend can be retired to reduce hosting costs while keeping GAS as the sole automation engine.
-
----
-
 ## 📘 Phase 25 — Reschedule Handling Policy
 
-**Purpose:** Define clear, consistent rules for how reschedules are captured, logged, and reversed within the PilatesHQ Booking Bot ecosystem.
+*(Unchanged — still active as baseline for session management)*
 
-### 1️⃣ Client-Initiated Reschedules
-- Triggered when client sends “reschedule”, “cancel”, “can’t make”, “cannot make”, “miss class”, or “skip today”.  
-- Bot response:  
-  > 💜 Got it — I’ve marked your session for rescheduling. Nadine will contact you soon.  
-- GAS marks latest booked session as `Reschedule Requested (reason=client)` and notifies Nadine.
-
-### 2️⃣ Admin-Initiated Reschedules
-- Nadine commands:  
-  - `reschedule {client}` → `Rescheduled (reason=admin)`  
-  - `{client} noshow` → `Rescheduled (reason=noshow)`  
-- Bot confirms action to Nadine in WhatsApp.
-
-### 3️⃣ Reversals / Reactivations
-- Clients cannot reverse reschedules via the bot.  
-- If client changes mind, they message Nadine directly.  
-- Nadine decides if space allows and manually reinstates the booking (via Sheets or admin tools).  
-- This keeps reversals human-approved and prevents over-booking.
-
-### 4️⃣ Data & Audit
-- GAS records date, time, trigger source (`client | admin | noshow`), and previous session state.  
-- Monthly reports can analyse reschedule frequency and reasons.
-
-### 5️⃣ Design Principle
+**Design Principle:**  
 > All automation flows one-way — from *Active → Rescheduled*.  
 > Only Nadine may reverse a reschedule manually.
 
 ---
 
+✅ **Status:** Phase 30 Ready — Reminders & Invoice Confirmations integrated

@@ -1,11 +1,10 @@
-# render_backend/app/invoices_router.py
 """
-invoices_router.py – Phase 30 (Dual Delivery + Confirmation Callback)
-─────────────────────────────────────────────────────────────────────
-• Continues dual WhatsApp + Email delivery for invoices.
-• Adds /invoices/confirm endpoint (GAS → Render) to record delivery/result.
-• Uses admin template notifications and appends a log event to GAS.
-─────────────────────────────────────────────────────────────────────
+invoices_router.py – Phase 18 (Invoice ID + Message Simplify)
+────────────────────────────────────────────────────────────
+• Adds monthly invoice ID format <Name_YYYYMM>
+• Simplifies WhatsApp message: “🧾 Invoice for <Name>”
+• Removes extra confirmation message (sent only once)
+────────────────────────────────────────────────────────────
 """
 
 import os, io, time, re, logging, requests
@@ -22,10 +21,8 @@ log = logging.getLogger(__name__)
 # ── Environment ─────────────────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
-GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")  # for append_log_event
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
 BASE_URL = os.getenv("BASE_URL", "https://pilateshq-booking-bot.onrender.com")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
 TPL_CLIENT_ALERT = "client_generic_alert_us"
@@ -34,15 +31,6 @@ TPL_PAYMENT_LOGGED = "payment_logged_admin_us"
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
 LOGO_PATH = os.path.join(STATIC_DIR, "pilateshq_logo.png")
 
-def _append_log_event(message: str, context: str):
-    """Append a compact event line to GAS Logs tab (best-effort)."""
-    if not GAS_WEBHOOK_URL:
-        return
-    try:
-        payload = {"action": "append_log_event", "sheet_id": SHEET_ID, "message": f"{context}: {message}"}
-        requests.post(GAS_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        log.debug(f"[log-append] skipped ({e})")
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
@@ -54,6 +42,7 @@ def flatten_message(text: str) -> str:
     while "  " in clean:
         clean = clean.replace("  ", " ")
     return clean.strip()
+
 
 def _post_to_gas(payload: dict, retries: int = 2) -> dict:
     for attempt in range(retries + 1):
@@ -68,6 +57,7 @@ def _post_to_gas(payload: dict, retries: int = 2) -> dict:
             log.error(f"GAS POST failed ({attempt+1}/{retries+1}): {e}")
         time.sleep(2)
     return {"ok": False, "error": "GAS communication failed"}
+
 
 # ─────────────────────────────────────────────────────────────
 # /invoices/send  → dual delivery
@@ -119,7 +109,6 @@ def send_invoice_dual():
                 "message": f"{client_name} | Email={email_status}",
             }
         )
-        _append_log_event(f"{client_name} | Email={email_status}", "invoices/send")
 
         return jsonify(
             {
@@ -140,8 +129,8 @@ def send_invoice_dual():
             variables=[flatten_message(f"❌ send_invoice_dual error: {e}")],
             label="invoice_dual_error",
         )
-        _append_log_event(str(e), "invoices/send_error")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # ─────────────────────────────────────────────────────────────
 # /invoices/view/<token>  → secure PDF
@@ -211,6 +200,7 @@ def view_invoice(token):
         download_name=f"{client_name.replace(' ', '_')}_{invoice_id}.pdf",
     )
 
+
 # ─────────────────────────────────────────────────────────────
 # /invoices/review-one
 # ─────────────────────────────────────────────────────────────
@@ -228,52 +218,8 @@ def review_one_invoice():
 
     except Exception as e:
         log.exception("review_one_invoice error")
-        _append_log_event(str(e), "invoices/review-one_error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ─────────────────────────────────────────────────────────────
-# /invoices/confirm  → Phase 30 callback from GAS
-# ─────────────────────────────────────────────────────────────
-@bp.route("/confirm", methods=["POST"])
-def invoice_confirm():
-    """
-    GAS posts confirmation about invoice actions:
-    Payload example:
-      {
-        "client_name": "Mary Smith",
-        "invoice_id": "MarySmith_202511",
-        "status": "email_sent|email_failed|whatsapp_sent|whatsapp_failed|posted",
-        "channel": "email|whatsapp|both",
-        "notes": "optional notes"
-      }
-    """
-    try:
-        d = request.get_json(force=True) or {}
-        client = (d.get("client_name") or "").strip() or "Unknown"
-        invoice_id = (d.get("invoice_id") or "").strip()
-        status = (d.get("status") or "posted").strip()
-        channel = (d.get("channel") or "email").strip()
-        notes = (d.get("notes") or "").strip()
-
-        status_line = f"🧾 Invoice {invoice_id or '(n/a)'} for {client}: {status} via {channel}."
-        if notes:
-            status_line += f" Note: {notes}"
-
-        # Notify Nadine
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_ADMIN_ALERT,
-            variables=[status_line],
-            label="invoice_confirm_admin",
-        )
-        _append_log_event(status_line, "invoices/confirm")
-
-        return jsonify({"ok": True, "message": "confirmation_recorded"})
-    except Exception as e:
-        log.exception("invoice_confirm error")
-        _append_log_event(str(e), "invoices/confirm_error")
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ─────────────────────────────────────────────────────────────
 # Health
@@ -285,11 +231,6 @@ def health():
         {
             "status": "ok",
             "service": "invoices_router",
-            "endpoints": [
-                "/invoices/send",
-                "/invoices/confirm",
-                "/invoices/view/<token>",
-                "/invoices/health",
-            ],
+            "endpoints": ["/invoices/send", "/invoices/view/<token>", "/invoices/health"],
         }
     ), 200

@@ -1,25 +1,26 @@
 # render_backend/app/tasks_router.py
 """
-tasks_router.py – Phase 30 (Automated Reminders & Invoice Flow UAT)
-──────────────────────────────────────────────────────────────────
+tasks_router.py – Phase 18 (Unified Version)
+────────────────────────────────────────────
 Purpose:
- • Central webhook handler for time-based automation triggers (from GAS).
- • Adds dedicated morning/evening reminder endpoints for Phase 30.
- • Continues to handle client reminders, birthdays, behaviour, and package events.
+ • Central webhook handler for all time-based automation triggers.
+ • Google Apps Script (GAS) is responsible for scheduling triggers
+   and calling these endpoints on Render.
 
-New in Phase 30:
- • /tasks/reminder/morning   → 06h00 daily admin summary
- • /tasks/reminder/evening   → 20h00 daily admin preview
- • GAS log append helper (_append_log_event)
+Includes:
+ • /tasks/run-reminders → Admin morning/evening/week summary
+ • /tasks/client-reminders → Client session templates (+ admin invoice review)
+ • /tasks/package-events → Admin package alerts
+ • /tasks/client-behaviour → Behaviour analytics
+ • /tasks/birthdays + /tasks/birthday-greetings → Birthday automation
 
-Notes:
- • All scheduling remains in Google Apps Script; Flask only executes on POST.
-──────────────────────────────────────────────────────────────────
+Merged:
+ • Integrated client_reminders.py logic (next-hour, night-before, week-ahead)
+────────────────────────────────────────────
 """
 
 import os
 import logging
-import requests
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from .utils import send_safe_message, safe_execute, send_whatsapp_template
@@ -33,8 +34,6 @@ tasks_bp = Blueprint("tasks_bp", __name__)
 # Environment
 NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
-GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 
 # Templates
 TPL_ADMIN_ALERT = "admin_generic_alert_us"
@@ -61,18 +60,9 @@ def _send_admin_message(msg: str, label: str = "admin_alert", to_wa: str | None 
     )
     log.info(f"📲 Admin alert sent ({label}) → {dest}: {msg}")
 
-def _append_log_event(message: str, context: str):
-    """Append a compact event line to GAS Logs tab (best-effort)."""
-    if not GAS_WEBHOOK_URL:
-        return
-    try:
-        payload = {"action": "append_log_event", "message": f"{context}: {message}"}
-        requests.post(GAS_WEBHOOK_URL, json=payload, timeout=REQUEST_TIMEOUT)
-    except Exception as e:
-        log.debug(f"[log-append] skipped ({e})")
 
 # ─────────────────────────────────────────────
-# ROUTE: Admin morning/evening/week-ahead summaries (legacy consolidated)
+# ROUTE: Admin morning/evening/week-ahead summaries
 # ─────────────────────────────────────────────
 @tasks_bp.route("/run-reminders", methods=["POST"])
 def run_reminders():
@@ -99,50 +89,8 @@ def run_reminders():
         msg = f"🕐 Unknown reminder type received ({msg_type})."
 
     _send_admin_message(msg, label=f"run_reminders_{msg_type}")
-    _append_log_event(msg, f"run-reminders/{msg_type or 'unknown'}")
     return jsonify({"ok": True, "message": msg})
 
-# ─────────────────────────────────────────────
-# ROUTE: Phase 30 — Dedicated morning reminder
-# ─────────────────────────────────────────────
-@tasks_bp.route("/reminder/morning", methods=["POST"])
-def reminder_morning():
-    """
-    GAS (06h00) → POST {
-        "total": <int>,
-        "schedule": "<compact one-line or multi-line summary>",
-        "summary": "<optional pre-formatted line>"
-    }
-    """
-    d = request.get_json(force=True) or {}
-    total = int(d.get("total") or 0)
-    schedule = d.get("schedule") or ""
-    summary = d.get("summary") or f"{total} sessions today."
-    msg = f"🌅 PilatesHQ Morning Summary: {summary}\n{schedule}".strip()
-    _send_admin_message(msg, label="reminder_morning")
-    _append_log_event(f"total={total}", "reminder/morning")
-    return jsonify({"ok": True, "message": "morning_sent", "total": total})
-
-# ─────────────────────────────────────────────
-# ROUTE: Phase 30 — Dedicated evening reminder
-# ─────────────────────────────────────────────
-@tasks_bp.route("/reminder/evening", methods=["POST"])
-def reminder_evening():
-    """
-    GAS (20h00) → POST {
-        "total": <int>,
-        "schedule": "<compact one-line or multi-line summary>",
-        "summary": "<optional pre-formatted line>"
-    }
-    """
-    d = request.get_json(force=True) or {}
-    total = int(d.get("total") or 0)
-    schedule = d.get("schedule") or ""
-    summary = d.get("summary") or f"{total} sessions tomorrow."
-    msg = f"🌙 PilatesHQ Evening Preview: {summary}\n{schedule}".strip()
-    _send_admin_message(msg, label="reminder_evening")
-    _append_log_event(f"total={total}", "reminder/evening")
-    return jsonify({"ok": True, "message": "evening_sent", "total": total})
 
 # ─────────────────────────────────────────────
 # ROUTE: Unified client reminder handler
@@ -161,6 +109,8 @@ def handle_client_reminders():
     sessions = payload.get("sessions") or []
     admin_number = (payload.get("admin_number") or NADINE_WA or "").strip()
     log.info(f"[client-reminders] Received job={job_type}, count={len(sessions)}")
+    
+    # 👇 Additional context log 
     log.info(f"[client-reminders] type={job_type}, sessions={len(sessions)}, admin={admin_number}")
 
     sent_clients = 0
@@ -182,7 +132,6 @@ def handle_client_reminders():
             if ok:
                 sent_clients += 1
         _send_admin_message(f"🌙 Sent night-before reminders ({sent_clients}).")
-        _append_log_event(f"sent={sent_clients}", "client-reminders/night-before")
 
     # Week-ahead (Sunday 20h00)
     elif job_type == "client-week-ahead":
@@ -202,7 +151,6 @@ def handle_client_reminders():
             if ok:
                 sent_clients += 1
         _send_admin_message(f"📅 Sent week-ahead reminders ({sent_clients}).")
-        _append_log_event(f"sent={sent_clients}", "client-reminders/week-ahead")
 
     # Next-hour reminders (hourly)
     elif job_type == "client-next-hour":
@@ -221,23 +169,21 @@ def handle_client_reminders():
             if ok:
                 sent_clients += 1
         _send_admin_message(f"⏰ Sent next-hour reminders ({sent_clients}).")
-        _append_log_event(f"sent={sent_clients}", "client-reminders/next-hour")
 
     # Admin invoice review nudge (pre & month-end)
     elif job_type == "admin_invoice_review":
         note = payload.get("message") or "📅 Invoice Review: Please review and finalise invoices."
         _send_admin_message(note, label="admin_invoice_review", to_wa=admin_number)
-        _append_log_event("admin_invoice_review sent", "client-reminders/admin-invoice-review")
         return jsonify({"ok": True, "message": "admin_invoice_review"})
 
     # Fallback for unknown type
     else:
         _send_admin_message(f"⚠️ Unknown reminder type: {job_type}")
-        _append_log_event(f"unknown={job_type}", "client-reminders/unknown")
         return jsonify({"ok": False, "error": f"Unknown job type: {job_type}"}), 400
 
     log.info(f"[client-reminders] Job={job_type} → Sent={sent_clients}")
     return jsonify({"ok": True, "sent_clients": sent_clients, "message": job_type})
+
 
 # ─────────────────────────────────────────────
 # ROUTE: Test route for health checks
@@ -247,6 +193,7 @@ def test_client_reminders():
     """Simple test endpoint to confirm route is alive."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify({"ok": True, "timestamp": now})
+
 
 # ─────────────────────────────────────────────
 # ROUTE: Admin package / credits events
@@ -258,8 +205,8 @@ def package_events():
     log.info(f"[Tasks] /package-events payload: {data}")
     message = data.get("message") or "No message"
     _send_admin_message(message, label="package_event")
-    _append_log_event("package_event", "package-events")
     return jsonify({"ok": True, "message": "Sent to Nadine"})
+
 
 # ─────────────────────────────────────────────
 # ROUTE: Client behaviour analytics (weekly)
@@ -281,8 +228,8 @@ def client_behaviour():
         f"💤 Inactive: {len(inactive)}"
     )
     _send_admin_message(summary, label="client_behaviour_summary")
-    _append_log_event("weekly_behaviour", "client-behaviour")
     return jsonify({"ok": True, "message": summary})
+
 
 # ─────────────────────────────────────────────
 # ROUTE: Birthday reminders + greetings
@@ -300,8 +247,8 @@ def birthdays():
     names = ", ".join([f"{(b.get('name') or '').strip()} ({(b.get('date') or '').strip()})" for b in birthdays])
     msg = f"🎉 PilatesHQ Birthday Planner: {names}"
     _send_admin_message(msg, label="birthday_alert")
-    _append_log_event(f"count={len(birthdays)}", "birthdays")
     return jsonify({"ok": True, "message": msg})
+
 
 @tasks_bp.route("/birthday-greetings", methods=["POST"])
 def birthday_greetings():
@@ -331,5 +278,4 @@ def birthday_greetings():
         log.info(f"🎂 Sent birthday greeting to {name} ({wa})")
 
     _send_admin_message(f"🎂 PilatesHQ Birthday Greetings sent: {sent}", label="birthday_greetings_summary")
-    _append_log_event(f"sent={sent}", "birthday-greetings")
     return jsonify({"ok": True, "sent": sent, "message": "birthday_greetings"})

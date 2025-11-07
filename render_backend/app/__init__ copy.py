@@ -1,42 +1,45 @@
-# render_backend/app/__init__.py
+
+##render_backend/app/__init__.py
 """
-__init__.py – PilatesHQ Render Backend (Phase 30)
-────────────────────────────────────────────────
+__init__.py – PilatesHQ Render Backend (Phase 26)
+────────────────────────────────────────────────────────────
 Initialises the Flask app and registers all feature blueprints.
 
-Includes:
+✅ Includes:
  • router_webhook      → WhatsApp inbound handler (Meta)
- • invoices_router     → PDF invoice generation & delivery (+ Phase 30 confirm)
- • tasks_router        → Phase 30 reminders (morning/evening) + client reminders
+ • invoices_router     → PDF invoice generation & delivery
  • client_behaviour    → Behaviour analytics (from GAS)
- • client_menu_router  → Client Self-Service Menu
-
+ • client_menu_router  → Client Self-Service Menu (NEW)
+────────────────────────────────────────────────────────────
 Enhancements:
  • Unified structured logging (INFO default)
  • Defensive import handling (graceful skip if module missing)
  • Startup environment diagnostics for Render
  • Clear health endpoint responses
-────────────────────────────────────────────────
+────────────────────────────────────────────────────────────
 """
 
 import os
 import logging
 from flask import Flask, jsonify
 
+# ─────────────────────────────────────────────────────────────
+# Flask App Factory
+# ─────────────────────────────────────────────────────────────
 def create_app():
     """Create and configure the Flask application."""
     app = Flask(__name__)
 
-    # Structured logging
+    # ── Configure structured logging ───────────────────────────────
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
     log = logging.getLogger("pilateshq_init")
-    log.info("🚀 Starting PilatesHQ Render Backend (Phase 30)")
+    log.info("🚀 Starting PilatesHQ Render Backend")
 
-    # Register Blueprints safely
+    # ── Register Blueprints safely ────────────────────────────────
     try:
         from .router_webhook import router_bp
         app.register_blueprint(router_bp, url_prefix="/")
@@ -52,13 +55,6 @@ def create_app():
         log.error(f"❌ invoices_router failed to register: {e}")
 
     try:
-        from .tasks_router import tasks_bp
-        app.register_blueprint(tasks_bp, url_prefix="/tasks")
-        log.info("✅ tasks_router registered")
-    except Exception as e:
-        log.error(f"❌ tasks_router failed to register: {e}")
-
-    try:
         from .client_behaviour import bp as behaviour_bp
         app.register_blueprint(behaviour_bp, url_prefix="/behaviour")
         log.info("✅ client_behaviour registered")
@@ -72,7 +68,7 @@ def create_app():
     except Exception as e:
         log.error(f"❌ client_menu_router failed to register: {e}")
 
-    # Root health check
+    # ── Root health check ───────────────────────────────
     @app.route("/health", methods=["GET"])
     def health_root():
         """Primary Render health check endpoint."""
@@ -82,13 +78,12 @@ def create_app():
             "registered_routes": [
                 "/ (Meta Webhook)",
                 "/invoices/*",
-                "/tasks/*",
                 "/behaviour/*",
                 "/client-menu/*"
             ]
         }), 200
 
-    # Environment summary (logs only)
+    # ── Environment summary for debug (visible in logs only) ──────
     debug_envs = {
         "WEBHOOK_BASE": os.getenv("WEBHOOK_BASE"),
         "NADINE_WA": os.getenv("NADINE_WA"),
@@ -99,7 +94,10 @@ def create_app():
 
     return app
 
+
+# ─────────────────────────────────────────────────────────────
 # Gunicorn / Local Entrypoint
+# ─────────────────────────────────────────────────────────────
 app = create_app()
 
 if __name__ == "__main__":
