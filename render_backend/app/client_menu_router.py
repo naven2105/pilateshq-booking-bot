@@ -1,11 +1,10 @@
 """
-client_menu_router.py – Phase 27K (Invoice Delivery Fix + NLP Stable)
+client_menu_router.py – Phase 27L (Menu Fallback + Invoice Merge)
 ────────────────────────────────────────────────────────────
 Enhancement:
- • Fix: Invoice delivery now includes client wa_number in payload
-   → prevents fallback to NADINE_WA.
- • Keeps NLP normalisation (invoice / invoices / share invoice / etc.)
- • Logs raw + normalised inputs for diagnosis
+ • Removes duplicate “Your latest invoice...” message
+ • Adds intelligent fallback → sends client menu for unknown text
+ • Keeps NLP normalisation for schedule/invoice terms
  • Unified REQUEST_TIMEOUT from environment (default 35 s)
 ────────────────────────────────────────────────────────────
 """
@@ -29,16 +28,12 @@ NADINE_WA = os.getenv("NADINE_WA", "")
 TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 MENU_TEMPLATE = "pilateshq_menu_main"
 CLIENT_ALERT_TEMPLATE = "client_generic_alert_us"
-ADMIN_TEMPLATE = "admin_generic_alert_us"
 GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
 WEBHOOK_BASE = os.getenv(
     "WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com"
 )
 
-# Global timeout (default = 35 s, overridable)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
-
-# GAS & local endpoints
 INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
 
 
@@ -51,11 +46,9 @@ def normalise_action(text: str) -> str:
         return ""
     t = text.strip().lower()
 
-    # Schedule variants
     if any(k in t for k in ["schedule", "booking", "class", "session"]):
         return "my_schedule"
 
-    # Invoice variants
     if any(
         k in t
         for k in [
@@ -69,7 +62,6 @@ def normalise_action(text: str) -> str:
     ):
         return "view_invoice"
 
-    # Default
     return t
 
 
@@ -89,7 +81,7 @@ def send_client_menu(wa_number: str, name: str = "there"):
 
 
 # ─────────────────────────────────────────────────────────────
-# Button / payload handler (2-button + NLP version)
+# Action handler (buttons + NLP)
 # ─────────────────────────────────────────────────────────────
 @bp.route("/action", methods=["POST"])
 def handle_client_action():
@@ -99,14 +91,14 @@ def handle_client_action():
     name = data.get("name", "there")
     raw_action = (data.get("payload") or data.get("text") or "").strip()
     action = normalise_action(raw_action)
-    handled = False  # 🧩 prevent duplicate sends
+    handled = False
 
     log.info(
         f"[client_menu] Action received: raw='{raw_action}', normalised='{action}' from {wa_number}"
     )
 
     try:
-        # 1️⃣ My Schedule – 7-day summary via GAS
+        # 1️⃣ My Schedule
         if action == "my_schedule" and not handled:
             handled = True
             if GAS_WEBHOOK_URL:
@@ -121,51 +113,34 @@ def handle_client_action():
                     summary = result.get("summary", "")
                     if summary:
                         send_whatsapp_template(
-                            wa_number,
-                            CLIENT_ALERT_TEMPLATE,
-                            TEMPLATE_LANG,
-                            [summary],
+                            wa_number, CLIENT_ALERT_TEMPLATE, TEMPLATE_LANG, [summary]
                         )
-                        log.info(f"📆 Sent 7-day schedule to {wa_number}")
                         return jsonify({"ok": True, "summary": summary}), 200
-                    else:
-                        send_whatsapp_text(
-                            wa_number,
-                            "📭 No booked sessions found in the next 7 days.",
-                        )
-                        return jsonify({"ok": True, "summary": "none"}), 200
+                    send_whatsapp_text(
+                        wa_number, "📭 No booked sessions found in the next 7 days."
+                    )
+                    return jsonify({"ok": True, "summary": "none"}), 200
             send_whatsapp_text(wa_number, "⚠️ Unable to fetch your schedule right now.")
             return jsonify({"ok": False}), 200
 
         # 2️⃣ View Latest Invoice
         if action == "view_invoice" and not handled:
             handled = True
+            payload = {"client_name": name, "wa_number": wa_number}
             try:
-                # Include wa_number in payload to prevent fallback to admin
-                payload = {"client_name": name, "wa_number": wa_number}
                 r = requests.post(INVOICE_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT)
-                log.info(
-                    f"🧾 Invoice request → HTTP {r.status_code} | body={r.text[:200]}"
-                )
+                log.info(f"🧾 Invoice request → HTTP {r.status_code}")
                 if r.ok:
-                    send_safe_message(
-                        wa_number,
-                        "🧾 Your latest invoice has been sent via WhatsApp and email.",
-                    )
                     return jsonify({"ok": True, "routed": "invoice"}), 200
             except Exception as e:
                 log.warning(f"Invoice error: {e}")
-            send_whatsapp_text(
-                wa_number, "⚠️ Unable to retrieve your invoice right now."
-            )
+            send_whatsapp_text(wa_number, "⚠️ Unable to retrieve your invoice right now.")
             return jsonify({"ok": False}), 200
 
-        # Unrecognised payload
-        send_whatsapp_text(
-            wa_number,
-            "❓ Sorry, I didn’t understand that option. Please type *menu* to try again.",
-        )
-        return jsonify({"ok": False, "error": "unknown payload"}), 400
+        # 3️⃣ Fallback → show menu again
+        log.info(f"[client_menu] Unrecognised input → showing menu to {wa_number}")
+        send_client_menu(wa_number, name)
+        return jsonify({"ok": False, "fallback": "menu"}), 200
 
     except Exception as e:
         log.error(f"⚠️ handle_client_action failed: {e}")
@@ -176,30 +151,23 @@ def handle_client_action():
 
 
 # ─────────────────────────────────────────────────────────────
-# API trigger – manual send
+# Manual send + health
 # ─────────────────────────────────────────────────────────────
 @bp.route("/send", methods=["POST"])
 def send_menu_api():
-    data = request.get_json(force=True) or {}
-    wa_number = normalize_wa(data.get("wa_number", ""))
-    name = data.get("name", "there")
+    d = request.get_json(force=True) or {}
+    wa_number = normalize_wa(d.get("wa_number", ""))
+    name = d.get("name", "there")
     return jsonify(send_client_menu(wa_number, name)), 200
 
 
-# ─────────────────────────────────────────────────────────────
-# Health check
-# ─────────────────────────────────────────────────────────────
 @bp.route("/health", methods=["GET"])
 @bp.route("", methods=["GET"])
 @bp.route("/", methods=["GET"])
 def health():
     return (
         jsonify(
-            {
-                "status": "ok",
-                "service": "client_menu_router",
-                "timeout": REQUEST_TIMEOUT,
-            }
+            {"status": "ok", "service": "client_menu_router", "timeout": REQUEST_TIMEOUT}
         ),
         200,
     )

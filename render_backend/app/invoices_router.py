@@ -1,15 +1,9 @@
 """
-invoices_router.py – Phase 17 (Unified Invoices + Payments + Health)
+invoices_router.py – Phase 18 (Invoice ID + Message Simplify)
 ────────────────────────────────────────────────────────────
-Handles all invoice and payment automation for PilatesHQ.
-
-✅ Includes:
- • /invoices/send            → Dual Email + WhatsApp delivery
- • /invoices/resend          → Regenerate invoice PDF
- • /invoices/mark-paid       → Manual payment log
- • /invoices/log-payment     → Free-text or structured log
- • /invoices/view/<token>    → Secure PDF viewer
- • /invoices/health & /invoices/ → Service health check
+• Adds monthly invoice ID format <Name_YYYYMM>
+• Simplifies WhatsApp message: “🧾 Invoice for <Name>”
+• Removes extra confirmation message (sent only once)
 ────────────────────────────────────────────────────────────
 """
 
@@ -21,13 +15,10 @@ from reportlab.pdfgen import canvas
 from .utils import send_safe_message
 from .tokens import generate_invoice_token, verify_invoice_token
 
-# ─────────────────────────────────────────────────────────────
 bp = Blueprint("invoices_bp", __name__)
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# Environment
-# ─────────────────────────────────────────────────────────────
+# ── Environment ─────────────────────────────────────────────
 NADINE_WA = os.getenv("NADINE_WA", "")
 GAS_INVOICE_URL = os.getenv("GAS_INVOICE_URL", "")
 SHEET_ID = os.getenv("CLIENT_SHEET_ID", "")
@@ -40,6 +31,7 @@ TPL_PAYMENT_LOGGED = "payment_logged_admin_us"
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "../static")
 LOGO_PATH = os.path.join(STATIC_DIR, "pilateshq_logo.png")
 
+
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
@@ -51,6 +43,7 @@ def flatten_message(text: str) -> str:
         clean = clean.replace("  ", " ")
     return clean.strip()
 
+
 def _post_to_gas(payload: dict, retries: int = 2) -> dict:
     for attempt in range(retries + 1):
         try:
@@ -61,58 +54,71 @@ def _post_to_gas(payload: dict, retries: int = 2) -> dict:
                 return r.json()
             log.warning(f"GAS HTTP {r.status_code}: {r.text}")
         except Exception as e:
-            log.error(f"GAS POST failed ({attempt + 1}/{retries + 1}): {e}")
+            log.error(f"GAS POST failed ({attempt+1}/{retries+1}): {e}")
         time.sleep(2)
     return {"ok": False, "error": "GAS communication failed"}
 
+
 # ─────────────────────────────────────────────────────────────
-# /invoices/send
+# /invoices/send  → dual delivery
 # ─────────────────────────────────────────────────────────────
 @bp.route("/send", methods=["POST"])
 def send_invoice_dual():
-    """Dual delivery → Email + WhatsApp (client)."""
+    """Send invoice to client via WhatsApp and email."""
     try:
         data = request.get_json(force=True)
         client_name = data.get("client_name", "").strip()
         wa_number = data.get("wa_number", "").strip() or NADINE_WA
-        invoice_id = data.get("invoice_id") or f"INV-{int(time.time())}"
 
         if not client_name:
             return jsonify({"ok": False, "error": "Missing client_name"}), 400
 
+        # unique monthly invoice ID
+        invoice_id = f"{client_name.replace(' ', '')}_{datetime.now():%Y%m}"
         token = generate_invoice_token(client_name, invoice_id)
         view_url = f"{BASE_URL}/invoices/view/{token}"
 
-        msg = flatten_message(f"🧾 PilatesHQ Invoice for *{client_name}*: {view_url} (expires in 48h)")
+        msg = flatten_message(f"🧾 Invoice for *{client_name}*: {view_url} (expires in 48 h)")
         send_safe_message(
             to=wa_number,
             is_template=True,
             template_name=TPL_CLIENT_ALERT,
             variables=[msg],
-            label="invoice_dual_send"
+            label="invoice_dual_send",
         )
 
-        email_result = _post_to_gas({
-            "action": "send_invoice_email",
-            "sheet_id": SHEET_ID,
-            "client_name": client_name
-        })
-        email_status = "Sent" if email_result.get("ok") else f"Failed: {email_result.get('error')}"
+        email_result = _post_to_gas(
+            {
+                "action": "send_invoice_email",
+                "sheet_id": SHEET_ID,
+                "client_name": client_name,
+                "invoice_id": invoice_id,
+            }
+        )
+        email_status = (
+            "Sent"
+            if email_result.get("ok")
+            else f"Failed: {email_result.get('error')}"
+        )
 
-        _post_to_gas({
-            "action": "append_log_event",
-            "sheet_id": SHEET_ID,
-            "event": "INVOICE_DUAL",
-            "message": f"{client_name} | Email={email_status}"
-        })
+        _post_to_gas(
+            {
+                "action": "append_log_event",
+                "sheet_id": SHEET_ID,
+                "event": "INVOICE_DUAL",
+                "message": f"{client_name} | Email={email_status}",
+            }
+        )
 
-        return jsonify({
-            "ok": True,
-            "client_name": client_name,
-            "invoice_id": invoice_id,
-            "email_status": email_status,
-            "link": view_url
-        })
+        return jsonify(
+            {
+                "ok": True,
+                "client_name": client_name,
+                "invoice_id": invoice_id,
+                "email_status": email_status,
+                "link": view_url,
+            }
+        )
 
     except Exception as e:
         log.exception("send_invoice_dual error")
@@ -121,16 +127,16 @@ def send_invoice_dual():
             is_template=True,
             template_name=TPL_ADMIN_ALERT,
             variables=[flatten_message(f"❌ send_invoice_dual error: {e}")],
-            label="invoice_dual_error"
+            label="invoice_dual_error",
         )
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 # ─────────────────────────────────────────────────────────────
-# /invoices/view/<token>
+# /invoices/view/<token>  → secure PDF
 # ─────────────────────────────────────────────────────────────
 @bp.route("/view/<token>", methods=["GET"])
 def view_invoice(token):
-    """Secure PDF viewer."""
     check = verify_invoice_token(token)
     if not check or not check.get("client"):
         return jsonify({"ok": False, "error": "Invalid token"}), 403
@@ -149,20 +155,19 @@ def view_invoice(token):
         log.warning(f"Logo draw failed: {e}")
 
     pdf.setFont("Helvetica-Bold", 14)
-    pdf.drawString(200, 790, "PilatesHQ – Client Invoice")
+    pdf.drawString(200, 790, "Client Invoice")
     pdf.setFont("Helvetica", 11)
-    pdf.drawString(200, 770, f"Invoice: {invoice_id}")
-    pdf.drawString(200, 755, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
+    pdf.drawString(200, 770, f"Invoice ID: {invoice_id}")
+    pdf.drawString(200, 755, f"Date: {datetime.now():%Y-%m-%d}")
     pdf.drawString(200, 740, f"Client: {client_name}")
     pdf.line(50, 730, 550, 730)
 
-    # Example placeholder line items
     y = 710
     items = [
         ("02 Oct 2025 – Duo Session", 250),
         ("04 Oct 2025 – Duo Session", 250),
         ("11 Oct 2025 – Single Session", 300),
-        ("18 Oct 2025 – Single Session", 300)
+        ("18 Oct 2025 – Single Session", 300),
     ]
     for desc, amt in items:
         pdf.drawString(60, y, desc)
@@ -181,7 +186,7 @@ def view_invoice(token):
         "Bank: ABSA",
         "Account: 4117151887",
         "Payments due on or before the 25th each month.",
-        "Send POP to Nadine (084 313 1635)."
+        "Send POP to Nadine (084 313 1635).",
     ]:
         y -= 15
         pdf.drawString(70, y, line)
@@ -192,133 +197,8 @@ def view_invoice(token):
         buf,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=f"{client_name.replace(' ', '_')}_{invoice_id}.pdf"
+        download_name=f"{client_name.replace(' ', '_')}_{invoice_id}.pdf",
     )
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/resend
-# ─────────────────────────────────────────────────────────────
-@bp.route("/resend", methods=["POST"])
-def resend_invoice():
-    """Regenerate and resend invoice PDF."""
-    try:
-        data = request.get_json(force=True)
-        client_name = data.get("client_name", "").strip()
-        month = data.get("month", "").strip()
-        wa_number = data.get("wa_number", "").strip() or NADINE_WA
-
-        if not client_name or not month:
-            return jsonify({"ok": False, "error": "Missing client_name or month"}), 400
-
-        payload = {
-            "action": "generate_invoice_pdf",
-            "sheet_id": SHEET_ID,
-            "client_name": client_name,
-            "month": month
-        }
-        resp = _post_to_gas(payload)
-        if not resp.get("ok"):
-            raise Exception(resp.get("error", "PDF generation failed"))
-
-        pdf_link = resp.get("pdf_link")
-        msg = flatten_message(
-            f"📄 PilatesHQ Invoice for {month} is ready for {client_name}. View here: {pdf_link}"
-        )
-        send_safe_message(
-            to=wa_number,
-            is_template=True,
-            template_name=TPL_CLIENT_ALERT,
-            variables=[msg],
-            label="invoice_resend"
-        )
-        return jsonify({"ok": True, "pdf_link": pdf_link})
-
-    except Exception as e:
-        log.exception("resend_invoice error")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/mark-paid
-# ─────────────────────────────────────────────────────────────
-@bp.route("/mark-paid", methods=["POST"])
-def mark_paid():
-    """Structured payment logging (Nadine manual input)."""
-    try:
-        data = request.get_json(force=True)
-        client = data.get("client_name", "").strip()
-        amount = data.get("amount")
-        date = data.get("date") or datetime.now().strftime("%Y-%m-%d")
-        note = data.get("note", "")
-
-        if not client or not amount:
-            return jsonify({"ok": False, "error": "Missing client_name or amount"}), 400
-
-        append_result = _post_to_gas({
-            "action": "appendPayment_",
-            "client_name": client,
-            "amount": amount,
-            "date": date,
-            "note": note
-        })
-        if not append_result.get("ok"):
-            raise Exception(append_result.get("error", "appendPayment_ failed"))
-
-        match_result = _post_to_gas({"action": "autoMatchInvoice_", "client_name": client})
-        status = match_result.get("status", "Pending")
-
-        msg = flatten_message(
-            f"✅ Payment logged for *{client}*\nAmount: R{amount}\nStatus: {status}\nNote: {note or '—'}"
-        )
-        send_safe_message(
-            to=NADINE_WA,
-            is_template=True,
-            template_name=TPL_PAYMENT_LOGGED,
-            variables=[msg],
-            label="payment_mark_paid"
-        )
-
-        return jsonify({"ok": True, "client_name": client, "status": status})
-    except Exception as e:
-        log.exception("mark_paid error")
-        send_safe_message(NADINE_WA, f"⚠️ Payment logging failed: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# ─────────────────────────────────────────────────────────────
-# /invoices/log-payment (free text)
-# ─────────────────────────────────────────────────────────────
-@bp.route("/log-payment", methods=["POST"])
-def log_payment():
-    """Handles free-text or NLP payment logs."""
-    try:
-        data = request.get_json(force=True)
-        text = (data.get("text") or "").strip()
-        client_name = (data.get("client_name") or "").strip()
-        amount = data.get("amount")
-        date = data.get("date")
-
-        if text and (not client_name or not amount):
-            m = re.match(r"(.+?)\s+paid\s+R?(\d+(?:\.\d{1,2})?)", text, re.I)
-            if m:
-                client_name = client_name or m.group(1).strip().title()
-                amount = amount or float(m.group(2))
-
-        if not client_name or not amount:
-            return jsonify({"ok": False, "error": "Missing client_name or amount"}), 400
-
-        payload = {
-            "action": "appendPayment_",
-            "client_name": client_name,
-            "amount": amount,
-            "date": date or datetime.now().strftime("%Y-%m-%d"),
-            "note": "NLP payment log"
-        }
-        resp = _post_to_gas(payload)
-        msg = f"✅ {client_name} payment logged (R{amount})"
-        send_safe_message(NADINE_WA, msg)
-        return jsonify(resp)
-    except Exception as e:
-        log.exception("log_payment error")
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────
@@ -326,18 +206,14 @@ def log_payment():
 # ─────────────────────────────────────────────────────────────
 @bp.route("/review-one", methods=["POST"])
 def review_one_invoice():
-    """
-    Client self-service: latest invoice delivery (WhatsApp + Email).
-    Triggered via /client-menu/action when client taps 'View Latest Invoice'.
-    """
+    """Client self-service: latest invoice delivery."""
     try:
         data = request.get_json(force=True)
         client_name = (data.get("client_name") or "").strip()
+        wa_number = (data.get("wa_number") or NADINE_WA).strip()
         if not client_name:
             return jsonify({"ok": False, "error": "Missing client_name"}), 400
 
-        # Reuse the dual-delivery function
-        from .invoices_router import send_invoice_dual
         return send_invoice_dual()
 
     except Exception as e:
@@ -346,21 +222,15 @@ def review_one_invoice():
 
 
 # ─────────────────────────────────────────────────────────────
-# Health routes
+# Health
 # ─────────────────────────────────────────────────────────────
 @bp.route("/health", methods=["GET"])
 @bp.route("/", methods=["GET"])
 def health():
-    """Basic router health check."""
-    return jsonify({
-        "status": "ok",
-        "service": "invoices_router",
-        "endpoints": [
-            "/invoices/send",
-            "/invoices/resend",
-            "/invoices/view/<token>",
-            "/invoices/mark-paid",
-            "/invoices/log-payment",
-            "/invoices/health"
-        ]
-    }), 200
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "invoices_router",
+            "endpoints": ["/invoices/send", "/invoices/view/<token>", "/invoices/health"],
+        }
+    ), 200
