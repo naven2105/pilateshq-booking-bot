@@ -1,11 +1,10 @@
 """
-client_menu_router.py – Phase 27L (Menu Fallback + Invoice Merge)
+client_menu_router.py – Phase 27L+ (Menu Fallback + Invoice Merge + (x) markers)
 ────────────────────────────────────────────────────────────
-Enhancement:
- • Removes duplicate “Your latest invoice...” message
- • Adds intelligent fallback → sends client menu for unknown text
- • Keeps NLP normalisation for schedule/invoice terms
- • Unified REQUEST_TIMEOUT from environment (default 35 s)
+Enhancements in this version:
+ • Standardised summary formatting: if a sessions array is present,
+   rebuild the summary ensuring rescheduled sessions show "(x)".
+ • Keeps NLP normalisation and existing flows as-is.
 ────────────────────────────────────────────────────────────
 """
 
@@ -29,9 +28,7 @@ TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
 MENU_TEMPLATE = "pilateshq_menu_main"
 CLIENT_ALERT_TEMPLATE = "client_generic_alert_us"
 GAS_WEBHOOK_URL = os.getenv("GAS_WEBHOOK_URL", "")
-WEBHOOK_BASE = os.getenv(
-    "WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com"
-)
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://pilateshq-booking-bot.onrender.com")
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
@@ -41,7 +38,6 @@ INVOICE_ENDPOINT = f"{WEBHOOK_BASE}/invoices/review-one"
 # NLP normaliser for free-text variants
 # ─────────────────────────────────────────────────────────────
 def normalise_action(text: str) -> str:
-    """Map flexible client input into canonical actions."""
     if not text:
         return ""
     t = text.strip().lower()
@@ -49,27 +45,45 @@ def normalise_action(text: str) -> str:
     if any(k in t for k in ["schedule", "booking", "class", "session"]):
         return "my_schedule"
 
-    if any(
-        k in t
-        for k in [
-            "invoice",
-            "invoices",
-            "share invoice",
-            "send invoice",
-            "latest invoice",
-            "view invoice",
-        ]
-    ):
+    if any(k in t for k in ["invoice", "invoices", "share invoice", "send invoice", "latest invoice", "view invoice"]):
         return "view_invoice"
 
     return t
 
 
 # ─────────────────────────────────────────────────────────────
+# Summary formatter with “(x)” markers
+# ─────────────────────────────────────────────────────────────
+def _fmt_line(time_str: str, client_name: str, session_type: str, status: str) -> str:
+    t = (time_str or "").strip()
+    name = (client_name or "").strip()
+    s_type = (session_type or "single").strip()
+    st = (status or "").strip().lower()
+    mark = " (x)" if st == "rescheduled" else ""
+    return f"{t}{mark} • {name} ({s_type})"
+
+
+def _rebuild_summary_from_sessions(sessions: list) -> str:
+    if not isinstance(sessions, list) or not sessions:
+        return ""
+    def _key(s):
+        t = str(s.get("start_time") or "")
+        return t.replace("h", ":")
+    lines = []
+    for s in sorted(sessions, key=_key):
+        lines.append(_fmt_line(
+            time_str=str(s.get("start_time") or ""),
+            client_name=str(s.get("client_name") or ""),
+            session_type=str(s.get("session_type") or "single"),
+            status=str(s.get("status") or "")
+        ))
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
 # Menu sender
 # ─────────────────────────────────────────────────────────────
 def send_client_menu(wa_number: str, name: str = "there"):
-    """Send the PilatesHQ client menu (template-based)."""
     try:
         send_whatsapp_template(wa_number, MENU_TEMPLATE, TEMPLATE_LANG, [name])
         log.info(f"✅ Menu template sent to {wa_number}")
@@ -85,7 +99,6 @@ def send_client_menu(wa_number: str, name: str = "there"):
 # ─────────────────────────────────────────────────────────────
 @bp.route("/action", methods=["POST"])
 def handle_client_action():
-    """Handles quick-reply button or NLP responses from client menu."""
     data = request.get_json(force=True) or {}
     wa_number = normalize_wa(data.get("wa_number", ""))
     name = data.get("name", "there")
@@ -93,9 +106,7 @@ def handle_client_action():
     action = normalise_action(raw_action)
     handled = False
 
-    log.info(
-        f"[client_menu] Action received: raw='{raw_action}', normalised='{action}' from {wa_number}"
-    )
+    log.info(f"[client_menu] Action received: raw='{raw_action}', normalised='{action}' from {wa_number}")
 
     try:
         # 1️⃣ My Schedule
@@ -109,16 +120,14 @@ def handle_client_action():
                 )
                 log.info(f"🔗 export_sessions_week → HTTP {r.status_code}")
                 if r.ok:
-                    result = r.json()
-                    summary = result.get("summary", "")
+                    result = r.json() or {}
+                    sessions = result.get("sessions") or []
+                    # Always prefer rebuilding from rows (guarantees '(x)' markers)
+                    summary = _rebuild_summary_from_sessions(sessions) if sessions else str(result.get("summary") or "")
                     if summary:
-                        send_whatsapp_template(
-                            wa_number, CLIENT_ALERT_TEMPLATE, TEMPLATE_LANG, [summary]
-                        )
+                        send_whatsapp_template(wa_number, CLIENT_ALERT_TEMPLATE, TEMPLATE_LANG, [summary])
                         return jsonify({"ok": True, "summary": summary}), 200
-                    send_whatsapp_text(
-                        wa_number, "📭 No booked sessions found in the next 7 days."
-                    )
+                    send_whatsapp_text(wa_number, "📭 No booked sessions found in the next 7 days.")
                     return jsonify({"ok": True, "summary": "none"}), 200
             send_whatsapp_text(wa_number, "⚠️ Unable to fetch your schedule right now.")
             return jsonify({"ok": False}), 200
@@ -144,9 +153,7 @@ def handle_client_action():
 
     except Exception as e:
         log.error(f"⚠️ handle_client_action failed: {e}")
-        send_whatsapp_text(
-            wa_number, "⚠️ Something went wrong. Please try again later."
-        )
+        send_whatsapp_text(wa_number, "⚠️ Something went wrong. Please try again later.")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -165,9 +172,4 @@ def send_menu_api():
 @bp.route("", methods=["GET"])
 @bp.route("/", methods=["GET"])
 def health():
-    return (
-        jsonify(
-            {"status": "ok", "service": "client_menu_router", "timeout": REQUEST_TIMEOUT}
-        ),
-        200,
-    )
+    return jsonify({"status": "ok", "service": "client_menu_router", "timeout": REQUEST_TIMEOUT}), 200
