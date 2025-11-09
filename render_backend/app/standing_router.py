@@ -1,15 +1,15 @@
 # app/standing_router.py
 """
-standing_router.py – Phase 30B (Specials + Action Routing)
+standing_router.py – Phase 30C (Fixed GAS Action + Specials)
 ──────────────────────────────────────────────────────────────
 Purpose:
   Handles recurring client slot commands (“book”, “suspend”, “resume”)
-  and forwards them to Google Apps Script.
+  and forwards them to Google Apps Script (GAS).
 
 Enhancements:
-  • Adds optional SPECIAL_CODE parsing (e.g. BF2025)
-  • Adds explicit "action": "standing_command" so GAS knows how to route
-  • Returns clean JSON with GAS feedback or error
+  • Explicitly sets "action": "standing_command" so GAS router recognises it
+  • Optional parsing of promotion codes (e.g. BF2025)
+  • Clear JSON feedback + structured logging
 ──────────────────────────────────────────────────────────────
 """
 
@@ -27,22 +27,18 @@ bp = Blueprint("standing_router", __name__)
 # ───────────────────────────────────────────────
 GAS_STANDING_URL = os.getenv(
     "GAS_STANDING_URL",
-    "https://script.google.com/macros/s/AKfycbx-009V1LZWXldZMF4gWhXM07z681FYIhJiT0biOM3fXZvteDhe8Jhynls88TYuVU6jpw/exec"
+    "https://script.google.com/macros/s/AKfycbzhZgscmpyCTN3xOJJvP3Ey-nVxmQvQo8ZHZEAptARX1ickJbieHfrFyhy_B9pMF_m73A/exec"
 )
 ADMIN_WA = os.getenv("ADMIN_WA", "27627597357")
 
-# Code pattern: letters/digits/underscore, e.g. BF2025, SUMMER_24
+# Detect codes like BF2025 or SUMMER_24 at end of command
 SPECIAL_CODE_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]{2,})\b")
-
 
 # ───────────────────────────────────────────────
 # Helpers
 # ───────────────────────────────────────────────
 def _extract_special_code(cmd: str) -> str | None:
-    """
-    Detects if the final token looks like a promotion code.
-    Returns None if not present.
-    """
+    """Detect promotion/special code token at the end of message."""
     if not cmd:
         return None
     parts = cmd.strip().split()
@@ -55,13 +51,12 @@ def _extract_special_code(cmd: str) -> str | None:
         return candidate
     return None
 
-
 # ───────────────────────────────────────────────
-# Main route
+# Route handler
 # ───────────────────────────────────────────────
 @bp.route("/standing/command", methods=["POST"])
 def standing_command():
-    """Receive WhatsApp messages for standing slot actions."""
+    """Handles admin WhatsApp booking/suspend/resume commands."""
     try:
         data = request.get_json(force=True) or {}
         wa_from = str(data.get("from", "")).strip()
@@ -70,19 +65,19 @@ def standing_command():
         if not text:
             return jsonify({"ok": False, "error": "Empty message"}), 400
 
-        # Restrict to admin
+        # Restrict access
         if wa_from != ADMIN_WA:
             log.warning(f"Unauthorized standing command from {wa_from}")
             return jsonify({"ok": False, "error": "Unauthorized"}), 403
 
-        # Parse optional special code
+        # Detect optional promo/special code
         special_code = _extract_special_code(text)
         if special_code:
-            log.info(f"[standing] Parsed special_code={special_code} from: {text}")
+            log.info(f"[standing] Found special_code={special_code}")
 
-        # Build payload for GAS
+        # Build payload for GAS router
         payload = {
-            "action": "standing_command",   # 👈 key addition
+            "action": "standing_command",
             "from": wa_from,
             "text": text
         }
@@ -90,11 +85,16 @@ def standing_command():
             payload["special_code"] = special_code
 
         log.info(f"[standing→GAS] POST {GAS_STANDING_URL} payload={payload}")
-        res = requests.post(GAS_STANDING_URL, json=payload, timeout=15)
+        res = requests.post(GAS_STANDING_URL, json=payload, timeout=20)
+
+        # Parse response safely
+        try:
+            js = res.json() if res.text else {}
+        except Exception:
+            js = {"ok": False, "error": f"Non-JSON response (HTTP {res.status_code})"}
 
         if res.status_code == 404:
-            log.error(f"GAS returned 404 — likely old deployment or missing case in doPost")
-        js = res.json() if res.text else {"ok": False, "error": f"HTTP {res.status_code}"}
+            log.error(f"GAS returned 404 — check deployment or router case mismatch")
 
         log.info(f"[standing] GAS response: {js}")
         return jsonify(js), res.status_code
@@ -102,7 +102,6 @@ def standing_command():
     except Exception as e:
         log.exception("standing_command error")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 # ───────────────────────────────────────────────
 # Blueprint registration
