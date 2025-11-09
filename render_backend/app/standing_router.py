@@ -1,27 +1,16 @@
 # app/standing_router.py
 """
-standing_router.py – Phase 30 (Specials-Aware Standing Booking)
-───────────────────────────────────────────────────────────────
+standing_router.py – Phase 30B (Specials + Action Routing)
+──────────────────────────────────────────────────────────────
 Purpose:
-  Handles recurring client slots (“book”, “suspend”, “resume”) and forwards to Apps Script.
-  Adds optional SPECIAL_CODE parsing (e.g., BF2025) and forwards it as 'special_code'
-  while preserving the original text for GAS-side parsing.
+  Handles recurring client slot commands (“book”, “suspend”, “resume”)
+  and forwards them to Google Apps Script.
 
-Admin examples (WhatsApp → Nadine only):
-  - "book Terrance Tuesday 09h00 group BF2025"
-  - "book Mary 2025-11-12 07h00 single"
-  - "book John every Wednesday 08h00 duo BF2025"
-  - "suspend Mary"
-  - "resume Mary"
-
-Forwards requests to Google Apps Script → handleStandingCommand(payload)
-Payload shape:
-  {
-    "from": "<admin_wa>",
-    "text": "<original admin text>",
-    "special_code": "<OPTIONAL e.g. BF2025>"
-  }
-───────────────────────────────────────────────────────────────
+Enhancements:
+  • Adds optional SPECIAL_CODE parsing (e.g. BF2025)
+  • Adds explicit "action": "standing_command" so GAS knows how to route
+  • Returns clean JSON with GAS feedback or error
+──────────────────────────────────────────────────────────────
 """
 
 from flask import Blueprint, request, jsonify
@@ -33,25 +22,26 @@ import re
 log = logging.getLogger(__name__)
 bp = Blueprint("standing_router", __name__)
 
-# Environment variable (your Apps Script deployment URL)
+# ───────────────────────────────────────────────
+# Environment variables
+# ───────────────────────────────────────────────
 GAS_STANDING_URL = os.getenv(
     "GAS_STANDING_URL",
-    "https://script.google.com/macros/s/AKfycbwYOUR_DEPLOYMENT_ID/exec"
+    "https://script.google.com/macros/s/AKfycbx-009V1LZWXldZMF4gWhXM07z681FYIhJiT0biOM3fXZvteDhe8Jhynls88TYuVU6jpw/exec"
 )
-
-# Nadine’s number (from env or fallback)
 ADMIN_WA = os.getenv("ADMIN_WA", "27627597357")
 
-# Simple SPECIAL_CODE pattern: letters/digits/underscore, e.g. BF2025
+# Code pattern: letters/digits/underscore, e.g. BF2025, SUMMER_24
 SPECIAL_CODE_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]{2,})\b")
 
 
+# ───────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────
 def _extract_special_code(cmd: str) -> str | None:
     """
-    Heuristic:
-      - Look at the final token; if it looks like a promo code (BF2025, SUMMER24),
-        treat it as special_code.
-      - We do NOT remove it from text; GAS will also parse the full text.
+    Detects if the final token looks like a promotion code.
+    Returns None if not present.
     """
     if not cmd:
         return None
@@ -59,15 +49,16 @@ def _extract_special_code(cmd: str) -> str | None:
     if len(parts) < 2:
         return None
     candidate = parts[-1].strip()
-    # Avoid common non-codes that appear at the end
     if candidate.lower() in {"single", "duo", "group", "resume", "suspend", "book", "every"}:
         return None
-    # Accept codes like BF2025, SUMMER_2026, etc.
     if SPECIAL_CODE_RE.fullmatch(candidate):
         return candidate
     return None
 
 
+# ───────────────────────────────────────────────
+# Main route
+# ───────────────────────────────────────────────
 @bp.route("/standing/command", methods=["POST"])
 def standing_command():
     """Receive WhatsApp messages for standing slot actions."""
@@ -79,26 +70,34 @@ def standing_command():
         if not text:
             return jsonify({"ok": False, "error": "Empty message"}), 400
 
-        # Only allow admin (Nadine)
+        # Restrict to admin
         if wa_from != ADMIN_WA:
             log.warning(f"Unauthorized standing command from {wa_from}")
             return jsonify({"ok": False, "error": "Unauthorized"}), 403
 
+        # Parse optional special code
         special_code = _extract_special_code(text)
         if special_code:
             log.info(f"[standing] Parsed special_code={special_code} from: {text}")
 
-        # Forward to Google Apps Script
-        payload = {"from": wa_from, "text": text}
+        # Build payload for GAS
+        payload = {
+            "action": "standing_command",   # 👈 key addition
+            "from": wa_from,
+            "text": text
+        }
         if special_code:
             payload["special_code"] = special_code
 
-        log.info(f"[standing] → GAS_STANDING_URL POST: {payload}")
+        log.info(f"[standing→GAS] POST {GAS_STANDING_URL} payload={payload}")
         res = requests.post(GAS_STANDING_URL, json=payload, timeout=15)
-        js = res.json() if res.text else {"ok": False, "error": "No response body"}
 
-        log.info(f"[standing] GAS response: HTTP {res.status_code} {js}")
-        return jsonify(js), (res.status_code if res.status_code else 200)
+        if res.status_code == 404:
+            log.error(f"GAS returned 404 — likely old deployment or missing case in doPost")
+        js = res.json() if res.text else {"ok": False, "error": f"HTTP {res.status_code}"}
+
+        log.info(f"[standing] GAS response: {js}")
+        return jsonify(js), res.status_code
 
     except Exception as e:
         log.exception("standing_command error")
@@ -106,7 +105,7 @@ def standing_command():
 
 
 # ───────────────────────────────────────────────
-# Optional: helper to register blueprint in main app
+# Blueprint registration
 # ───────────────────────────────────────────────
 def register_standing_routes(app):
     """Attach the standing_router blueprint to Flask app."""
